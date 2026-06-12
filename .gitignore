@@ -1,0 +1,11 @@
+.build/
+*.app
+*.dmg
+*.zip
+dmg-staging/
+.build_number
+Sources/AutoSwitcher/Resources/ru.txt
+Sources/AutoSwitcher/Resources/en.txt
+.DS_Store
+*.swp
+recup_dir.*/

@@ -1,0 +1,372 @@
+import Foundation
+
+/// Детектор раскладки. Портировано из keyswitcher (MIT, © Ilya Granin),
+/// адаптировано под наш Config и Dictionary.
+///
+/// Возможности:
+/// - Динамическая таблица транслита через LayoutResolver (поддержка любых раскладок)
+/// - Словари RU/EN из Dictionary.shared (~146к и 48к слов)
+/// - Список «плохих» n-грамм (~160к латинских + 80к кириллических подстрок,
+///   которые в реальном языке практически не встречаются)
+/// - Учёт контекста: смотрим на предыдущие набранные слова
+/// - Обработка смешанных алфавитов (`;му` → `жму`, `'kkf` → `элла`)
+/// - Ретроконверсия одиночных букв-предлогов
+final class Detector {
+
+    static let shared = Detector()
+
+    private(set) var enToRu: [Character: Character] = [:]
+    private(set) var ruToEn: [Character: Character] = [:]
+
+    /// Плохие подстроки длиной 3-6, появление которых в слове сигнализирует
+    /// о неправильной раскладке.
+    private(set) var badLatin: Set<String> = []
+    private(set) var badCyrillic: Set<String> = []
+
+    private(set) var loaded = false
+
+    private init() {
+        load()
+    }
+
+    private func load() {
+        // 1. Таблица транслитерации: динамическая через UCKeyTranslate + fallback на JSON
+        let standardLayout = loadJSONFile(name: "layout_map", as: LayoutFile.self)
+        let standardEnToRu = standardLayout.map { Detector.charMap($0.en_to_ru) } ?? [:]
+        let standardRuToEn = standardLayout.map { Detector.charMap($0.ru_to_en) } ?? [:]
+
+        if let dynamic = LayoutResolver.resolve() {
+            print("📐 Раскладка: динамическая (en→ru: \(dynamic.enToRu.count), ru→en: \(dynamic.ruToEn.count))")
+            self.enToRu = Detector.mergeMap(primary: dynamic.enToRu, fallback: standardEnToRu)
+            self.ruToEn = Detector.mergeMap(primary: dynamic.ruToEn, fallback: standardRuToEn)
+        } else {
+            print("📐 Раскладка: используем JSON (динамическое определение не сработало)")
+            self.enToRu = standardEnToRu
+            self.ruToEn = standardRuToEn
+        }
+
+        // 2. Плохие n-граммы (натренированные триггеры)
+        if let triggers = loadJSONFile(name: "bad_ngrams", as: TriggersFile.self) {
+            badLatin = Set(triggers.latin)
+            badCyrillic = Set(triggers.cyrillic)
+            print("📊 Плохие n-граммы: \(badLatin.count) лат, \(badCyrillic.count) кир")
+        } else {
+            print("⚠️ bad_ngrams.json не найден — детектор будет работать слабее")
+        }
+
+        loaded = !enToRu.isEmpty
+    }
+
+    // MARK: - Транслитерация по физическим клавишам
+
+    /// Преобразовать строку как если бы её набрали на другой раскладке.
+    /// Учитывает смешанные алфавиты: «;му» (`;` на EN = `ж`) → «жму».
+    func swap(_ s: String) -> String {
+        let cyrLetters = s.filter(isCyrillicLetter).count
+        let latLetters = s.filter(isLatinLetter).count
+        let hasEnLayoutPunct = s.contains { ch in
+            guard !isLatinLetter(ch), !isCyrillicLetter(ch) else { return false }
+            guard let mapped = enToRu[ch] else { return false }
+            return isCyrillicLetter(mapped)
+        }
+
+        // Смешанный текст с кириллицей → нормализуем к кириллице
+        if cyrLetters > 0 && (latLetters > 0 || hasEnLayoutPunct) {
+            return String(s.map { enToRu[$0] ?? $0 })
+        }
+
+        // Только кириллица → латиница
+        if cyrLetters > 0 {
+            return String(s.map { ruToEn[$0] ?? $0 })
+        }
+
+        // Только латиница (или EN-пунктуация маппящаяся на RU-букву) → кириллица
+        return String(s.map { enToRu[$0] ?? ruToEn[$0] ?? $0 })
+    }
+
+    /// «Тупой» свап: каждый символ → его пара по физической клавише.
+    /// Кириллица → латиница, латиница → кириллица. Для выделенного текста.
+    /// Не пытается «нормализовать» смешанное — каждую букву меняет в свою сторону.
+    func hardSwap(_ s: String) -> String {
+        return String(s.map { ch -> Character in
+            if isLatinLetter(ch), let m = enToRu[ch] { return m }
+            if isCyrillicLetter(ch), let m = ruToEn[ch] { return m }
+            // Не буква — может быть EN-пунктуация → RU-буква (`[` → `х`)
+            if let m = enToRu[ch], isCyrillicLetter(m) { return m }
+            return ch
+        })
+    }
+
+    // MARK: - Главный детектор
+
+    /// Решает: переключать или нет. Вызывается на границе слова.
+    /// Возвращает true если надо вызвать swap() и заменить.
+    static func shouldSwitch(word raw: String, currentLang: InputSource.Lang,
+                             context: InputSource.Lang? = nil) -> Bool {
+        let cfg = Config.shared
+        let lower = raw.lowercased()
+        let layoutPunct: Set<Character> = [";", "[", "]", "'", "`", "\\", ",", "."]
+        let effectiveChars = raw.filter { $0.isLetter || layoutPunct.contains($0) }
+
+        if cfg.forceWords.contains(lower) { return true }
+        if cfg.stopWords.contains(lower) { return false }
+
+        // Одиночная буква — обрабатывается отдельно через контекст
+        if effectiveChars.count == 1 {
+            return shared.singleCharSwap(raw, context: context) != nil
+        }
+
+        guard effectiveChars.count >= cfg.minWordLength else { return false }
+
+        return shared.autoConvert(raw, context: context) != nil
+    }
+
+    /// Свап одиночной буквы-предлога с учётом контекста.
+    /// Например, `f` после русских слов → `а` (предлог).
+    /// Без контекста — не трогаем (могут быть EN `a`, `i`).
+    func singleCharSwap(_ word: String, context: InputSource.Lang?) -> String? {
+        guard let context = context else { return nil }
+        let lower = word.lowercased()
+        let singleRu: Set<String> = ["а", "и", "в", "к", "с", "о", "у", "я"]
+        let singleEn: Set<String> = ["a", "i"]
+
+        // Уже валидный предлог в каком-то языке — не трогаем
+        if singleRu.contains(lower) || singleEn.contains(lower) { return nil }
+
+        let swapped = swap(word)
+        let swappedLow = swapped.lowercased()
+
+        // Контекст RU и свап даёт RU-предлог → SWAP
+        if singleRu.contains(swappedLow), context == .ru {
+            return swapped
+        }
+        // Контекст EN и свап даёт EN-предлог → SWAP
+        if singleEn.contains(swappedLow), context == .en {
+            return swapped
+        }
+        return nil
+    }
+
+    /// Детектор. Возвращает свапнутую строку если надо переключить, иначе nil.
+    /// Логика (по приоритету):
+    ///   1. Слово смешанное → нормализуем (если результат — чистый алфавит)
+    ///   2. Слово целиком в словаре текущего языка → не трогаем
+    ///   3. Свап слова целиком есть в плохих триггерах → SWAP
+    ///   4. Свап слова — валидное слово в другом языке → SWAP
+    ///   5. Взвешенный score по плохим подстрокам → SWAP если перевешивает в 1.8 раз
+    ///   6. Если контекст явно противоречит языку слова — SWAP
+    func autoConvert(_ word: String, context: InputSource.Lang? = nil) -> String? {
+        let dict = Dictionary.shared
+        let lower = word.lowercased()
+
+        guard lower.count >= 2 else { return nil }
+
+        let isLatin = lower.allSatisfy { isLatinLetter($0) }
+        let isCyrillic = lower.allSatisfy { isCyrillicLetter($0) }
+
+        // (1) Смешанные алфавиты
+        if !isLatin && !isCyrillic {
+            let lettersLat = String(lower.filter { isLatinLetter($0) })
+            let lettersCyr = String(lower.filter { isCyrillicLetter($0) })
+            let hasLat = !lettersLat.isEmpty
+            let hasCyr = !lettersCyr.isEmpty
+            let hasEnLayoutPunct = lower.contains { ";[]'`\\,.".contains($0) }
+            let isCandidate = (hasLat && hasCyr)
+                           || (hasEnLayoutPunct && (hasLat || hasCyr))
+            guard isCandidate else { return nil }
+
+            // Если layout-пунктуация только в конце слова (как `Hello,`) — это настоящая
+            // пунктуация. Не трогаем если буквенная часть в словаре.
+            let layoutPunct: Set<Character> = [";", "[", "]", "'", "`", "\\", ",", "."]
+            let firstIsLayoutPunct = lower.first.map { layoutPunct.contains($0) } ?? false
+            if !firstIsLayoutPunct {
+                if !hasCyr && hasLat && dict.en.contains(lettersLat) { return nil }
+                if !hasLat && hasCyr && dict.ru.contains(lettersCyr) { return nil }
+            }
+
+            let normalized = swap(word)
+            guard normalized.lowercased() != lower else { return nil }
+            let normLow = normalized.lowercased()
+            let normIsLat = normLow.allSatisfy { isLatinLetter($0) }
+            let normIsCyr = normLow.allSatisfy { isCyrillicLetter($0) }
+            if normIsLat || normIsCyr { return normalized }
+            return nil
+        }
+
+        // (2) Слово целиком валидно в текущем языке — не трогаем
+        if isLatin && dict.en.contains(lower) {
+            print("  [det] '\(lower)' валидное EN-слово → keep")
+            return nil
+        }
+        if isCyrillic && dict.ru.contains(lower) {
+            print("  [det] '\(lower)' валидное RU-слово → keep")
+            return nil
+        }
+
+        let candidate = swap(word)
+        let candidateLower = candidate.lowercased()
+
+        let triggers = isLatin ? badLatin : badCyrillic
+
+        // (3) Слово целиком в плохих триггерах
+        if triggers.contains(lower) {
+            print("  [det] '\(lower)' в триггерах → SWAP к '\(candidate)'")
+            return candidate
+        }
+
+        // (4) Свап есть в словаре другого языка
+        // Логика по длине:
+        // - 2 буквы: разрешаем свободно (yt → не, yf → на)
+        //   2-буквенных EN-слов мало, и большинство уже в EN-словаре (it, is, of, in...)
+        //   Если 2-буквенное не в EN-словаре, а свап есть в RU-словаре — почти точно промах раскладки.
+        // - 3 буквы: требуем доп. подтверждения (защита от dmg → вьп):
+        //   длина 4+, плохая n-грамма, или контекст
+        // - 4+ букв: разрешаем
+        let len = lower.count
+        let canSwap: Bool = {
+            if len <= 2 { return true }
+            if len >= 4 { return true }
+            // len == 3
+            if weightedBadScore(in: lower, triggers: triggers) >= 1 { return true }
+            if isLatin && context == .ru { return true }
+            if isCyrillic && context == .en { return true }
+            return false
+        }()
+
+        if isLatin && dict.ru.contains(candidateLower) {
+            if canSwap {
+                print("  [det] свап '\(candidate)' есть в RU (len=\(len), ctx=\(String(describing: context))) → SWAP")
+                return candidate
+            } else {
+                print("  [det] свап '\(candidate)' в RU, но 3 буквы и нет подтверждения → keep")
+            }
+        }
+        if isCyrillic && dict.en.contains(candidateLower) {
+            if canSwap {
+                print("  [det] свап '\(candidate)' есть в EN (len=\(len), ctx=\(String(describing: context))) → SWAP")
+                return candidate
+            } else {
+                print("  [det] свап '\(candidate)' в EN, но 3 буквы и нет подтверждения → keep")
+            }
+        }
+
+        // (5) Раньше тут было правило взвешенного score, но оно делало ложные свапы
+        // валидных слов которых нет в словаре (пишешь → gbitim). Удалено: либо слово
+        // в словаре другого языка (правило 4) → SWAP, либо ничего.
+
+        print("  [det] '\(lower)' (свап='\(candidate)') не подошло ни одно правило → keep")
+        return nil
+    }
+
+    /// Сумма взвешенных совпадений плохих подстрок длины 3-6.
+    /// Длинные совпадения весят больше (они дискриминативнее).
+    private func weightedBadScore(in word: String, triggers: Set<String>) -> Int {
+        let chars = Array(word)
+        var score = 0
+        for L in 3...6 where L <= chars.count {
+            let weight = L - 2  // 3→1, 4→2, 5→3, 6→4
+            let limit = chars.count - L
+            for start in 0...limit {
+                let sub = String(chars[start..<(start + L)])
+                if triggers.contains(sub) { score += weight }
+            }
+        }
+        return score
+    }
+
+    // MARK: - Helpers
+
+    private func isLatinLetter(_ c: Character) -> Bool {
+        return ("a"..."z").contains(c) || ("A"..."Z").contains(c)
+    }
+
+    private func isCyrillicLetter(_ c: Character) -> Bool {
+        return ("а"..."я").contains(c) || c == "ё" || ("А"..."Я").contains(c) || c == "Ё"
+    }
+
+    // MARK: - JSON loading
+
+    private struct LayoutFile: Decodable {
+        let en_to_ru: [String: String]
+        let ru_to_en: [String: String]
+    }
+
+    private struct TriggersFile: Decodable {
+        let latin: [String]
+        let cyrillic: [String]
+    }
+
+    private func loadJSONFile<T: Decodable>(name: String, as type: T.Type) -> T? {
+        // Ищем так же как и словари — через Bundle и SwiftPM-bundle
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: name, withExtension: "json"),
+            Bundle.main.resourceURL?.appendingPathComponent("\(name).json"),
+        ]
+        for url in candidates {
+            guard let url = url, FileManager.default.fileExists(atPath: url.path) else { continue }
+            if let data = try? Data(contentsOf: url),
+               let decoded = try? JSONDecoder().decode(T.self, from: data) {
+                return decoded
+            }
+        }
+        // Поиск во вложенных бандлах
+        if let resURL = Bundle.main.resourceURL,
+           let contents = try? FileManager.default.contentsOfDirectory(at: resURL, includingPropertiesForKeys: nil) {
+            for item in contents where item.pathExtension == "bundle" {
+                let candidates = [
+                    item.appendingPathComponent("Contents/Resources/\(name).json"),
+                    item.appendingPathComponent("\(name).json"),
+                ]
+                for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+                    if let data = try? Data(contentsOf: url),
+                       let decoded = try? JSONDecoder().decode(T.self, from: data) {
+                        return decoded
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Static helpers
+
+    /// Мержит мапы: предпочитает primary, но если primary мапит пунктуацию на пунктуацию
+    /// (а не на букву) — берёт fallback (где есть буква).
+    /// Это спасает от кастомных раскладок где `.` → `,` вместо `.` → `ю`.
+    private static func mergeMap(primary: [Character: Character],
+                                  fallback: [Character: Character]) -> [Character: Character] {
+        func isLetter(_ c: Character) -> Bool { c.isLetter }
+        var out = fallback
+        for (k, v) in primary {
+            if let f = fallback[k] {
+                if isLetter(v) || !isLetter(f) {
+                    out[k] = v
+                }
+            } else {
+                out[k] = v
+            }
+        }
+        return out
+    }
+
+    private static func charMap(_ src: [String: String]) -> [Character: Character] {
+        var out: [Character: Character] = [:]
+        for (k, v) in src where k.count == 1 && v.count == 1 {
+            out[k.first!] = v.first!
+        }
+        return out
+    }
+}
+
+// MARK: - Translit compatibility
+
+/// Старый интерфейс Translit, чтобы не ломать остальной код.
+/// Делегирует на Detector.shared.swap().
+enum Translit {
+    static func toRu(_ s: String) -> String {
+        Detector.shared.swap(s)
+    }
+    static func toEn(_ s: String) -> String {
+        Detector.shared.swap(s)
+    }
+}
