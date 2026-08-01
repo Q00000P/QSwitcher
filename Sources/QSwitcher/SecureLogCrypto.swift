@@ -28,7 +28,7 @@ import LocalAuthentication
 enum SecureLogCrypto {
 
     private static let keychainAccount = "securelog-master-key"
-    private static let keychainService = "local.AutoSwitcher.securelog"
+    private static let keychainService = "local.AutoSwitcher.securelog"  // имя не меняем: иначе старый лог не расшифруется
 
     enum CryptoError: Error {
         case keyGenerationFailed(OSStatus)

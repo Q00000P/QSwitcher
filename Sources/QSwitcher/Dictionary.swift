@@ -35,7 +35,7 @@ final class Dictionary {
         // Override: пользовательский каталог
         let userDir = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AutoSwitcher/dicts", isDirectory: true)
+            .appendingPathComponent("QSwitcher/dicts", isDirectory: true)
         let userRu = userDir.appendingPathComponent("ru.txt")
         let userEn = userDir.appendingPathComponent("en.txt")
         if FileManager.default.fileExists(atPath: userRu.path) {
@@ -90,8 +90,8 @@ final class Dictionary {
                 baseURL.appendingPathComponent("Resources/\(fileName)"),
                 baseURL.appendingPathComponent(fileName),
                 baseURL.appendingPathComponent("../Resources/\(fileName)"),
-                baseURL.appendingPathComponent("AutoSwitcher_AutoSwitcher.bundle/\(fileName)"),
-                baseURL.appendingPathComponent("AutoSwitcher_AutoSwitcher.bundle/Contents/Resources/\(fileName)"),
+                baseURL.appendingPathComponent("QSwitcher_QSwitcher.bundle/\(fileName)"),
+                baseURL.appendingPathComponent("QSwitcher_QSwitcher.bundle/Contents/Resources/\(fileName)"),
             ]
             for c in candidates {
                 if FileManager.default.fileExists(atPath: c.path) { return c }

@@ -2,7 +2,7 @@ import Foundation
 import Cocoa
 
 /// Конфиг приложения. Хранится в
-/// ~/Library/Application Support/AutoSwitcher/config.json
+/// ~/Library/Application Support/QSwitcher/config.json
 /// Перечитывается с диска по mtime каждые 2 секунды — можно редактировать
 /// файл в любом редакторе и изменения применяются на лету.
 final class Config {
@@ -18,6 +18,30 @@ final class Config {
     private(set) var maxConsonantRunEn: Int = 4
     private(set) var maxConsonantRunRu: Int = 5
 
+    /// После скольких подряд сконвертированных слов переключать раскладку.
+    /// 0 — не переключать никогда (только исправлять текст),
+    /// 1 — сразу после первого слова (прежнее поведение),
+    /// 2 — по умолчанию: разовая вставка раскладку не трогает.
+    private(set) var switchLayoutAfter: Int = 2
+
+    /// Пауза перед первым backspace, миллисекунды. По умолчанию НОЛЬ.
+    ///
+    /// Была попытка лечить паузой поле поиска программ, которое не принимает
+    /// синтетический backspace. Не помогло даже 300 мс, зато сломало обычные поля:
+    /// пока мы ждём, человек успевает набрать следующий символ, и стирание
+    /// попадает не туда. Замена должна идти вплотную к нажатию.
+    private(set) var replaceStartDelayMs: Int = 0
+
+    /// Пауза между отдельными нажатиями при стирании и печати, миллисекунды.
+    private(set) var keyIntervalMs: Int = 3
+
+    /// Звук когда текст исправлен, но раскладка НЕ менялась.
+    private(set) var soundConvertOnly: String = "Tink"
+    /// Звук когда исправлен текст И переключена раскладка.
+    private(set) var soundConvertAndSwitch: String = "Pop"
+    // Доступные системные: Basso, Blow, Bottle, Frog, Funk, Glass, Hero,
+    // Morse, Ping, Pop, Purr, Sosumi, Submarine, Tink
+
     // === SecureLog ===
     private(set) var logEnabled: Bool = false
     private(set) var logSecureInput: Bool = true
@@ -27,7 +51,7 @@ final class Config {
 
     var path: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = appSupport.appendingPathComponent("AutoSwitcher", isDirectory: true)
+        let dir = appSupport.appendingPathComponent("QSwitcher", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("config.json")
     }
@@ -109,6 +133,11 @@ final class Config {
             minWordLength      = json["minWordLength"]      as? Int ?? 2
             maxConsonantRunEn  = json["maxConsonantRunEn"]  as? Int ?? 4
             maxConsonantRunRu  = json["maxConsonantRunRu"]  as? Int ?? 5
+            switchLayoutAfter  = json["switchLayoutAfter"]  as? Int ?? 2
+            replaceStartDelayMs = json["replaceStartDelayMs"] as? Int ?? 0
+            keyIntervalMs       = json["keyIntervalMs"]       as? Int ?? 3
+            soundConvertOnly      = json["soundConvertOnly"]      as? String ?? "Tink"
+            soundConvertAndSwitch = json["soundConvertAndSwitch"] as? String ?? "Pop"
 
             logEnabled             = json["logEnabled"]             as? Bool ?? false
             logSecureInput         = json["logSecureInput"]         as? Bool ?? true

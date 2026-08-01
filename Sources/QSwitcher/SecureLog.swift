@@ -35,12 +35,12 @@ final class SecureLog {
     private var db: OpaquePointer?
     private var buffer: [String] = []
     private var bufferBytes: Int = 0
-    private let queue = DispatchQueue(label: "local.AutoSwitcher.securelog", qos: .utility)
+    private let queue = DispatchQueue(label: "local.QSwitcher.securelog", qos: .utility)
     private var flushTimer: Timer?
 
     private var dbPath: URL {
         let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/AutoSwitcher", isDirectory: true)
+            .appendingPathComponent("Logs/QSwitcher", isDirectory: true)
         try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
         return logs.appendingPathComponent("securelog.db")
     }

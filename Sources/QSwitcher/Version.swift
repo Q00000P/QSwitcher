@@ -2,17 +2,17 @@ import Foundation
 
 /// Информация о версии. BuildInfo переписывается make-app.sh при каждой сборке.
 enum AppVersion {
-    static let version = "0.7"
+    static let version = "3.1"
     static let build = BuildInfo.number
     static let buildDate = BuildInfo.date
 
     static var fullString: String {
-        return "AutoSwitcher \(version) (билд \(build))"
+        return "QSwitcher \(version) (билд \(build))"
     }
 }
 
 /// Автогенерируется make-app.sh — не редактировать руками.
 enum BuildInfo {
-    static let number = "2"
-    static let date = "2026-06-12 22:15"
+    static let number = "10"
+    static let date = "2026-08-01 14:16"
 }

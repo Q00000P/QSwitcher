@@ -54,7 +54,57 @@ final class Detector {
             print("⚠️ bad_ngrams.json не найден — детектор будет работать слабее")
         }
 
+        // 3. Частотные короткие слова (2-3 буквы)
+        loadShortWords()
+
         loaded = !enToRu.isEmpty
+    }
+
+
+    // MARK: - Частотные короткие слова (2-3 буквы)
+    //
+    // Полный словарь на коротких словах бесполезен: в нём 437 двухбуквенных
+    // «слов» вроде 'ут', 'аи', 'аш', и почти половина конфликтует с английскими
+    // по раскладке. Принадлежность словарю там ничего не значит.
+    //
+    // Эти списки построены по частотным данным OpenSubtitles (ru_50k/en_50k):
+    // слово попадает сюда если его реально печатают — либо оно частотно само
+    // (>=20 на миллион), либо его свап в другом языке ещё реже. Тогда короткое
+    // слово свапается только когда само нечастотное, а результат свапа частотный:
+    // 'рук' защищено (55/млн), 'ут' нет (1.7/млн), а 'en' по ту сторону есть.
+    static var commonShortRu: Set<String> = []
+    static var commonShortEn: Set<String> = []
+
+    private func loadShortWords() {
+        Detector.commonShortRu = Detector.loadWordList(name: "short_ru")
+        Detector.commonShortEn = Detector.loadWordList(name: "short_en")
+        if Detector.commonShortRu.isEmpty || Detector.commonShortEn.isEmpty {
+            print("⚠️ short_ru/short_en не найдены — короткие слова будут сверяться с полным словарём")
+        } else {
+            print("📏 Частотные короткие: ru=\(Detector.commonShortRu.count), en=\(Detector.commonShortEn.count)")
+        }
+    }
+
+    private static func loadWordList(name: String) -> Set<String> {
+        var urls: [URL] = []
+        if let u = Bundle.main.url(forResource: name, withExtension: "txt") { urls.append(u) }
+        if let r = Bundle.main.resourceURL {
+            urls.append(r.appendingPathComponent("\(name).txt"))
+            if let contents = try? FileManager.default.contentsOfDirectory(at: r, includingPropertiesForKeys: nil) {
+                for item in contents where item.pathExtension == "bundle" {
+                    urls.append(item.appendingPathComponent("Contents/Resources/\(name).txt"))
+                    urls.append(item.appendingPathComponent("\(name).txt"))
+                }
+            }
+        }
+        for url in urls where FileManager.default.fileExists(atPath: url.path) {
+            if let text = try? String(contentsOf: url, encoding: .utf8) {
+                return Set(text.split(separator: "\n").map {
+                    $0.trimmingCharacters(in: .whitespaces).lowercased()
+                }.filter { !$0.isEmpty })
+            }
+        }
+        return []
     }
 
     // MARK: - Транслитерация по физическим клавишам
@@ -110,6 +160,17 @@ final class Detector {
 
         if cfg.forceWords.contains(lower) { return true }
         if cfg.stopWords.contains(lower) { return false }
+
+        // Выученное на исправлениях пользователя. Важнее любых наших эвристик:
+        // человек уже показал что он хочет для этого конкретного слова.
+        if LearnedRules.shared.shouldForce(lower) {
+            print("  [det] '\(lower)' — выучено: переключаем")
+            return true
+        }
+        if LearnedRules.shared.shouldStop(lower) {
+            print("  [det] '\(lower)' — выучено: не трогаем")
+            return false
+        }
 
         // Одиночная буква — обрабатывается отдельно через контекст
         if effectiveChars.count == 1 {
@@ -193,14 +254,29 @@ final class Detector {
             return nil
         }
 
-        // (2) Слово целиком валидно в текущем языке — не трогаем
-        if isLatin && dict.en.contains(lower) {
-            print("  [det] '\(lower)' валидное EN-слово → keep")
-            return nil
+        // (2) Слово целиком валидно в текущем языке — не трогаем.
+        //
+        // Для 2-буквенных полный словарь не годится: в нём 2.35 млн слов вместе с
+        // архаизмами и фамилиями, и почти любая пара букв формально «слово»
+        // ('ут' — старое название ноты). Из-за этого глохла конвертация: набрал 'en',
+        // получил 'ут', а свитчер считал что так и надо. Поэтому короткие сверяем
+        // с компактным списком реально употребимых.
+        let shortWord = lower.count <= 3
+        if isLatin {
+            let valid = (shortWord && !Detector.commonShortEn.isEmpty)
+                ? Detector.commonShortEn.contains(lower) : dict.en.contains(lower)
+            if valid {
+                print("  [det] '\(lower)' валидное EN-слово → keep")
+                return nil
+            }
         }
-        if isCyrillic && dict.ru.contains(lower) {
-            print("  [det] '\(lower)' валидное RU-слово → keep")
-            return nil
+        if isCyrillic {
+            let valid = (shortWord && !Detector.commonShortRu.isEmpty)
+                ? Detector.commonShortRu.contains(lower) : dict.ru.contains(lower)
+            if valid {
+                print("  [det] '\(lower)' валидное RU-слово → keep")
+                return nil
+            }
         }
 
         let candidate = swap(word)
@@ -226,12 +302,14 @@ final class Detector {
         let canSwap: Bool = {
             if len <= 2 { return true }
             if len >= 4 { return true }
-            // len == 3
-            if weightedBadScore(in: lower, triggers: triggers) >= 1 { return true }
-            if isLatin && context == .ru { return true }
-            if isCyrillic && context == .en { return true }
-            return false
+            // len == 3: раньше требовался контекст, и это душило полезные случаи
+            // ('dct'→'все', 'ljv'→'дом'). Проверка показала: все реальные аббревиатуры
+            // (dmg, jpg, sql, api, git…) свапаются в бессмыслицу и отсекаются словарём.
+            // Настоящих коллизий единицы (ltd→дев, ctv→сем), и они пишутся капсом —
+            // от них защищает проверка регистра ниже.
+            return true
         }()
+
 
         if isLatin && dict.ru.contains(candidateLower) {
             if canSwap {

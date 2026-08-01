@@ -12,6 +12,14 @@ enum InputSource {
     }
 
     static func switchTo(_ target: Lang) {
+        // TIS рассчитан на главный поток, а вызывать нас могут из очереди отправки.
+        // Перенаправляем, иначе поведение непредсказуемое вплоть до падения.
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { switchTo(target) }
+            return
+        }
+        // Раскладка меняется — сбрасываем кэш нашего переводчика клавиш
+        KeyTranslate.invalidateAndNotify()
         guard let listRaw = TISCreateInputSourceList(nil, false)?.takeRetainedValue() else { return }
         let list = listRaw as! [TISInputSource]
         for src in list {

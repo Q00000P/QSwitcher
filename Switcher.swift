@@ -19,12 +19,17 @@ final class Switcher {
         let triggerKeyCode: CGKeyCode
         var state: ToggleState
         var timestamp: Date
+        /// Переключение было автоматическим (не по нажатию пользователя).
+        /// Нужно чтобы отличить «свитчер ошибся, я откатил» от обычного тоггла.
+        let wasAutomatic: Bool
 
-        init(originalChars: String, convertedChars: String, triggerKeyCode: CGKeyCode, state: ToggleState) {
+        init(originalChars: String, convertedChars: String, triggerKeyCode: CGKeyCode,
+             state: ToggleState, wasAutomatic: Bool = false) {
             self.originalChars = originalChars
             self.convertedChars = convertedChars
             self.triggerKeyCode = triggerKeyCode
             self.state = state
+            self.wasAutomatic = wasAutomatic
             self.timestamp = Date()
         }
     }
@@ -33,6 +38,17 @@ final class Switcher {
         case original   // в документе сейчас исходный текст
         case converted  // в документе сейчас конвертированный текст
     }
+
+    private static let leftShiftKey: CGKeyCode = 56
+    private static let rightShiftKey: CGKeyCode = 60
+
+    /// Очередь для отправки синтетических событий. СТРОГО последовательная.
+    ///
+    /// Через DispatchQueue.global два переключения подряд выполнялись параллельно:
+    /// одно ещё слало backspace, другое уже печатало замену. Результат — съеденный
+    /// текст, мусор при свапе выделения и падения. Все стирания и печать обязаны
+    /// идти друг за другом, иначе события перемешиваются на уровне системы.
+    private let emitQueue = DispatchQueue(label: "local.QSwitcher.emit", qos: .userInitiated)
 
     private static let magic: Int64 = 0x4150_5357
 
@@ -81,6 +97,25 @@ final class Switcher {
     /// Сохранённое содержимое буфера обмена для отложенного восстановления.
     private var lastSavedClipboard: [NSPasteboardItem]?
 
+    /// Сколько слов подряд сконвертировано в одну и ту же сторону.
+    /// Раскладку переключаем только когда набралось подтверждение смены языка —
+    /// разовая вставка аббревиатуры ('NL' посреди русского текста) раскладку не трогает.
+    /// Пользователь держал Shift при свапе — запомнить правило независимо от длины.
+    /// Был ли Shift зажат в любой момент удержания Option.
+    /// Проверять только флаги в момент отпускания нельзя: правым Shift и правым
+    /// Option жмут одной рукой, и Shift часто уходит раньше — признак терялся.
+    private var shiftDuringHold = false
+
+    private var pendingExplicitLearn = false
+
+    private var consecutiveConversions = 0
+    private var lastConversionTarget: InputSource.Lang?
+
+    /// Запланировано ли отложенное восстановление буфера обмена.
+    /// readSelection ждёт его завершения, иначе примет восстановленное
+    /// содержимое за «скопированное выделение» и вставит чужой текст.
+    private var pendingClipboardRestore = false
+
     /// История последних N набранных слов для определения контекста (RU vs EN).
     private var wordHistory: [String] = []
     private let historyCapacity = 5
@@ -94,9 +129,14 @@ final class Switcher {
 
     func start() {
         // Слушаем keyDown И flagsChanged (для дабл-Shift)
+        // Клики мыши тоже слушаем: после них курсор в другом месте, и накопленное
+        // недописанное слово там уже не рядом. Без этого буфер тащил старые буквы
+        // и склеивал их со следующим словом ('приложений' + 'что' → 'приложенийчто').
         let mask: CGEventMask =
             (1 << CGEventType.keyDown.rawValue) |
-            (1 << CGEventType.flagsChanged.rawValue)
+            (1 << CGEventType.flagsChanged.rawValue) |
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.rightMouseDown.rawValue)
         let userInfo = Unmanaged.passUnretained(self).toOpaque()
 
         let cb: CGEventTapCallBack = { _, type, event, ctx in
@@ -120,6 +160,20 @@ final class Switcher {
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        KeyTranslate.installObserver()
+
+        // Смена раскладки посреди слова означает что дальше пойдут символы
+        // другого алфавита. Копить их в тот же буфер нельзя — получается склейка
+        // вида 'никогдаhe,' и детектор анализирует несуществующее слово.
+        KeyTranslate.onLayoutChanged = { [weak self] in
+            // switchTo может прийти из фонового потока (свап выделения),
+            // а буфер принадлежит главному — переносим туда.
+            DispatchQueue.main.async {
+                guard let self = self, !self.word.isEmpty else { return }
+                print("[layout] раскладка сменилась — сбрасываю незавершённое слово")
+                self.word.removeAll()
+            }
+        }
 
         lastUserAppBundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -137,7 +191,7 @@ final class Switcher {
             object: nil
         )
 
-        print("✅ AutoSwitcher активен. Option (одиночное нажатие) — переключить, Esc — отменить.")
+        print("✅ QSwitcher активен. Option (одиночное нажатие) — переключить, Esc — отменить.")
     }
 
     @objc private func appDidActivate(_ notif: Notification) {
@@ -162,8 +216,13 @@ final class Switcher {
     }
 
     private var isCurrentAppExcluded: Bool {
-        guard let bid = lastUserAppBundleId else { return false }
-        return Config.shared.excludedApps.contains(bid)
+        let excluded = Config.shared.excludedApps
+        // Активное приложение
+        if let bid = lastUserAppBundleId, excluded.contains(bid) { return true }
+        // И владелец фокуса ввода — системные накладки (поиск программ, Spotlight)
+        // активными приложениями не становятся, но фокус держат.
+        if let focus = AXSelection.focusedAppBundleIDCached(), excluded.contains(focus) { return true }
+        return false
     }
 
     // MARK: - Tap handler
@@ -175,6 +234,16 @@ final class Switcher {
         }
 
         // === flagsChanged: ловим одиночный тап Option ===
+        if type == .leftMouseDown || type == .rightMouseDown {
+            if !word.isEmpty {
+                print("[buf] клик мышью — сбрасываю незавершённое слово")
+                word.removeAll()
+            }
+            lastSwitch = nil
+            lastCompletedWord = nil
+            return Unmanaged.passUnretained(event)
+        }
+
         if type == .flagsChanged {
             if event.getIntegerValueField(.eventSourceUserData) == Switcher.magic {
                 return Unmanaged.passUnretained(event)
@@ -188,6 +257,7 @@ final class Switcher {
                     modifierPressTime = Date()
                     modifierContaminated = false
                     trackedModifierKey = keyCode
+                    shiftDuringHold = event.flags.contains(.maskShift)
                 } else {
                     // Отпустили — проверяем условия
                     if let pressTime = modifierPressTime,
@@ -201,14 +271,18 @@ final class Switcher {
                             lastManualSwitchTime = Date()
                             let isLeft = (keyCode == Switcher.leftOptionKey)
                             let side = isLeft ? "левый" : "правый"
-                            print("[\(Switcher.ts())] [opt-tap] \(side) Option (held=\(String(format: "%.3f", held))s)")
+                            // Shift зажат в момент отпускания Option — явная команда
+                            // «переключи и запомни», работает на словах любой длины.
+                            let withShift = event.flags.contains(.maskShift) || shiftDuringHold
+                            let shiftMark = withShift ? " +Shift(обучение)" : ""
+                            print("[\(Switcher.ts())] [opt-tap] \(side) Option\(shiftMark) (held=\(String(format: "%.3f", held))s)")
                             DispatchQueue.main.async { [weak self] in
                                 if isLeft {
                                     // Левый Option — ТОЛЬКО свап выделения (мышкой)
                                     self?.handleSelectionSwap()
                                 } else {
                                     // Правый Option — свап набранного / тоггл
-                                    self?.handleBufferSwap()
+                                    self?.handleBufferSwap(explicitLearn: withShift)
                                 }
                             }
                         }
@@ -216,9 +290,18 @@ final class Switcher {
                     modifierPressTime = nil
                     modifierContaminated = false
                     trackedModifierKey = nil
+                    shiftDuringHold = false
+                }
+            } else if keyCode == Switcher.leftShiftKey || keyCode == Switcher.rightShiftKey {
+                // Shift — часть жеста «переключи и запомни», а не помеха.
+                // Запоминаем что он был, и НЕ помечаем нажатие загрязнённым:
+                // иначе отпускание Shift раньше Option гасило бы весь тап.
+                if modifierPressTime != nil, event.flags.contains(.maskShift) {
+                    shiftDuringHold = true
                 }
             } else {
-                // Любой другой модификатор-чейндж во время удержания Option = «загрязнение»
+                // Остальные модификаторы (Cmd, Ctrl, Fn) во время удержания Option
+                // означают что жмут другое сочетание — не наше дело.
                 if modifierPressTime != nil {
                     modifierContaminated = true
                 }
@@ -299,10 +382,21 @@ final class Switcher {
             return Unmanaged.passUnretained(event)
         }
 
-        var len = 0
-        var buf = [UniChar](repeating: 0, count: 8)
-        event.keyboardGetUnicodeString(maxStringLength: 8, actualStringLength: &len, unicodeString: &buf)
-        let chars = len > 0 ? String(utf16CodeUnits: buf, count: len) : ""
+        // Символ берём СВОИМ переводом по актуальной раскладке.
+        // event.keyboardGetUnicodeString() отдаёт символ по раскладке, закэшированной
+        // в нашем процессе, и она не следует за TISSelectInputSource — в логах ловили
+        // расхождение на десятки секунд (на экране 'rfrf', в буфере 'кака').
+        let chars: String = {
+            if let c = KeyTranslate.char(keyCode: CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
+                                         flags: event.flags) {
+                return c
+            }
+            // Fallback если раскладка недоступна (например экзотический IME)
+            var len = 0
+            var buf = [UniChar](repeating: 0, count: 8)
+            event.keyboardGetUnicodeString(maxStringLength: 8, actualStringLength: &len, unicodeString: &buf)
+            return len > 0 ? String(utf16CodeUnits: buf, count: len) : ""
+        }()
 
         // === Логирование нажатий в SecureLog ===
         // Если включён лог и (logSecureInput=true ИЛИ не в secure-input поле)
@@ -340,8 +434,21 @@ final class Switcher {
                 // Обновляем контекст: добавляем слово в историю ДО решения о свапе
                 // (для самого слова контекст = что было ДО него)
                 let context = computeContext()
+                // Диагностика рассинхрона: символы в буфере — истина, currentLanguage() врёт
+                if let actual = Switcher.langOf(text), actual != cur {
+                    print("[\(Switcher.ts())] [!] система говорит \(cur), а набрано \(actual) — доверяем набранному")
+                }
                 let willSwitch = Detector.shouldSwitch(word: text, currentLang: cur, context: context)
-                print("[\(Switcher.ts())] [boundary] '\(text)' (\(cur), ctx=\(context.map { String(describing: $0) } ?? "nil")) → \(willSwitch ? "SWITCH" : "keep")")
+                // Владелец фокуса ввода, а не «активное приложение»: системные
+                // накладки frontmost не занимают и остаются невидимыми для него.
+                let focusApp = AXSelection.focusedAppBundleIDCached()
+                // Берём отслеживаемое по уведомлениям значение, а не спрашиваем
+                // систему: в обработчике тапа любой лишний запрос — риск задержать
+                // ввод во всей системе.
+                let frontApp = lastUserAppBundleId ?? "?"
+                let appMark = (focusApp != nil && focusApp != frontApp)
+                    ? "\(frontApp)/фокус:\(focusApp!)" : frontApp
+                print("[\(Switcher.ts())] [boundary] '\(text)' (\(cur), ctx=\(context.map { String(describing: $0) } ?? "nil"), app=\(appMark)) → \(willSwitch ? "SWITCH" : "keep")")
                 SecureLog.shared.append("[boundary] '\(text)' (\(cur)) → \(willSwitch ? "SWITCH" : "keep")")
                 if willSwitch {
                     let replay = word
@@ -355,7 +462,9 @@ final class Switcher {
                     }
                     return nil
                 }
-                // Не свапаем — добавляем как есть и запоминаем для возможного ручного свапа
+                // Не свапаем — значит раскладка верная, серия конвертаций прервана
+                consecutiveConversions = 0
+                lastConversionTarget = nil
                 appendToHistory(text)
                 lastCompletedWord = LastCompletedWord(
                     chars: text,
@@ -381,6 +490,34 @@ final class Switcher {
         }
 
         if !chars.isEmpty {
+            // Layout-пунктуация ('.', ',', ';' …) — палка о двух концах. Она нужна
+            // как часть слова, иначе не починить '.,rf' → 'юбка'. Но она же склеивает
+            // обычную пунктуацию со следующим словом: '...' набранное четыре минуты
+            // назад приклеилось к 'миграция' и превратилось в 'юююмиграция'.
+            //
+            // Различаем по алфавиту. Кириллица в буфере означает что человек в русской
+            // раскладке, где точка — настоящая пунктуация, а не артефакт раскладки.
+            // Латиница оставляет надежду что это русское слово набранное не там.
+            let incoming = chars.first
+            let incomingIsCyrillic = incoming.map { Switcher.isCyrillicLetter($0) } ?? false
+            let incomingIsLetter = incoming.map { $0.isLetter } ?? false
+
+            let bufferText = word.map { $0.chars }.joined()
+            let bufferHasCyrillic = bufferText.contains { Switcher.isCyrillicLetter($0) }
+            let bufferHasLetters = bufferText.contains { $0.isLetter }
+            let bufferIsOnlyPunct = !bufferText.isEmpty && !bufferHasLetters
+
+            if incomingIsCyrillic && bufferIsOnlyPunct {
+                // Накопленная пунктуация была самостоятельной — слово начинается здесь
+                print("[buf] пунктуация '\(bufferText)' отброшена — дальше кириллица")
+                word.removeAll()
+            } else if !incomingIsLetter && layoutPunctChars.contains(incoming ?? " ") && bufferHasCyrillic {
+                // Пунктуация после кириллического слова — это конец слова, не его часть
+                word.removeAll()
+                lastCompletedWord = nil
+                return Unmanaged.passUnretained(event)
+            }
+
             word.append(Keystroke(keyCode: keyCode, flags: flags, chars: chars))
         }
         return Unmanaged.passUnretained(event)
@@ -397,6 +534,32 @@ final class Switcher {
         wordHistory.append(word)
         if wordHistory.count > historyCapacity {
             wordHistory.removeFirst()
+        }
+    }
+
+    /// Привести историю в соответствие с тем что РЕАЛЬНО на экране после ручного свапа.
+    ///
+    /// Зачем: computeContext() определяет язык по последним словам истории, а контекст
+    /// влияет на решения детектора. Если ручной свап или тоггл не обновили историю —
+    /// контекст врёт («думаем что пишем по-русски», хотя уже перешли на латиницу),
+    /// и дальше начинаются ложные автосвапы.
+    ///
+    /// text — то что теперь на экране (может быть несколько слов, например при свапе
+    /// выделенной фразы). Заменяем хвост истории на слова из него.
+    private func syncHistoryTail(with text: String) {
+        let words = text
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty else { return }
+
+        // Убираем из хвоста столько записей сколько заменяем (но не больше чем есть)
+        let replaceCount = min(words.count, wordHistory.count)
+        if replaceCount > 0 {
+            wordHistory.removeLast(replaceCount)
+        }
+        for w in words.suffix(historyCapacity) {
+            appendToHistory(w)
         }
     }
 
@@ -430,11 +593,40 @@ final class Switcher {
     /// ЛЕВЫЙ Option — свап выделенного мышкой текста. Только это, ничего больше.
     /// Не лезет в буфер набора и не тоггает — если выделения нет, просто ничего.
     private func handleSelectionSwap() {
-        // ВАЖНО: readSelection/writeSelection шлют ⌘C/⌘V и ждут доставки циклами usleep.
-        // На главном потоке это замораживает RunLoop → события не доставляются →
-        // буфер не меняется. Поэтому ВСЯ операция (чтение + запись) в фоне.
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // Всё в фоне: и AX (может блокировать при неотвечающем приложении),
+        // и клипбордный fallback (usleep в ожидании ⌘C/⌘V).
+        // Главный поток продолжает крутить RunLoop и доставлять события.
+        emitQueue.async { [weak self] in
             guard let self = self else { return }
+
+            // ПУТЬ 1 — Accessibility API: читаем и пишем выделение напрямую
+            // у элемента, без буфера обмена. Без гонок, не портит клипборд.
+            var swappedTo: String? = nil
+            let original = AXSelection.swapSelection { text in
+                guard text.count <= 5000 else { return text }
+                let result = Detector.shared.hardSwap(text)
+                swappedTo = result
+                return result
+            }
+
+            if let original = original, let result = swappedTo, result != original {
+                print("[selSwap/AX] выделение (\(original.count) симв) → swap")
+                print("[manual-sel] '\(original.prefix(40))' → '\(result.prefix(40))'")
+                SecureLog.shared.append("[selSwap/AX] \(original.count) симв")
+                DispatchQueue.main.async {
+                    self.word.removeAll()
+                    self.lastSwitch = nil
+                    self.lastCompletedWord = nil
+                    self.syncHistoryTail(with: result)
+                    self.switchLayoutFor(result)
+                }
+                self.playSound()
+                return
+            }
+
+            // ПУТЬ 2 — fallback на ⌘C/⌘V для приложений без поддержки AX
+            // (Electron: Telegram, VS Code; часть Java/Qt).
+            print("[selSwap] AX недоступен → fallback на буфер обмена")
             guard let selected = self.readSelection(restoreClipboard: false),
                   !selected.isEmpty, selected.count <= 5000 else {
                 print("[selSwap] нет выделения — ничего")
@@ -446,14 +638,50 @@ final class Switcher {
                 self.lastSwitch = nil
                 self.lastCompletedWord = nil
             }
-            // Свап и запись тоже в фоне (внутри usleep для ⌘V)
             self.swapSelectedTextSync(selected)
         }
     }
 
+    /// Определить язык по СОДЕРЖИМОМУ текста.
+    ///
+    /// Почему не InputSource.currentLanguage(): она врёт. В логах ловили прямое
+    /// противоречие — буфер содержит латиницу 'pfdnhf', а API говорит «сейчас ru»;
+    /// и наоборот, буфер 'будет' кириллицей, а API — «en». Причины разные
+    /// (кэш TIS, «своя раскладка для каждого приложения», задержка после switchTo),
+    /// но нам они не важны: символы в буфере произвела сама система при нажатии,
+    /// это истина. Раскладку выбираем по ним.
+    static func isCyrillicLetter(_ c: Character) -> Bool {
+        ("а"..."я").contains(c) || c == "ё" || ("А"..."Я").contains(c) || c == "Ё"
+    }
+
+    static func langOf(_ text: String) -> InputSource.Lang? {
+        let cyr = text.filter { ("а"..."я").contains($0) || $0 == "ё"
+                              || ("А"..."Я").contains($0) || $0 == "Ё" }.count
+        let lat = text.filter { ("a"..."z").contains($0) || ("A"..."Z").contains($0) }.count
+        if cyr > lat { return .ru }
+        if lat > cyr { return .en }
+        return nil
+    }
+
+    /// Переключить системную раскладку под содержимое текста.
+    private func switchLayoutFor(_ text: String) {
+        guard let target = Switcher.langOf(text) else { return }
+        InputSource.switchTo(target)
+    }
+
     /// ПРАВЫЙ Option — свап набранного / тоггл. Не трогает выделение вообще
     /// (не дёргает ⌘C), поэтому работает стабильно.
-    private func handleBufferSwap() {
+    /// Максимальная длина слова для АВТОМАТИЧЕСКОГО обучения.
+    /// Короткие слова неоднозначны по своей природе — там решает пользователь.
+    /// Длинные надёжно разбирает словарь, и разовый ручной свап (процитировать,
+    /// показать как выглядит) не должен превращаться в постоянное правило.
+    private static let autoLearnMaxLength = 3
+
+    /// explicitLearn — пользователь держал Shift, то есть явно просит запомнить
+    /// независимо от длины слова.
+    private func handleBufferSwap(explicitLearn: Bool = false) {
+        pendingExplicitLearn = explicitLearn
+        defer { pendingExplicitLearn = false }
         // 1. Буфер содержит новое слово
         if !word.isEmpty {
             print("[bufSwap] свап буфера ('\(word.map{$0.chars}.joined())')")
@@ -487,16 +715,22 @@ final class Switcher {
             return
         }
 
-        let target: InputSource.Lang = (last.lang == .ru) ? .en : .ru
+        // Раскладка по содержимому результата, не по last.lang (он из currentLanguage())
+        let target: InputSource.Lang = Switcher.langOf(translated)
+            ?? ((last.lang == .ru) ? .en : .ru)
         let triggerCount = (last.triggerKeyCode != 0) ? 1 : 0
         let toDelete = original.count + triggerCount
 
-        sendBackspaces(toDelete)
-        InputSource.switchTo(target)
-
-        for ch in translated {
-            postUnicode(String(ch))
-            usleep(3_000)
+        emitQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.sendBackspaces(toDelete)
+            InputSource.switchTo(target)
+            let gap = UInt32(Config.shared.keyIntervalMs) * 1000
+            for ch in translated {
+                self.postUnicode(String(ch))
+                usleep(gap)
+            }
+            if triggerCount > 0 { self.postVirtualKey(last.triggerKeyCode) }
         }
 
         // Возвращаем триггер
@@ -514,6 +748,11 @@ final class Switcher {
         lastCompletedWord = nil
         playSound()
         print("[manual-completed] '\(original)' → '\(translated)'")
+        // Обучение — ТОЛЬКО по явной команде Shift + правый Option.
+        // Обычный свап это разовое действие, а не заявка на вечное правило.
+        if pendingExplicitLearn {
+            LearnedRules.shared.learnForce(original)
+        }
     }
 
     /// Свапнуть выделенный текст в другую раскладку — БЕЗУСЛОВНО.
@@ -533,12 +772,12 @@ final class Switcher {
         }
 
         // Целевая раскладка — по тому что получилось после свапа
-        let cyrCount = swapped.filter { ("а"..."я").contains($0) || $0 == "ё"
-                                       || ("А"..."Я").contains($0) || $0 == "Ё" }.count
-        let latCount = swapped.filter { ("a"..."z").contains($0) || ("A"..."Z").contains($0) }.count
-        let target: InputSource.Lang? = cyrCount > latCount ? .ru : (latCount > cyrCount ? .en : nil)
+        let target: InputSource.Lang? = Switcher.langOf(swapped)
 
         print("[manual-sel] '\(text.prefix(40))' → '\(swapped.prefix(40))'")
+        DispatchQueue.main.async { [weak self] in
+            self?.syncHistoryTail(with: swapped)
+        }
         writeSelection(swapped)
 
         if let target = target {
@@ -589,9 +828,30 @@ final class Switcher {
     }
 
     private func performSwitch(replay: [Keystroke], trigger: Keystroke, fromLang: InputSource.Lang) {
-        let target: InputSource.Lang = (fromLang == .ru) ? .en : .ru
         let original = replay.map { $0.chars }.joined()
-        let translated: String = (target == .ru) ? Translit.toRu(original) : Translit.toEn(original)
+        // Свап решает по содержимому — направление задавать не нужно
+        let translated: String = Detector.shared.swap(original)
+        // Раскладку выбираем по тому что РЕАЛЬНО вставляем, а не по fromLang:
+        // currentLanguage() может врать и тогда переключение уходит в обратную сторону
+        // (вставили кириллицу, а раскладку поставили EN → дальше набор идёт латиницей).
+        let target: InputSource.Lang = Switcher.langOf(translated)
+            ?? ((fromLang == .ru) ? .en : .ru)
+
+        // Считаем подряд идущие конвертации в одну сторону
+        if lastConversionTarget == target {
+            consecutiveConversions += 1
+        } else {
+            lastConversionTarget = target
+            consecutiveConversions = 1
+        }
+        // Раскладку меняем только при подтверждённой смене языка.
+        // Одиночная вставка ('NL' в русском тексте) текст исправит, но раскладку
+        // не тронет — и ты продолжаешь писать по-русски как ни в чём не бывало.
+        let threshold = Config.shared.switchLayoutAfter
+        let shouldSwitchLayout = threshold > 0 && consecutiveConversions >= threshold
+        if !shouldSwitchLayout {
+            print("[layout] раскладку не трогаем (\(consecutiveConversions)/\(threshold) подряд)")
+        }
 
         // Ретроконверсия: цепочка одиночных букв перед текущим словом
         let retro = retroactiveChain(targetLang: target)
@@ -602,21 +862,26 @@ final class Switcher {
             print("[retro] цепочка: \(retro.map { "\($0.original)→\($0.swapped)" }.joined(separator: ", "))")
             print("[switch] '\(original)' → '\(translated)' с ретро (\(fromLang) → \(target))")
 
-            sendBackspaces(charsToDelete)
-            InputSource.switchTo(target)
+            let retroPairs = retro
+            emitQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.sendBackspaces(charsToDelete)
+                if shouldSwitchLayout { InputSource.switchTo(target) }
 
-            // Печатаем все ретро-свапы через пробелы, потом основное слово
-            for (i, pair) in retro.enumerated() {
-                if i > 0 { postUnicode(" ") }
-                for ch in pair.swapped {
-                    postUnicode(String(ch))
-                    usleep(2_000)
+                let gap = UInt32(Config.shared.keyIntervalMs) * 1000
+                for (i, pair) in retroPairs.enumerated() {
+                    if i > 0 { self.postUnicode(" ") }
+                    for ch in pair.swapped {
+                        self.postUnicode(String(ch))
+                        usleep(gap)
+                    }
                 }
-            }
-            postUnicode(" ")
-            for ch in translated {
-                postUnicode(String(ch))
-                usleep(3_000)
+                self.postUnicode(" ")
+                for ch in translated {
+                    self.postUnicode(String(ch))
+                    usleep(gap)
+                }
+                self.emitTrigger(trigger)
             }
 
             // Обновляем историю: заменяем ретро-слова на свапнутые
@@ -629,58 +894,69 @@ final class Switcher {
             }
         } else {
             print("[switch] '\(original)' → '\(translated)'  (\(fromLang) → \(target))")
-            sendBackspaces(replay.count)
-            InputSource.switchTo(target)
-            for ch in translated {
-                postUnicode(String(ch))
-                usleep(3_000)
+            // Отправка в фоне: usleep на главном потоке замораживает RunLoop
+            // и ломает доставку событий — на этом мы уже обжигались.
+            let count = replay.count
+            emitQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.sendBackspaces(count)
+                if shouldSwitchLayout { InputSource.switchTo(target) }
+                for ch in translated {
+                    self.postUnicode(String(ch))
+                    usleep(UInt32(Config.shared.keyIntervalMs) * 1000)
+                }
+                self.emitTrigger(trigger)
             }
         }
 
-        // Печатаем триггер (пробел/Enter/пунктуация)
-        let controlKeys: Set<CGKeyCode> = [49, 36, 48, 76]
-        if controlKeys.contains(trigger.keyCode) {
-            postVirtualKey(trigger.keyCode)
-        } else if !trigger.chars.isEmpty {
-            postUnicode(trigger.chars)
-        }
 
         lastSwitch = LastSwitch(
             originalChars: original,
             convertedChars: translated,
             triggerKeyCode: trigger.keyCode,
-            state: .converted
+            state: .converted,
+            wasAutomatic: true
         )
         lastCompletedWord = nil
 
-        playSound()
+        playSound(shouldSwitchLayout ? .convertAndSwitch : .convertOnly)
     }
 
     func forceSwitchLastWord() {
         guard !word.isEmpty else { return }
         let cur = InputSource.currentLanguage()
-        let target: InputSource.Lang = (cur == .ru) ? .en : .ru
         let replay = word
         word.removeAll()
 
         let original = replay.map { $0.chars }.joined()
-        let translated: String = (target == .ru) ? Translit.toRu(original) : Translit.toEn(original)
+        let translated: String = Detector.shared.swap(original)
+        // Целевая раскладка — по содержимому результата, не по currentLanguage()
+        let target: InputSource.Lang = Switcher.langOf(translated)
+            ?? ((cur == .ru) ? .en : .ru)
         print("[manual] '\(original)' → '\(translated)'  (\(cur) → \(target))")
 
-        sendBackspaces(replay.count)
-        InputSource.switchTo(target)
-        for ch in translated {
-            postUnicode(String(ch))
-            usleep(3_000)
+        let deleteCount = replay.count
+        emitQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.sendBackspaces(deleteCount)
+            InputSource.switchTo(target)
+            let gap = UInt32(Config.shared.keyIntervalMs) * 1000
+            for ch in translated {
+                self.postUnicode(String(ch))
+                usleep(gap)
+            }
         }
 
         lastSwitch = LastSwitch(
             originalChars: original,
             convertedChars: translated,
             triggerKeyCode: 0,
-            state: .converted
+            state: .converted,
+            wasAutomatic: true
         )
         lastCompletedWord = nil
+        // История должна отражать то что теперь на экране, иначе контекст соврёт
+        syncHistoryTail(with: translated)
         playSound()
     }
 
@@ -703,26 +979,34 @@ final class Switcher {
         }
         last.timestamp = Date()
 
-        // Удаляем текущий текст + триггер
-        sendBackspaces(currentText.count + triggerCount)
-
-        // Определяем целевую раскладку по содержимому targetText
-        let cyrCount = targetText.filter { ("а"..."я").contains($0) || $0 == "ё"
-                                          || ("А"..."Я").contains($0) || $0 == "Ё" }.count
-        let latCount = targetText.filter { ("a"..."z").contains($0) || ("A"..."Z").contains($0) }.count
-        let target: InputSource.Lang = cyrCount > latCount ? .ru : .en
-        InputSource.switchTo(target)
-
-        // Печатаем целевой текст
-        for ch in targetText {
-            postUnicode(String(ch))
-            usleep(3_000)
+        let deleteCount = currentText.count + triggerCount
+        let triggerKey = last.triggerKeyCode
+        emitQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.sendBackspaces(deleteCount)
+            if let target = Switcher.langOf(targetText) {
+                InputSource.switchTo(target)
+            }
+            let gap = UInt32(Config.shared.keyIntervalMs) * 1000
+            for ch in targetText {
+                self.postUnicode(String(ch))
+                usleep(gap)
+            }
+            if triggerKey != 0 { self.postVirtualKey(triggerKey) }
         }
 
-        // Возвращаем триггер
-        if last.triggerKeyCode != 0 {
-            postVirtualKey(last.triggerKeyCode)
+        // Тоггл НЕ обучает.
+        //
+        // Он служит просмотром: человек жмёт туда-обратно, чтобы увидеть оба
+        // варианта. Раньше каждое нажатие переписывало правило в противоположную
+        // сторону, и в логе получалась чехарда «больше не переключаем» /
+        // «впредь переключаем» подряд. Правило меняется только по явной команде.
+        if pendingExplicitLearn && last.state == .original {
+            LearnedRules.shared.learnStop(last.originalChars)
         }
+
+        // История должна отражать то что теперь на экране
+        syncHistoryTail(with: targetText)
 
         print("[toggle] '\(currentText)' → '\(targetText)' (state теперь = \(last.state))")
         playSound()
@@ -774,6 +1058,11 @@ final class Switcher {
             if !hasModifiers { break }
             usleep(10_000)
         }
+
+        // Ожидание восстановления буфера здесь НЕ нужно и опасно: восстановление
+        // запланировано на этой же последовательной очереди, поэтому крутить цикл
+        // означало бы блокировать очередь в ожидании задачи из неё же — вечный клинч.
+        // Порядок гарантирует сама очередь.
 
         let beforeCount = pb.changeCount
 
@@ -855,8 +1144,18 @@ final class Switcher {
         // Восстанавливаем буфер ПОЗЖЕ — медленные приложения (Electron, браузеры)
         // обрабатывают вставку до 0.5-1 сек. Если восстановить сразу — вставится
         // старое содержимое буфера («куски предыдущих текстов»).
+        //
+        // ГОНКА которую это порождало: отложенное восстановление возвращало старое
+        // содержимое в буфер, changeCount дёргался, и если в этот момент шло новое
+        // чтение выделения — оно принимало восстановленный буфер за «скопированное
+        // выделение» и вставляло чужой текст. Поэтому: помечаем что восстановление
+        // запланировано, и readSelection ждёт его завершения перед своим ⌘C.
+        pendingClipboardRestore = true
         let snapshotChangeCount = pb.changeCount
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        // Восстановление — на той же последовательной очереди что и чтение,
+        // иначе запись флага и его проверка идут из разных потоков.
+        emitQueue.asyncAfter(deadline: .now() + 1.0) {
+            defer { self.pendingClipboardRestore = false }
             // Восстанавливаем только если буфер всё ещё наш (пользователь не копировал сам)
             if pb.changeCount == snapshotChangeCount, let saved = savedItems {
                 pb.clearContents()
@@ -883,11 +1182,32 @@ final class Switcher {
 
     // MARK: - Sound
 
-    private func playSound() {
+    /// Что именно произошло — от этого зависит звук.
+    enum SoundKind {
+        /// Текст исправлен, раскладка осталась прежней.
+        case convertOnly
+        /// Текст исправлен И раскладка переключена.
+        case convertAndSwitch
+    }
+
+    /// Звуковая обратная связь. Два разных сигнала, чтобы на слух отличать
+    /// «просто исправил слово» от «исправил и сменил раскладку» — иначе
+    /// непонятно в какой раскладке продолжать печатать.
+    private func playSound(_ kind: SoundKind = .convertAndSwitch) {
         guard Config.shared.soundEnabled else { return }
+        let name: String
+        let volume: Float
+        switch kind {
+        case .convertOnly:
+            name = Config.shared.soundConvertOnly
+            volume = 0.25
+        case .convertAndSwitch:
+            name = Config.shared.soundConvertAndSwitch
+            volume = 0.3
+        }
         DispatchQueue.main.async {
-            if let s = NSSound(named: NSSound.Name("Pop")) {
-                s.volume = 0.3
+            if let s = NSSound(named: NSSound.Name(name)) {
+                s.volume = volume
                 s.play()
             }
         }
@@ -926,10 +1246,32 @@ final class Switcher {
         }
     }
 
+    /// Отправка backspace для стирания уже набранного.
+    ///
+    /// Пауза ПЕРЕД первым нажатием обязательна. Наш тап видит символ раньше, чем
+    /// его успевает принять целевое поле, и backspace прилетает в пустоту: символ
+    /// остаётся, а замена дописывается следом — так `й` превращался в `йq`
+    /// в поиске приложений. Системным полям (Spotlight, поиск программ) нужно
+    /// заметно больше времени, чем обычным текстовым.
+    /// Печать клавиши-границы (пробел/Enter/пунктуация) после замены.
+    private func emitTrigger(_ trigger: Keystroke) {
+        let controlKeys: Set<CGKeyCode> = [49, 36, 48, 76]
+        if controlKeys.contains(trigger.keyCode) {
+            postVirtualKey(trigger.keyCode)
+        } else if !trigger.chars.isEmpty {
+            postUnicode(trigger.chars)
+        }
+    }
+
     private func sendBackspaces(_ n: Int) {
+        guard n > 0 else { return }
+        usleep(UInt32(Config.shared.replaceStartDelayMs) * 1000)
+        let gap = UInt32(Config.shared.keyIntervalMs) * 1000
         for _ in 0..<n {
             postVirtualKey(51)
-            usleep(3_000)
+            usleep(gap)
         }
+        // Дать полю переварить удаление до того как начнём печатать
+        usleep(gap * 2)
     }
 }

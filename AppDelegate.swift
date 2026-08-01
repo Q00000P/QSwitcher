@@ -26,9 +26,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if !trusted {
             updateStatusBar(trusted: false, lang: .en)
-            fputs("⚠️  Нет прав Accessibility.\n", stderr)
+            fputs("⚠️  Нет прав Accessibility. Жду выдачи…\n", stderr)
+            startWaitingForAccessibility()
             return
         }
+
+        startCore()
+    }
+
+    /// Ждём появления прав и стартуем сами, без перезапуска приложения.
+    ///
+    /// Раньше приложение проверяло права один раз и, не найдя их, сдавалось
+    /// навсегда: выдал галку — изволь убить и запустить заново. Теперь опрашиваем
+    /// раз в две секунды. Опрос БЕЗ kAXTrustedCheckOptionPrompt, иначе системный
+    /// диалог будет выскакивать каждые две секунды.
+    private var accessibilityTimer: Timer?
+
+    private func startWaitingForAccessibility() {
+        accessibilityTimer?.invalidate()
+        accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+            guard AXIsProcessTrusted() else { return }
+            timer.invalidate()
+            self?.accessibilityTimer = nil
+            print("✅ Права Accessibility появились — запускаюсь")
+            self?.startCore()
+        }
+        // Таймер должен тикать и когда открыто меню
+        if let t = accessibilityTimer {
+            RunLoop.main.add(t, forMode: .common)
+        }
+    }
+
+    /// Основной запуск: конфиг, лог, перехват. Вызывается либо сразу,
+    /// либо когда права наконец выданы.
+    private func startCore() {
 
         _ = Config.shared
 
@@ -59,14 +90,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !trusted {
             btn.title = "⌨︎!"
             btn.image = nil
-            btn.toolTip = "AutoSwitcher — нет прав Accessibility"
+            btn.toolTip = "QSwitcher — нет прав Accessibility"
             return
         }
 
         if !Config.shared.enabled {
             btn.title = "⏸"
             btn.image = nil
-            btn.toolTip = "AutoSwitcher на паузе"
+            btn.toolTip = "QSwitcher на паузе"
             return
         }
 
@@ -75,7 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         btn.image = nil
         btn.title = label
         btn.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        btn.toolTip = "AutoSwitcher — текущая раскладка: \(label)"
+        btn.toolTip = "QSwitcher — текущая раскладка: \(label)"
     }
 
     // MARK: - Menu
@@ -84,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
-        headerItem = NSMenuItem(title: "AutoSwitcher", action: nil, keyEquivalent: "")
+        headerItem = NSMenuItem(title: "QSwitcher", action: nil, keyEquivalent: "")
         headerItem.isEnabled = false
         menu.addItem(headerItem)
         menu.addItem(NSMenuItem.separator())
@@ -146,6 +177,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         help.target = self
         menu.addItem(help)
 
+        let learned = NSMenuItem(title: "Выученные правила…", action: #selector(showLearned), keyEquivalent: "")
+        learned.target = self
+        menu.addItem(learned)
+
+        let resetLearn = NSMenuItem(title: "Сбросить выученное…", action: #selector(resetLearned), keyEquivalent: "")
+        resetLearn.target = self
+        menu.addItem(resetLearn)
+
         let about = NSMenuItem(title: "О программе…", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
         menu.addItem(about)
@@ -174,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trusted = AXIsProcessTrusted()
 
         headerItem.title = !trusted ? "Нет прав Accessibility"
-                          : (cfg.enabled ? "AutoSwitcher активен (\(switcher?.currentLang == .ru ? "RU" : "EN"))" : "AutoSwitcher на паузе")
+                          : (cfg.enabled ? "QSwitcher активен (\(switcher?.currentLang == .ru ? "RU" : "EN"))" : "QSwitcher на паузе")
 
         pauseItem.title = cfg.enabled ? "Поставить на паузу" : "Возобновить"
         soundItem.state = cfg.soundEnabled ? .on : .off
@@ -450,7 +489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func logExport() {
         withTouchID(reason: "экспортировать расшифрованный лог") {
             let panel = NSSavePanel()
-            panel.nameFieldStringValue = "AutoSwitcher-log-\(Self.dateStamp()).txt"
+            panel.nameFieldStringValue = "QSwitcher-log-\(Self.dateStamp()).txt"
             panel.canCreateDirectories = true
             NSApp.activate(ignoringOtherApps: true)
             if panel.runModal() == .OK, let url = panel.url {
@@ -531,12 +570,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return df.string(from: Date())
     }
 
+    @objc private func showLearned() {
+        let r = LearnedRules.shared
+        let stopList  = r.stop.sorted().joined(separator: ", ")
+        let forceList = r.force.sorted().joined(separator: ", ")
+        let body = """
+        Свитчер запоминает твои исправления:
+        откатил переключение — больше не трогает,
+        переключил вручную — впредь делает сам.
+
+        Правила создаются ТОЛЬКО через ⇧ + правый Option.
+        Обычный свап и тоггл ничего не меняют — можно спокойно
+        смотреть оба варианта, правило не перезапишется.
+
+        ━━━ НЕ ПЕРЕКЛЮЧАТЬ (\(r.stop.count)) ━━━
+
+        \(stopList.isEmpty ? "—" : stopList)
+
+        ━━━ ПЕРЕКЛЮЧАТЬ (\(r.force.count)) ━━━
+
+        \(forceList.isEmpty ? "—" : forceList)
+
+        ━━━━━━━━━━━━━━━━━━━━
+
+        Сбросить: меню → «Сбросить выученное…»
+        Файл: ~/Library/Application Support/QSwitcher/learned.json
+        """
+        showScrollableText(title: "Выученные правила", body: body)
+    }
+
+    @objc private func resetLearned() {
+        let r = LearnedRules.shared
+        let alert = NSAlert()
+        alert.messageText = "Сбросить выученные правила?"
+        alert.informativeText = "Сейчас записано: \(r.summary).\nПосле сброса свитчер начнёт учиться заново."
+        alert.addButton(withTitle: "Отмена")
+        alert.addButton(withTitle: "Сбросить")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            LearnedRules.shared.reset()
+        }
+    }
+
     @objc private func showAbout() {
         let alert = NSAlert()
         alert.messageText = AppVersion.fullString
         alert.informativeText = """
         Автопереключатель раскладки RU↔EN для macOS.
-        Аналог Punto Switcher.
+        Автоматически исправляет текст, набранный не в той раскладке.
 
         Версия: \(AppVersion.version)
         Билд: #\(AppVersion.build)
@@ -551,10 +632,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.runModal()
     }
 
+
+    /// Окно с прокруткой для длинных текстов.
+    ///
+    /// NSAlert для справки не годится: он не умеет прокрутку и просто растёт по
+    /// высоте, пока не уедет за нижнюю границу экрана. При этом он модальный,
+    /// поэтому висит поверх всего и не закрывается — приходилось убивать процесс.
+    private var textWindows: [NSWindow] = []
+
+    private func showScrollableText(title: String, body: String) {
+        // Если такое окно уже открыто — просто выводим его вперёд
+        if let existing = textWindows.first(where: { $0.title == title }) {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let w = min(760, screen.width  * 0.55)
+        let h = screen.height * 0.82
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = title
+        window.isReleasedWhenClosed = false
+        window.center()
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = false
+        scroll.borderType = .noBorder
+        scroll.autoresizingMask = [.width, .height]
+
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        text.isEditable = false
+        text.isSelectable = true
+        text.drawsBackground = false
+        text.textContainerInset = NSSize(width: 18, height: 16)
+        text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        text.string = body
+        text.isVerticallyResizable = true
+        text.autoresizingMask = [.width]
+        text.textContainer?.widthTracksTextView = true
+
+        scroll.documentView = text
+        window.contentView = scroll
+
+        // Прокрутка в начало (NSTextView по умолчанию показывает конец)
+        text.scrollRangeToVisible(NSRange(location: 0, length: 0))
+
+        textWindows.append(window)
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            self?.textWindows.removeAll { $0 === window }
+        }
+
+        // Уходим в другое приложение — окно убирается. Это утилита из строки меню,
+        // её справка не должна висеть поверх работы.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak window] _ in
+            window?.orderOut(nil)
+        }
+
+        // Esc закрывает
+        window.standardWindowButton(.closeButton)?.isEnabled = true
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     @objc private func showHelp() {
-        let alert = NSAlert()
-        alert.messageText = "AutoSwitcher — горячие клавиши"
-        alert.informativeText = """
+        showScrollableText(title: "QSwitcher — горячие клавиши", body: """
         ━━━ ПЕРЕКЛЮЧЕНИЕ ━━━
 
         ПРАВЫЙ Option — переключить набранное / тоггл
@@ -565,6 +719,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ЛЕВЫЙ Option — переключить ВЫДЕЛЕННЫЙ мышкой текст
             Выделил мышью слово/фразу → тапнул левый Option → свапнулось.
             Работает с любым текстом, без проверки словарей.
+
+        ⇧ + ПРАВЫЙ Option — переключить И ЗАПОМНИТЬ
+            Свитчер запомнит решение для этого слова навсегда.
+            Без Shift короткие слова (2–3 буквы) запоминаются сами,
+            длинные — только по этой команде.
 
         ⌘⇧Space — универсально (выделение если есть, иначе буфер)
 
@@ -600,14 +759,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         • Стоп-слово — НИКОГДА не переключается
         • Форс-слово — ВСЕГДА переключается
         • Свои слова можно добавлять прямо в файл:
-          ~/Library/Application Support/AutoSwitcher/dicts/ru.txt
-          ~/Library/Application Support/AutoSwitcher/dicts/en.txt
+          ~/Library/Application Support/QSwitcher/dicts/ru.txt
+          ~/Library/Application Support/QSwitcher/dicts/en.txt
           (одно слово на строку, нижний регистр)
-        """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Закрыть")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        """)
     }
 
     @objc private func quit() {

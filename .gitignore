@@ -1,11 +1,18 @@
+# Сборочные артефакты
 .build/
 *.app
 *.dmg
 *.zip
 dmg-staging/
 .build_number
-Sources/AutoSwitcher/Resources/ru.txt
-Sources/AutoSwitcher/Resources/en.txt
+
+# Большие словари — качаются скриптом fetch-dicts.sh, не храним в гите
+Sources/QSwitcher/Resources/ru.txt
+Sources/QSwitcher/Resources/en.txt
+
+# macOS
 .DS_Store
 *.swp
+
+# Восстановленный мусор
 recup_dir.*/

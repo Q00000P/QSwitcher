@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")"
 
-OUT_DIR="Sources/AutoSwitcher/Resources"
+OUT_DIR="Sources/QSwitcher/Resources"
 mkdir -p "$OUT_DIR"
 
 RU_URL="https://raw.githubusercontent.com/danakt/russian-words/master/russian.txt"
