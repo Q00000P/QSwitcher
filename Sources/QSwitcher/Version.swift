@@ -13,6 +13,6 @@ enum AppVersion {
 
 /// Автогенерируется make-app.sh — не редактировать руками.
 enum BuildInfo {
-    static let number = "10"
-    static let date = "2026-08-01 14:16"
+    static let number = "11"
+    static let date = "2026-08-01 14:38"
 }
