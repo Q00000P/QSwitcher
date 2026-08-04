@@ -1,0 +1,15 @@
+# Сборка
+bin/
+obj/
+
+# Большие словари — качаются скриптом, в репозитории не нужны
+src/QSwitcher.App/Resources/ru.txt
+src/QSwitcher.App/Resources/en.txt
+
+# Звук из Punto Switcher — чужой ассет, в репозиторий не кладём.
+# Если положил свой файл под этим именем, он останется только локально.
+src/QSwitcher.App/Resources/switch.wav
+
+# Пользовательское
+*.user
+.vs/

@@ -1,6 +1,6 @@
 # Сборочные артефакты
 .build/
-*.app
+/*.app
 *.dmg
 *.zip
 dmg-staging/

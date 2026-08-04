@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>QSwitcher</AssemblyName>
+    <ApplicationIcon>Resources\qswitcher.ico</ApplicationIcon>
+    <!-- Win10 1607+ (нужно для флага 4 в ToUnicodeEx) -->
+    <SupportedOSPlatformVersion>10.0.14393.0</SupportedOSPlatformVersion>
+    <!-- Портативная сборка: один exe, рантайм внутри, установка не нужна -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+
+    <!-- Сжатие рантайма внутри exe: было ~178 МБ, станет заметно меньше.
+         Цена — чуть более долгий первый запуск (распаковка в кэш). -->
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+
+    <!-- Выкидываем неиспользуемый код фреймворка. Для WinForms обрезка
+         консервативная, но десятки мегабайт снимает. -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <DebugType>none</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!-- WinForms тянет за собой куски WPF (D3DCompiler, wpfgfx, PresentationNative).
+         Приложению они не нужны — папка сборки становится чище. -->
+    <UseWPF>false</UseWPF>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\QSwitcher.Core\QSwitcher.Core.csproj" />
+    <!-- DPAPI (ProtectedData) в .NET вынесен в отдельный пакет -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Словари и звуки ВНУТРИ сборки: приложение должно быть одним файлом,
+         который просто запускается. Раньше они лежали рядом папкой, и без
+         неё exe был бесполезен. Код при этом сначала ищет файл снаружи —
+         так можно подменить словарь или звук, не пересобирая. -->
+    <EmbeddedResource Include="Resources\**" />
+  </ItemGroup>
+</Project>
