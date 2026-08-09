@@ -161,7 +161,7 @@ public sealed class BufferedLogger : IDisposable
 /// <summary>Версия приложения.</summary>
 public static class AppVersion
 {
-    public const string Version = "0.1";
+    public const string Version = "3.2";
 }
 
 /// <summary>
@@ -403,7 +403,7 @@ public sealed class TrayUi : IDisposable
 
         _icon = new NotifyIcon
         {
-            Text = "QSwitcher",
+            Text = $"QSwitcher {AppVersion.Version}",
             Icon = TrayIconFactory.ForLayout("EN", paused: false),
             ContextMenuStrip = menu,
             Visible = true,
@@ -450,7 +450,7 @@ public sealed class TrayUi : IDisposable
             _lastPaused = paused;
             var icon = TrayIconFactory.ForLayout(label, paused);
             _icon.Icon = icon;
-            _icon.Text = paused ? $"QSwitcher — пауза ({label})" : $"QSwitcher — {label}";
+            _icon.Text = paused ? $"QSwitcher {AppVersion.Version} — пауза ({label})" : $"QSwitcher {AppVersion.Version} — {label}";
         }
         catch { }
     }

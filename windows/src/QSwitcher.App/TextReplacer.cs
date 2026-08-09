@@ -108,6 +108,8 @@ public sealed class TextReplacer : IDisposable
                 // и последние из них могут прилететь в хук уже после Execute.
                 Thread.Sleep(30);
                 Injecting = false;
+                // Доввод реального ввода, съеденного хуком во время замены.
+                FlushDelayed();
             }
         }
     }
@@ -126,6 +128,11 @@ public sealed class TextReplacer : IDisposable
         int id = ++_jobCounter;
         Log($"[replace #{id}] стираю {job.EraseCount}, печатаю '{job.Text}'");
 
+        // Раскладка окна ДО любых наших действий: по ней будут переведены
+        // задержанные шлюзом нажатия. После замены раскладка может смениться,
+        // а человек жал клавиши ещё при старой — довводить надо её символы.
+        _jobLayout = ForegroundLayoutHandle();
+
         // Пауза перед стиранием. Хук пропускает клавишу-границу дальше и сразу
         // ставит слово в очередь — но приложение может ещё не успеть её
         // обработать. Тогда backspace'ы стирают на символ больше, чем реально
@@ -133,17 +140,36 @@ public sealed class TextReplacer : IDisposable
         // покрыть доставку одного события, а не ожидание человека.
         if (StartDelayMs > 0) Thread.Sleep(StartDelayMs);
 
-        SendBackspaces(job.EraseCount);
-
-        // Печатаем замену юникодом — от раскладки не зависит
-        SendText(job.Text);
+        // ОДИН вызов SendInput со всем пакетом: backspace'ы + замена + триггер
+        // встают в системную очередь атомарно — между ними физически не может
+        // вклиниться другой ввод. Паузы между событиями убраны: порядок
+        // гарантирует сама очередь, пейсинг лишь растягивал окно гонки.
+        var batch = new List<INPUT>(job.EraseCount * 2 + (job.Text.Length + 2) * 2);
+        for (int i = 0; i < job.EraseCount; i++)
+        {
+            batch.Add(VkInput(0x08, false));
+            batch.Add(VkInput(0x08, true));
+        }
+        foreach (char c in job.Text)
+        {
+            batch.Add(CharInput(c, false));
+            batch.Add(CharInput(c, true));
+        }
 
         // Триггер: печатные символы юникодом (код клавиши прогнался бы через
         // текущую раскладку и дал не тот символ), а Enter и Tab — виртуальными
         // клавишами: как юникод они вставляют не перевод строки, а мусор.
-        if (job.TriggerChar == "\r") SendVirtualKey(0x0D);
-        else if (job.TriggerChar == "\t") SendVirtualKey(0x09);
-        else if (job.TriggerChar.Length > 0) SendText(job.TriggerChar);
+        if (job.TriggerChar == "\r") { batch.Add(VkInput(0x0D, false)); batch.Add(VkInput(0x0D, true)); }
+        else if (job.TriggerChar == "\t") { batch.Add(VkInput(0x09, false)); batch.Add(VkInput(0x09, true)); }
+        else foreach (char c in job.TriggerChar)
+        {
+            batch.Add(CharInput(c, false));
+            batch.Add(CharInput(c, true));
+        }
+
+        uint sent = SendInput((uint)batch.Count, batch.ToArray(), Marshal.SizeOf<INPUT>());
+        if (sent != batch.Count)
+            Log($"[replace #{id}] отправлено {sent}/{batch.Count} событий (err={Marshal.GetLastWin32Error()})");
 
         // Раскладку переключаем ПОСЛЕ печати. PostMessage асинхронный, и если
         // делать это раньше, часть символов уходит в старой раскладке, часть
@@ -239,38 +265,109 @@ public sealed class TextReplacer : IDisposable
         SendInput(4, inputs, Marshal.SizeOf<INPUT>());
     }
 
-    private void SendBackspaces(int n)
+    // === Input-gate: реальный ввод, съеденный хуком во время замены ===
+
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(uint Vk, ushort Scan, bool Up, bool Ext, bool Shift, bool Caps)> _delayed = new();
+    private const int DelayedCap = 128;
+
+    /// Раскладка окна на момент старта текущего задания (см. Execute).
+    private IntPtr _jobLayout;
+
+    /// Довведённый юникодом текст сюда: монитор кладёт его в буфер слова
+    /// готовыми символами (сам он эти события не видит — они с маркером).
+    public Action<string>? OnReplayedText;
+
+    /// Отложить реальное нажатие. Зовётся из потока LL-хука — только быстрая
+    /// постановка в очередь, никакого WinAPI и логов.
+    public void DelayRealKey(uint vk, ushort scan, bool up, bool extended, bool shift, bool caps)
     {
-        int failed = 0;
-        for (int i = 0; i < n; i++)
-        {
-            if (!SendVirtualKey(0x08)) failed++;
-            Thread.Sleep(3);
-        }
-        if (failed > 0) Log($"[replace] {failed} из {n} backspace не ушли (err={Marshal.GetLastWin32Error()})");
-        // Дать приложению переварить удаление до печати
-        Thread.Sleep(5);
+        if (_delayed.Count < DelayedCap)
+            _delayed.Enqueue((vk, scan, up, extended, shift, caps));
     }
 
-    private void SendText(string text)
+    /// Доввод задержанного. ПЕЧАТНЫЕ клавиши переводим в символы по раскладке
+    /// НА МОМЕНТ НАЖАТИЯ (_jobLayout) и шлём юникодом с маркером: замена могла
+    /// переключить раскладку, и сканкоды легли бы на экран не теми буквами —
+    /// именно так после свапа 'ТД'→'NL' кириллица превращалась в 'z ndjq'.
+    /// КОНТРОЛЬНЫЕ (пробел, Enter, backspace, стрелки) от раскладки не зависят —
+    /// идут сканкодами БЕЗ маркера, чтобы штатно пройти хук как границы/сбросы.
+    /// Вызывать строго ПОСЛЕ Injecting = false.
+    private void FlushDelayed()
     {
-        foreach (char c in text)
+        if (_delayed.IsEmpty) return;
+        var list = new List<INPUT>();
+        var replayedText = new System.Text.StringBuilder();
+        var unicodeDowns = new HashSet<uint>();
+
+        while (_delayed.TryDequeue(out var k))
         {
-            var inputs = new INPUT[2];
-            inputs[0] = CharInput(c, false);
-            inputs[1] = CharInput(c, true);
-            SendInput(2, inputs, Marshal.SizeOf<INPUT>());
-            Thread.Sleep(2);
+            if (k.Up)
+            {
+                // Пара down этой клавиши ушла юникодом — up уже отправлен с ней
+                if (unicodeDowns.Remove(k.Vk)) continue;
+                list.Add(RealKeyInput(k.Vk, k.Scan, true, k.Ext));
+                continue;
+            }
+
+            string s = "";
+            if (k.Vk != 0x20) // пробел — всегда сканкодом: это граница слова
+            {
+                var state = new byte[256];
+                if (k.Shift) state[0x10] = 0x80;
+                if (k.Caps) state[0x14] = 0x01;
+                s = KeyTranslator.Translate(k.Vk, k.Scan, state, _jobLayout);
+            }
+
+            if (s.Length > 0 && !char.IsControl(s[0]) && s[0] != ' ')
+            {
+                foreach (char c in s)
+                {
+                    list.Add(CharInput(c, false));
+                    list.Add(CharInput(c, true));
+                }
+                replayedText.Append(s);
+                unicodeDowns.Add(k.Vk);
+            }
+            else
+            {
+                list.Add(RealKeyInput(k.Vk, k.Scan, false, k.Ext));
+            }
         }
+
+        if (list.Count == 0) return;
+        Log($"[gate] доввод {list.Count} событий" +
+            (replayedText.Length > 0 ? $", юникодом: '{replayedText}'" : ""));
+        uint sent = SendInput((uint)list.Count, list.ToArray(), Marshal.SizeOf<INPUT>());
+        if (sent != list.Count)
+            Log($"[gate] отправлено {sent}/{list.Count} (err={Marshal.GetLastWin32Error()})");
+        if (replayedText.Length > 0)
+            OnReplayedText?.Invoke(replayedText.ToString());
     }
 
-    private bool SendVirtualKey(uint vk)
+    /// Раскладка потока окна с фокусом.
+    private static IntPtr ForegroundLayoutHandle()
     {
-        var inputs = new INPUT[2];
-        inputs[0] = VkInput(vk, false);
-        inputs[1] = VkInput(vk, true);
-        return SendInput(2, inputs, Marshal.SizeOf<INPUT>()) == 2;
+        IntPtr hwnd = GetForegroundWindow();
+        uint threadId = hwnd != IntPtr.Zero ? GetWindowThreadProcessId(hwnd, out _) : 0;
+        return GetKeyboardLayout(threadId);
     }
+
+    /// Клавиша доввода: со скан-кодом и extended-флагом как у оригинала,
+    /// dwExtraInfo = 0 — хук обработает её как реальный ввод.
+    private static INPUT RealKeyInput(uint vk, ushort scan, bool up, bool extended) => new()
+    {
+        type = 1,
+        u = new InputUnion
+        {
+            ki = new KEYBDINPUT
+            {
+                wVk = (ushort)vk,
+                wScan = scan,
+                dwFlags = (up ? 0x0002u : 0u) | (extended ? 0x0001u : 0u),
+                dwExtraInfo = 0,
+            }
+        }
+    };
 
     /// <summary>
     /// Переключение раскладки активного окна. ActivateKeyboardLayout меняет
@@ -383,6 +480,8 @@ public sealed class TextReplacer : IDisposable
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint idThread);
     [DllImport("user32.dll")] private static extern int GetKeyboardLayoutList(int nBuff, [Out] IntPtr[] lpList);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 }

@@ -58,7 +58,7 @@ public sealed class KeyboardMonitor : IDisposable
     public record Keystroke(uint VirtualKey, string Chars, bool Shift = false, bool Caps = false);
 
     /// Сырое нажатие, каким его увидел хук. Разбирается уже в рабочем потоке.
-    private record PendingKey(uint Vk, bool Shift, bool Caps, bool OtherLayout);
+    private record PendingKey(uint Vk, bool Shift, bool Caps, bool OtherLayout, string? Text = null);
 
     private readonly System.Collections.Concurrent.BlockingCollection<PendingKey> _pending = new();
     private Thread? _processor;
@@ -70,6 +70,10 @@ public sealed class KeyboardMonitor : IDisposable
         _learned = learned;
         _pair = pair;
         _replacer = replacer;
+        // Довведённые шлюзом юникод-символы идут с маркером и мимо хука —
+        // реплейсер отдаёт их сюда, чтобы буфер слова их не терял.
+        _replacer.OnReplayedText = s =>
+            _pending.Add(new PendingKey(0, false, false, false, s));
         _log = log;
         _keyboardProc = KeyboardCallback;
         _mouseProc = MouseCallback;
@@ -122,7 +126,18 @@ public sealed class KeyboardMonitor : IDisposable
     {
         foreach (var key in _pending.GetConsumingEnumerable())
         {
-            try { HandleKeyDown(key.Vk, key.Shift, key.Caps, key.OtherLayout); }
+            try
+            {
+                if (key.Text is not null)
+                {
+                    // Готовые символы довведённого шлюзом текста — сразу в буфер,
+                    // на границе слова они пойдут как есть, без перевода по vk.
+                    foreach (char c in key.Text)
+                        _word.Add(new Keystroke(0, c.ToString()));
+                    continue;
+                }
+                HandleKeyDown(key.Vk, key.Shift, key.Caps, key.OtherLayout);
+            }
             catch (Exception ex) { _log($"[keys] ошибка: {ex.Message}"); }
         }
     }
@@ -134,12 +149,41 @@ public sealed class KeyboardMonitor : IDisposable
         var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
 
         // Свои синтетические события пропускаем без обработки.
-        // Проверяем И метку, И флаг отправки: метка иногда теряется по пути,
-        // и тогда наша же замена уходила в детектор по второму кругу.
-        if (info.dwExtraInfo == InjectedMarker || _replacer.Injecting)
+        if (info.dwExtraInfo == InjectedMarker)
             return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
         int msg = wParam.ToInt32();
+
+        // Идёт замена — РЕАЛЬНЫЙ ввод в приложение не пропускаем: иначе он
+        // вклинится между backspace и печатью замены, и backspace съест свежие
+        // буквы (те самые «наслоения» при живой печати). Съедаем, откладываем,
+        // довводим после завершения задания — в исходном порядке, через хук,
+        // так что нажатия попадут и в буфер слова, и в приложение.
+        // Раньше здесь был простой pass-through — ввод летел прямо под backspace,
+        // а детектор его вдобавок не видел.
+        if (_replacer.Injecting)
+        {
+            // Инжектированные события (LLKHF_INJECTED ставит сама система для
+            // любого SendInput) пропускаем: это наши с потерявшейся меткой —
+            // раньше из-за них замена уходила в детектор по второму кругу.
+            // Задерживаем только ввод с реальной клавиатуры.
+            bool injected = (info.flags & 0x10) != 0;
+            if (!injected && msg is WM_KEYDOWN or WM_SYSKEYDOWN or WM_KEYUP or WM_SYSKEYUP)
+            {
+                // Shift трекаем и здесь (идемпотентно), иначе задержанная буква
+                // уйдёт без признака регистра. Caps не трогаем: его toggle
+                // сработает при довводе самого события.
+                bool isUp = msg is WM_KEYUP or WM_SYSKEYUP;
+                if (info.vkCode is 0x10 or 0xA0 or 0xA1) _shiftDown = !isUp;
+                _replacer.DelayRealKey(info.vkCode, (ushort)info.scanCode,
+                    up: isUp,
+                    extended: (info.flags & 0x01) != 0,
+                    shift: _shiftDown, caps: _capsOn);
+                return (IntPtr)1;
+            }
+            return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        }
+
         if (msg is WM_KEYUP or WM_SYSKEYUP)
         {
             if (HotkeyDetector.IsTrackableModifier(info.vkCode))
@@ -351,7 +395,8 @@ public sealed class KeyboardMonitor : IDisposable
         // Дёшево (одно слово вместо каждой буквы) и точно (без отставания кэша).
         bool otherLayout = KeyMap.QueryOtherLayoutActive();
         string text = string.Concat(_word.Select(k =>
-            KeyMap.Translate(k.VirtualKey, otherLayout, k.Shift, k.Caps)));
+            k.Chars.Length > 0 ? k.Chars
+                               : KeyMap.Translate(k.VirtualKey, otherLayout, k.Shift, k.Caps)));
         var wordCopy = _word.ToList();
         _word.Clear();
         if (text.Length == 0) return;
