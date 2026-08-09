@@ -116,6 +116,19 @@ final class Switcher {
     /// содержимое за «скопированное выделение» и вставит чужой текст.
     private var pendingClipboardRestore = false
 
+    // === Input-gate ===
+    /// Счётчик активных заданий замены. Пока > 0 — реальные keyDown пользователя
+    /// не пропускаются в приложение, а копятся в pendingRealEvents и довводятся
+    /// после завершения замены. Без шлюза быстрый набор вклинивается между
+    /// синтетическими backspace и печатью замены: backspace съедает свежие буквы,
+    /// замена размазывается по ним — те самые «наслоения» при живой печати.
+    private var activeReplays = 0
+    private var pendingRealEvents: [(event: CGEvent, chars: String)] = []
+    private static let pendingCap = 64
+    /// Страховка: если задание замены зависло и счётчик не обнулился,
+    /// через 2 с принудительно открываем ввод — иначе клавиатура «мертва».
+    private var gateWatchdog: Timer?
+
     /// История последних N набранных слов для определения контекста (RU vs EN).
     private var wordHistory: [String] = []
     private let historyCapacity = 5
@@ -315,6 +328,23 @@ final class Switcher {
             return Unmanaged.passUnretained(event)
         }
 
+        // Идёт замена — реальный ввод задерживаем, чтобы он не вклинился между
+        // синтетическими backspace и печатью. Символ переводим СЕЙЧАС, пока
+        // раскладка ещё не переключена заменой: довводить будем юникодом,
+        // иначе кейкоды лягут на экран буквами новой раскладки (на винде так
+        // кириллица превращалась в 'z ndjq'). Контрольные клавиши довводятся
+        // репостом события — они от раскладки не зависят.
+        if activeReplays > 0 {
+            if pendingRealEvents.count < Switcher.pendingCap, let copy = event.copy() {
+                let kc = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+                let chars = KeyTranslate.char(keyCode: kc, flags: event.flags) ?? ""
+                pendingRealEvents.append((event: copy, chars: chars))
+                return nil
+            }
+            // Переполнение очереди — пропускаем как есть, хуже потерять ввод
+            return Unmanaged.passUnretained(event)
+        }
+
         // Любое нажатие настоящей клавиши во время удержания модификатора —
         // «загрязняет» удержание (это уже шорткат, не одиночный тап)
         if modifierPressTime != nil {
@@ -457,6 +487,10 @@ final class Switcher {
                     // В истории сохраняем уже свапнутую версию
                     let swapped = Detector.shared.swap(text)
                     appendToHistory(swapped)
+                    // Шлюз открываем СИНХРОННО здесь, а не внутри performSwitch:
+                    // между return nil и async-блоком следующее нажатие успевает
+                    // проскочить в приложение и попасть под backspace.
+                    beginGate()
                     DispatchQueue.main.async { [weak self] in
                         self?.performSwitch(replay: replay, trigger: trigger, fromLang: cur)
                     }
@@ -669,6 +703,69 @@ final class Switcher {
         InputSource.switchTo(target)
     }
 
+    // MARK: - Input gate
+
+    /// Открыть шлюз перед заданием замены. Вызывать на main СИНХРОННО с решением
+    /// о замене — до emitQueue.async, иначе следующее нажатие успевает проскочить.
+    private func beginGate() {
+        activeReplays += 1
+        gateWatchdog?.invalidate()
+        gateWatchdog = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            guard let self = self, self.activeReplays > 0 else { return }
+            print("[gate] watchdog: замена не завершилась за 2с — принудительно открываю ввод")
+            self.activeReplays = 0
+            self.flushPendingInput()
+        }
+    }
+
+    /// Закрыть шлюз. Вызывать в КОНЦЕ блока на emitQueue (через defer).
+    private func endGate() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.activeReplays = max(0, self.activeReplays - 1)
+            if self.activeReplays == 0 {
+                self.gateWatchdog?.invalidate()
+                self.gateWatchdog = nil
+                self.flushPendingInput()
+            }
+        }
+    }
+
+    /// Доввод задержанного реального ввода (на main, без пауз).
+    /// Печатные клавиши — юникодом с символом раскладки НА МОМЕНТ НАЖАТИЯ,
+    /// и сразу в буфер слова (юникод-события идут с magic мимо tap'а).
+    /// Контрольные (границы, backspace, навигация) — репостом оригинального
+    /// события без magic: пройдут через tap штатно как границы и сбросы.
+    private func flushPendingInput() {
+        guard !pendingRealEvents.isEmpty else { return }
+        let pending = pendingRealEvents
+        pendingRealEvents.removeAll()
+        // Клавиши, которые обязаны пройти обычную обработку tap'а
+        let controlKeys: Set<CGKeyCode> = [
+            49, 36, 76, 48, 51, 53,
+            123, 124, 125, 126,
+            115, 116, 117, 119, 121,
+            122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111
+        ]
+        var typed = ""
+        for item in pending {
+            let kc = CGKeyCode(item.event.getIntegerValueField(.keyboardEventKeycode))
+            let printable = !item.chars.isEmpty
+                && !controlKeys.contains(kc)
+                && item.chars.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+                && item.event.flags.intersection([.maskCommand, .maskControl]).isEmpty
+            if printable {
+                postUnicode(item.chars)
+                word.append(Keystroke(keyCode: kc, flags: item.event.flags, chars: item.chars))
+                typed += item.chars
+            } else {
+                item.event.post(tap: .cghidEventTap)
+            }
+        }
+        print("[gate] доввод \(pending.count) задержанных нажатий"
+            + (typed.isEmpty ? "" : ", юникодом: '\(typed)'"))
+    }
+
     /// ПРАВЫЙ Option — свап набранного / тоггл. Не трогает выделение вообще
     /// (не дёргает ⌘C), поэтому работает стабильно.
     /// Максимальная длина слова для АВТОМАТИЧЕСКОГО обучения.
@@ -721,21 +818,16 @@ final class Switcher {
         let triggerCount = (last.triggerKeyCode != 0) ? 1 : 0
         let toDelete = original.count + triggerCount
 
+        beginGate()
         emitQueue.async { [weak self] in
             guard let self = self else { return }
+            defer { self.endGate() }
             self.sendBackspaces(toDelete)
             InputSource.switchTo(target)
-            let gap = UInt32(Config.shared.keyIntervalMs) * 1000
-            for ch in translated {
-                self.postUnicode(String(ch))
-                usleep(gap)
-            }
+            self.postUnicode(translated)
+            // Триггер возвращаем ЗДЕСЬ и только здесь. Раньше он отправлялся
+            // дважды — второй раз снаружи async-блока — и плодил лишние пробелы.
             if triggerCount > 0 { self.postVirtualKey(last.triggerKeyCode) }
-        }
-
-        // Возвращаем триггер
-        if last.triggerKeyCode != 0 {
-            postVirtualKey(last.triggerKeyCode)
         }
 
         // Сохраняем как тоггл-состояние, чтобы Option повторно можно было откатить назад
@@ -858,29 +950,19 @@ final class Switcher {
 
         if !retro.isEmpty {
             // Удаляем: каждое retro-слово (1 символ) + пробел после него, и текущее слово
-            let charsToDelete = retro.count * 2 + replay.count
+            let charsToDelete = retro.count * 2 + original.count
             print("[retro] цепочка: \(retro.map { "\($0.original)→\($0.swapped)" }.joined(separator: ", "))")
             print("[switch] '\(original)' → '\(translated)' с ретро (\(fromLang) → \(target))")
 
             let retroPairs = retro
             emitQueue.async { [weak self] in
                 guard let self = self else { return }
+                defer { self.endGate() }
                 self.sendBackspaces(charsToDelete)
                 if shouldSwitchLayout { InputSource.switchTo(target) }
-
-                let gap = UInt32(Config.shared.keyIntervalMs) * 1000
-                for (i, pair) in retroPairs.enumerated() {
-                    if i > 0 { self.postUnicode(" ") }
-                    for ch in pair.swapped {
-                        self.postUnicode(String(ch))
-                        usleep(gap)
-                    }
-                }
-                self.postUnicode(" ")
-                for ch in translated {
-                    self.postUnicode(String(ch))
-                    usleep(gap)
-                }
+                let text = retroPairs.map { $0.swapped }.joined(separator: " ")
+                    + " " + translated
+                self.postUnicode(text)
                 self.emitTrigger(trigger)
             }
 
@@ -896,15 +978,15 @@ final class Switcher {
             print("[switch] '\(original)' → '\(translated)'  (\(fromLang) → \(target))")
             // Отправка в фоне: usleep на главном потоке замораживает RunLoop
             // и ломает доставку событий — на этом мы уже обжигались.
-            let count = replay.count
+            // Удаляем по числу ГРАФЕМ на экране, не по числу кейстроков:
+            // dead keys и композиция дают одну графему из нескольких нажатий.
+            let count = original.count
             emitQueue.async { [weak self] in
                 guard let self = self else { return }
+                defer { self.endGate() }
                 self.sendBackspaces(count)
                 if shouldSwitchLayout { InputSource.switchTo(target) }
-                for ch in translated {
-                    self.postUnicode(String(ch))
-                    usleep(UInt32(Config.shared.keyIntervalMs) * 1000)
-                }
+                self.postUnicode(translated)
                 self.emitTrigger(trigger)
             }
         }
@@ -935,16 +1017,14 @@ final class Switcher {
             ?? ((cur == .ru) ? .en : .ru)
         print("[manual] '\(original)' → '\(translated)'  (\(cur) → \(target))")
 
-        let deleteCount = replay.count
+        let deleteCount = original.count
+        beginGate()
         emitQueue.async { [weak self] in
             guard let self = self else { return }
+            defer { self.endGate() }
             self.sendBackspaces(deleteCount)
             InputSource.switchTo(target)
-            let gap = UInt32(Config.shared.keyIntervalMs) * 1000
-            for ch in translated {
-                self.postUnicode(String(ch))
-                usleep(gap)
-            }
+            self.postUnicode(translated)
         }
 
         lastSwitch = LastSwitch(
@@ -981,17 +1061,15 @@ final class Switcher {
 
         let deleteCount = currentText.count + triggerCount
         let triggerKey = last.triggerKeyCode
+        beginGate()
         emitQueue.async { [weak self] in
             guard let self = self else { return }
+            defer { self.endGate() }
             self.sendBackspaces(deleteCount)
             if let target = Switcher.langOf(targetText) {
                 InputSource.switchTo(target)
             }
-            let gap = UInt32(Config.shared.keyIntervalMs) * 1000
-            for ch in targetText {
-                self.postUnicode(String(ch))
-                usleep(gap)
-            }
+            self.postUnicode(targetText)
             if triggerKey != 0 { self.postVirtualKey(triggerKey) }
         }
 
@@ -1215,20 +1293,36 @@ final class Switcher {
 
     // MARK: - Synthetic events
 
+    /// Инъекция строки синтетическими событиями. Строка режется на чанки
+    /// по ~16 UTF-16 юнитов: одно событие со слишком длинной строкой часть
+    /// приложений обрезает. Пауз между чанками НЕТ — порядок гарантирует
+    /// системная очередь событий, пейсинг ничего не добавляет и только
+    /// растягивает окно, в которое может вклиниться чужой ввод.
     private func postUnicode(_ s: String) {
         let utf16 = Array(s.utf16)
+        guard !utf16.isEmpty else { return }
         let src = CGEventSource(stateID: .privateState)
-        if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {
-            down.flags = []
-            down.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
-            down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-            down.post(tap: .cghidEventTap)
-        }
-        if let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
-            up.flags = []
-            up.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
-            up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-            up.post(tap: .cghidEventTap)
+        var i = 0
+        while i < utf16.count {
+            var end = min(i + 16, utf16.count)
+            // Не рвём суррогатную пару на границе чанка
+            if end < utf16.count, (0xD800...0xDBFF).contains(utf16[end - 1]) {
+                end += 1
+            }
+            let chunk = Array(utf16[i..<end])
+            if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {
+                down.flags = []
+                down.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+                down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                down.post(tap: .cghidEventTap)
+            }
+            if let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+                up.flags = []
+                up.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+                up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                up.post(tap: .cghidEventTap)
+            }
+            i = end
         }
     }
 
@@ -1265,13 +1359,15 @@ final class Switcher {
 
     private func sendBackspaces(_ n: Int) {
         guard n > 0 else { return }
+        // Settle ПЕРЕД первым backspace остаётся: медленным системным полям
+        // нужно принять последний реальный символ (см. коммент выше про 'йq').
         usleep(UInt32(Config.shared.replaceStartDelayMs) * 1000)
-        let gap = UInt32(Config.shared.keyIntervalMs) * 1000
+        // Между backspace пауз нет: события идут одной системной очередью,
+        // приложение обработает их по порядку в своём темпе.
         for _ in 0..<n {
             postVirtualKey(51)
-            usleep(gap)
         }
-        // Дать полю переварить удаление до того как начнём печатать
-        usleep(gap * 2)
+        // Короткий settle перед печатью замены
+        usleep(20_000)
     }
 }

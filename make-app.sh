@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 # Раньше она дублировалась в Version.swift и в Info.plist, причём в plist была
 # захардкожена и никогда не обновлялась: система показывала 0.3 независимо
 # от реальной версии, и то же самое попадало в отчёты о падениях.
-APP_VERSION="3.1"
+APP_VERSION="3.2"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then
