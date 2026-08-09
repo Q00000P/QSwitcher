@@ -34,6 +34,24 @@ public sealed class SecureLog : IDisposable
 
     public bool Enabled { get; set; } = true;
 
+    /// Писать ли набор в полях паролей. Детект — системный флаг UIA
+    /// IsPassword у фокусного элемента: покрывает Win32 Edit (ES_PASSWORD),
+    /// браузеры, большинство приложений. Аналог маковского
+    /// «Логировать пароли (Secure Input)» — на Windows нет Secure Input,
+    /// но есть честная пометка поля пароля.
+    public bool LogPasswords { get; set; } = true;
+
+    private static bool IsPasswordFieldFocused()
+    {
+        try
+        {
+            var el = System.Windows.Automation.AutomationElement.FocusedElement;
+            return el is not null && (bool)el.GetCurrentPropertyValue(
+                System.Windows.Automation.AutomationElement.IsPasswordProperty);
+        }
+        catch { return false; }
+    }
+
     /// Максимальный размер файла. При превышении старые записи отбрасываются.
     public int MaxSizeMb { get; set; } = 50;
 
@@ -47,10 +65,21 @@ public sealed class SecureLog : IDisposable
         _flushTimer = new System.Threading.Timer(_ => Flush(), null, 3000, 3000);
     }
 
+    /// Выгрузить буфер на диск немедленно (пункт меню).
+    public void FlushNow() => Flush();
+
+    /// Периодичность сброса буфера на диск.
+    public void SetFlushInterval(int seconds)
+    {
+        int ms = Math.Max(1, seconds) * 1000;
+        _flushTimer.Change(ms, ms);
+    }
+
     /// <summary>Добавить запись. Пишется в фоне, ввод не задерживает.</summary>
     public void Append(string text)
     {
         if (!Enabled || text.Length == 0) return;
+        if (!LogPasswords && IsPasswordFieldFocused()) return;
         _queue.Enqueue($"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\t{text}");
     }
 

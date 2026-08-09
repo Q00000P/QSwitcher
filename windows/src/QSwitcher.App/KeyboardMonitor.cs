@@ -128,6 +128,11 @@ public sealed class KeyboardMonitor : IDisposable
         {
             try
             {
+                if (key.Vk == ManualSwapMarker)
+                {
+                    ManualSwap(learn: false);
+                    continue;
+                }
                 if (key.Text is not null)
                 {
                     // Готовые символы довведённого шлюзом текста — сразу в буфер,
@@ -241,6 +246,20 @@ public sealed class KeyboardMonitor : IDisposable
 
     /// Свитчер на паузе — автозамена не работает, хоткеи работают.
     public bool Paused { get; private set; }
+
+    /// Пауза из меню трея (раньше пункт «Пауза» был TODO и ничего не делал).
+    public void TogglePause()
+    {
+        Paused = !Paused;
+        _log(Paused ? "⏸ Свитчер на паузе (меню)" : "▶ Свитчер активен (меню)");
+    }
+
+    /// Свап последнего слова из меню трея. Через очередь — ManualSwap
+    /// работает с состоянием processing-потока, из UI его звать нельзя.
+    public void RequestManualSwap() =>
+        _pending.Add(new PendingKey(ManualSwapMarker, false, false, false));
+
+    private const uint ManualSwapMarker = 0xFFFF_FFFE;
 
     private bool _shiftDown;
     private bool _capsOn;
@@ -407,7 +426,7 @@ public sealed class KeyboardMonitor : IDisposable
 
         var verdict = _detector.Decide(text, current, context);
         _log($"[word] собрано '{text}' ({wordCopy.Count} клавиш)");
-        _log($"[boundary] '{text}' ({current}, ctx={context?.ToString() ?? "nil"}) → {(verdict.ShouldSwap ? "SWITCH" : "keep")}");
+        _log($"[boundary] '{text}' ({current}, ctx={context?.ToString() ?? "nil"}) → {(verdict.ShouldSwap ? "SWITCH" : "keep")} [{verdict.Reason}]");
         SecureLog?.Append(verdict.ShouldSwap && verdict.Replacement is not null
             ? $"{text} → {verdict.Replacement}"
             : text);

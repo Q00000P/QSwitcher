@@ -36,6 +36,12 @@
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Полный desktop-фреймворк (WinForms+WPF) ради System.Windows.Automation:
+         детект полей паролей (IsPassword) для «Логировать пароли».
+         UseWPF НЕ включаем — он перестраивает implicit usings и ломает сборку. -->
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- Словари и звуки ВНУТРИ сборки: приложение должно быть одним файлом,
          который просто запускается. Раньше они лежали рядом папкой, и без
          неё exe был бесполезен. Код при этом сначала ищет файл снаружи —
