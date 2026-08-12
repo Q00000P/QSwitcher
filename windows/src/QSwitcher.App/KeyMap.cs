@@ -68,6 +68,21 @@ internal static class KeyMap
         [','] = '<', ['.'] = '>', ['`'] = '~', ['/'] = '?', ['\\'] = '|',
     };
 
+    /// <summary>Свап клавиши в противоположную раскладку. Если знак на этой
+    /// клавише одинаков в обеих раскладках — инвертируем Shift той же клавиши
+    /// ('3/3' → '3?3'), но только знак→знак: буквы и цифры не трогаем.</summary>
+    public static string SwapKey(uint vk, bool otherNow, bool shift, bool caps)
+    {
+        string s = Translate(vk, !otherNow, shift, caps);
+        string cur = Translate(vk, otherNow, shift, caps);
+        if (s.Length == 1 && s == cur && !char.IsLetterOrDigit(s[0]))
+        {
+            string alt = Translate(vk, !otherNow, !shift, caps);
+            if (alt.Length == 1 && !char.IsLetterOrDigit(alt[0])) s = alt;
+        }
+        return s;
+    }
+
     /// <summary>
     /// Перевести клавишу. otherLayout — активна ли «другая» раскладка (RU).
     /// Возвращает пустую строку для клавиш вне таблицы.

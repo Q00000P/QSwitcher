@@ -601,8 +601,17 @@ public sealed class KeyboardMonitor : IDisposable
             // Готовые символы (цифры, доввод) свапаются посимвольно.
             bufSwapped = _droppedPrefix + string.Concat(_word.Select(k =>
                 k.Chars.Length > 0 ? _pair.Swap(k.Chars)
-                                   : KeyMap.Translate(k.VirtualKey, !otherT, k.Shift, k.Caps)));
+                                   : KeyMap.SwapKey(k.VirtualKey, otherT, k.Shift, k.Caps)));
             if (bufSwapped == bufFull) tail = bufFull;
+        }
+
+        // Набор со ЗНАКАМИ, который свап не меняет — не трогаем ничего:
+        // каскад к предыдущему слову портил соседний текст. Каскад разрешён
+        // только чисто цифровому хвосту («гит 3» — намерение однозначно).
+        if (tail.Length > 0 && !tail.All(char.IsDigit))
+        {
+            _log($"[manual] набор '{tail}' свап не меняет — ничего не делаю");
+            return;
         }
 
         // 1. Буфер есть и его свап что-то меняет — свапаем буфер
@@ -675,7 +684,7 @@ public sealed class KeyboardMonitor : IDisposable
             bool otherNow = KeyMap.QueryOtherLayoutActive();
             swapped = _lastCompletedPrefix + string.Concat(histKeys.Select(k =>
                 k.Chars.Length > 0 ? _pair.Swap(k.Chars)
-                                   : KeyMap.Translate(k.VirtualKey, !otherNow, k.Shift, k.Caps)));
+                                   : KeyMap.SwapKey(k.VirtualKey, otherNow, k.Shift, k.Caps)));
         }
         else swapped = _pair.Swap(fullText);
         _log($"[manual] '{fullText}' → '{swapped}'{(learn ? " + запомнить" : "")}"
