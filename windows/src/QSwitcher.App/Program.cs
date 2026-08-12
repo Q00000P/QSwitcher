@@ -169,7 +169,7 @@ public sealed class BufferedLogger : IDisposable
 /// <summary>Версия приложения.</summary>
 public static class AppVersion
 {
-    public const string Version = "3.2";
+    public const string Version = "3.3";
 }
 
 /// <summary>

@@ -48,6 +48,11 @@ internal static class KeyTranslator
 /// <summary>Задание на замену текста.</summary>
 public record ReplaceJob(int EraseCount, string Text, string TriggerChar, bool SwitchLayout)
 {
+    /// Уже набранный после триггера хвост (цифровой префикс нового слова):
+    /// стирается EraseCount'ом вместе со словом и печатается заново после
+    /// триггера — иначе свап завершённого слова сносил его с экрана.
+    public string TailText { get; init; } = "";
+
     /// Если задано — это операция над выделением, а не замена набранного.
     public (KeyboardMonitor.SelectionOp op, Func<string, string> transform)? Selection { get; init; }
 }
@@ -162,6 +167,12 @@ public sealed class TextReplacer : IDisposable
         if (job.TriggerChar == "\r") { batch.Add(VkInput(0x0D, false)); batch.Add(VkInput(0x0D, true)); }
         else if (job.TriggerChar == "\t") { batch.Add(VkInput(0x09, false)); batch.Add(VkInput(0x09, true)); }
         else foreach (char c in job.TriggerChar)
+        {
+            batch.Add(CharInput(c, false));
+            batch.Add(CharInput(c, true));
+        }
+
+        foreach (char c in job.TailText)
         {
             batch.Add(CharInput(c, false));
             batch.Add(CharInput(c, true));

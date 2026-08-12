@@ -581,34 +581,42 @@ public sealed class KeyboardMonitor : IDisposable
     /// Свап последнего завершённого слова. Повтор — свап обратно.
     private void ManualSwap(bool learn = false)
     {
-        // 1. Буфер содержит незавершённое слово — свапаем его (вместе с
-        // цифровым префиксом: '10ю0ю0ю1' → '10.0.0.1', как Punto).
-        // Раньше незавершённый буфер вообще нельзя было свапнуть вручную.
-        if (_word.Count > 0)
+        // Текущий незавершённый набор. Критерий — меняет ли его КЕЙКОДНЫЙ
+        // свап: '3,3' (numpad-точка в RU) → '3.3' меняет — свапаем БУФЕР;
+        // чистое '3' свап не меняет — это ХВОСТ: при свапе завершённого слова
+        // его нужно стереть вместе со словом и вернуть на место, иначе
+        // стирание сносило его («гит 3» превращалось в «гubn»).
+        string tail = "";
+        string bufFull = "", bufSwapped = "";
+        if (_word.Count > 0 || _droppedPrefix.Length > 0)
         {
-            bool other = KeyMap.QueryOtherLayoutActive();
-            string bufText = string.Concat(_word.Select(k =>
+            bool otherT = KeyMap.QueryOtherLayoutActive();
+            string bufT = string.Concat(_word.Select(k =>
                 k.Chars.Length > 0 ? k.Chars
-                                   : KeyMap.Translate(k.VirtualKey, other, k.Shift, k.Caps)));
-            string full = _droppedPrefix + bufText;
+                                   : KeyMap.Translate(k.VirtualKey, otherT, k.Shift, k.Caps)));
+            bufFull = _droppedPrefix + bufT;
             // Свап ПО КЕЙКОДАМ через противоположную раскладку, а не по
-            // символьной карте: знак ';' по символу неоднозначен ('ж' в EN
+            // символьной карте: знак по символу неоднозначен (';' — 'ж' в EN
             // против Shift+4 в RU), по кейкоду — однозначен ('3;' → '3$').
             // Готовые символы (цифры, доввод) свапаются посимвольно.
-            string swappedFull = _droppedPrefix + string.Concat(_word.Select(k =>
+            bufSwapped = _droppedPrefix + string.Concat(_word.Select(k =>
                 k.Chars.Length > 0 ? _pair.Swap(k.Chars)
-                                   : KeyMap.Translate(k.VirtualKey, !other, k.Shift, k.Caps)));
+                                   : KeyMap.Translate(k.VirtualKey, !otherT, k.Shift, k.Caps)));
+            if (bufSwapped == bufFull) tail = bufFull;
+        }
+
+        // 1. Буфер есть и его свап что-то меняет — свапаем буфер
+        // (вместе с цифровым префиксом: '10ю0ю0ю1' → '10.0.0.1', как Punto).
+        if (bufFull.Length > 0 && tail.Length == 0)
+        {
+            string full = bufFull;
+            string swappedFull = bufSwapped;
+            string bufText = _droppedPrefix.Length > 0 ? full[_droppedPrefix.Length..] : full;
             _word.Clear();
             _droppedPrefix = "";
-            if (full.Length == 0) return;
-            if (swappedFull == full)
-            {
-                _log($"[manual-buf] '{full}' — свап равен оригиналу");
-                return;
-            }
             _log($"[manual-buf] '{full}' → '{swappedFull}'{(learn ? " + запомнить" : "")}");
-            if (learn && bufText.Length > 0)
-                LearnForceConsistent(bufText, _pair.Swap(bufText)); // учим слово, не префикс
+            if (learn && bufText.Any(char.IsLetter))
+                LearnForceConsistent(bufText, _pair.Swap(bufText)); // учим слово (с буквами), не префикс
             _lastSwitch = new LastSwitch(full, swappedFull, "");
             _lastWordLang = LangOf(swappedFull);
             _replacer.Enqueue(new ReplaceJob(
@@ -626,7 +634,7 @@ public sealed class KeyboardMonitor : IDisposable
         {
             string from = last.OnScreen, to = last.Other;
             last.ShowingConverted = !last.ShowingConverted;
-            _log($"[toggle] '{from}' → '{to}'");
+            _log($"[toggle] '{from}' → '{to}'" + (tail.Length > 0 ? $" (хвост '{tail}')" : ""));
 
             // Обучение ТОЛЬКО по явной команде. Тоггл сам по себе не учит:
             // человек просто смотрит варианты, и на macOS это раньше
@@ -635,10 +643,10 @@ public sealed class KeyboardMonitor : IDisposable
 
             _lastWordLang = LangOf(to);
             _replacer.Enqueue(new ReplaceJob(
-                EraseCount: from.Length + last.TriggerChar.Length,
+                EraseCount: from.Length + last.TriggerChar.Length + tail.Length,
                 Text: to,
                 TriggerChar: last.TriggerChar,
-                SwitchLayout: true));
+                SwitchLayout: true) { TailText = tail });
             // Вернулись к исходному — это откат, звук другой
             Sounds.Play(last.ShowingConverted ? SoundKind.ConvertAndSwitch : SoundKind.Undo);
             return;
@@ -670,16 +678,17 @@ public sealed class KeyboardMonitor : IDisposable
                                    : KeyMap.Translate(k.VirtualKey, !otherNow, k.Shift, k.Caps)));
         }
         else swapped = _pair.Swap(fullText);
-        _log($"[manual] '{fullText}' → '{swapped}'{(learn ? " + запомнить" : "")}");
+        _log($"[manual] '{fullText}' → '{swapped}'{(learn ? " + запомнить" : "")}"
+            + (tail.Length > 0 ? $" (хвост '{tail}')" : ""));
         if (learn) LearnForceConsistent(text, _pair.Swap(text)); // учим слово, не префикс
 
         _lastSwitch = new LastSwitch(fullText, swapped, triggerChar);
         _lastWordLang = LangOf(swapped);
         _replacer.Enqueue(new ReplaceJob(
-            EraseCount: fullText.Length + triggerChar.Length,
+            EraseCount: fullText.Length + triggerChar.Length + tail.Length,
             Text: swapped,
             TriggerChar: triggerChar,
-            SwitchLayout: true));
+            SwitchLayout: true) { TailText = tail });
         Sounds.Play(SoundKind.ConvertAndSwitch);
     }
 
