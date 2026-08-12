@@ -254,7 +254,24 @@ final class Switcher {
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            // По таймауту переподнимаем ТОЛЬКО при живых правах.
+            // По userInput (в т.ч. отзыв Accessibility) — НЕ воюем немедленным
+            // re-enable: система гасит tap, мы его форсим, она гасит снова —
+            // и весь системный ввод замирал наглухо, пока идёт эта борьба.
+            // Вместо этого открываем шлюз, чистим состояние и ждём возврата
+            // прав таймером.
+            if type == .tapDisabledByTimeout, AXIsProcessTrusted() {
+                if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            } else {
+                print("[tap] отключён (\(type == .tapDisabledByUserInput ? "userInput/отзыв прав" : "timeout без прав")) — жду возврата прав")
+                activeReplays = 0
+                pendingRealEvents.removeAll()
+                gateWatchdog?.invalidate()
+                gateWatchdog = nil
+                word.removeAll()
+                droppedPrefix = ""
+                scheduleTapRecovery()
+            }
             return Unmanaged.passUnretained(event)
         }
 
@@ -750,6 +767,25 @@ final class Switcher {
         InputSource.switchTo(target)
     }
 
+    // MARK: - Tap recovery
+
+    private var tapRecoveryTimer: Timer?
+
+    /// Ждём возврата прав Accessibility и только тогда включаем tap обратно.
+    private func scheduleTapRecovery() {
+        guard tapRecoveryTimer == nil else { return }
+        tapRecoveryTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard AXIsProcessTrusted() else { return }
+            if let tap = self.eventTap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+                print("[tap] права вернулись — tap включён")
+            }
+            self.tapRecoveryTimer?.invalidate()
+            self.tapRecoveryTimer = nil
+        }
+    }
+
     // MARK: - Input gate
 
     /// Открыть шлюз перед заданием замены. Вызывать на main СИНХРОННО с решением
@@ -840,6 +876,15 @@ final class Switcher {
                 + (swapByKeycodes(word, from: cur) ?? Detector.shared.swap(bufText))
         }
         let tail = (bufSwapProbe == bufFull) ? bufFull : ""
+
+        // Набор со ЗНАКАМИ, который свап не меняет ('3/3': '/' одинаков в
+        // обеих раскладках) — не трогаем ничего: каскад к предыдущему слову
+        // здесь портил соседний текст. Каскад разрешён только чисто
+        // цифровому хвосту («гит 3» — намерение однозначно).
+        if !tail.isEmpty && !tail.allSatisfy({ $0.isNumber }) {
+            print("[bufSwap] набор '\(tail)' свап не меняет — ничего не делаю")
+            return
+        }
 
         // 1. Буфер есть и его свап что-то меняет — свапаем буфер
         if !word.isEmpty && tail.isEmpty {
@@ -1083,11 +1128,20 @@ final class Switcher {
         let target: InputSource.Lang = (cur == .ru) ? .en : .ru
         var out = ""
         for k in keys {
-            guard let s = LayoutResolver.translate(
-                keyCode: k.keyCode,
-                shift: k.flags.contains(.maskShift),
-                capsLock: k.flags.contains(.maskAlphaShift),
+            let shift = k.flags.contains(.maskShift)
+            let caps = k.flags.contains(.maskAlphaShift)
+            guard var s = LayoutResolver.translate(
+                keyCode: k.keyCode, shift: shift, capsLock: caps,
                 to: target), !s.isEmpty else { return nil }
+            // Знак одинаков в обеих раскладках ('/' на kc44) — свапу нечего
+            // менять: инвертируем Shift той же клавиши ('3/3' → '3?3').
+            // Только знак→знак: буквы и цифры не трогаем, иначе '%'→'5'.
+            if s == k.chars, let c = s.first, !c.isLetter, !c.isNumber,
+               let alt = LayoutResolver.translate(
+                   keyCode: k.keyCode, shift: !shift, capsLock: caps, to: target),
+               let a = alt.first, !a.isLetter, !a.isNumber {
+                s = alt
+            }
             out += s
         }
         return out
