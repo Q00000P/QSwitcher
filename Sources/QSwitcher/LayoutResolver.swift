@@ -41,6 +41,11 @@ enum LayoutResolver {
 
         guard let en = enSource, let ru = ruSource else { return nil }
         guard let enData = layoutData(en), let ruData = layoutData(ru) else { return nil }
+        // Сохраняем данные обеих раскладок: ручной свап переводит по кейкодам
+        // через ПРОТИВОПОЛОЖНУЮ раскладку — символьная карта для знаков
+        // неоднозначна ('\"' — и RU-Shift+2, и EN-клавиша «э»).
+        enDataCache = enData
+        ruDataCache = ruData
 
         var enToRu: Map = [:]
         var ruToEn: Map = [:]
@@ -62,6 +67,22 @@ enum LayoutResolver {
         }
 
         return (enToRu, ruToEn)
+    }
+
+    // MARK: - Перевод по конкретной раскладке
+
+    private static var enDataCache: Data?
+    private static var ruDataCache: Data?
+
+    /// Перевести keycode по КОНКРЕТНОЙ раскладке (en/ru), независимо от активной.
+    /// nil — если resolve() не отработал (нет данных) или клавиша не переводится.
+    static func translate(keyCode: CGKeyCode, shift: Bool, capsLock: Bool,
+                          to lang: InputSource.Lang) -> String? {
+        guard let data = (lang == .ru) ? ruDataCache : enDataCache else { return nil }
+        var mods: UInt32 = shift ? 2 : 0
+        if capsLock { mods |= UInt32(alphaLock >> 8) }
+        return translateChar(data, keycode: UInt16(keyCode),
+                             modifiers: mods, kbdType: UInt32(LMGetKbdType()))
     }
 
     // MARK: - Helpers

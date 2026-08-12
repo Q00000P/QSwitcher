@@ -91,8 +91,18 @@ final class Switcher {
         let chars: String
         let triggerKeyCode: CGKeyCode
         let lang: InputSource.Lang
+        /// Цифро-пунктуационный префикс, набранный вплотную перед словом
+        /// и отброшенный буфером ('10' перед 'ю0ю0ю1' в IP-адресе).
+        /// Ручной свап конвертирует слово ВМЕСТЕ с ним — как Punto.
+        var prefix: String = ""
+        /// Кейстроки слова: ручной свап по кейкодам (см. swapByKeycodes).
+        var keys: [Keystroke] = []
     }
     private var lastCompletedWord: LastCompletedWord?
+
+    /// Отброшенный из буфера префикс текущего слова (см. LastCompletedWord.prefix).
+    /// Живёт строго вместе с word: любой сброс слова сбрасывает и его.
+    private var droppedPrefix = ""
 
     /// Сохранённое содержимое буфера обмена для отложенного восстановления.
     private var lastSavedClipboard: [NSPasteboardItem]?
@@ -185,6 +195,7 @@ final class Switcher {
                 guard let self = self, !self.word.isEmpty else { return }
                 print("[layout] раскладка сменилась — сбрасываю незавершённое слово")
                 self.word.removeAll()
+                self.droppedPrefix = ""
             }
         }
 
@@ -212,6 +223,7 @@ final class Switcher {
         if app.bundleIdentifier == Bundle.main.bundleIdentifier { return }
         lastUserAppBundleId = app.bundleIdentifier
         word.removeAll()
+        droppedPrefix = ""
         wordHistory.removeAll()
         lastSwitch = nil
         lastCompletedWord = nil
@@ -251,6 +263,7 @@ final class Switcher {
             if !word.isEmpty {
                 print("[buf] клик мышью — сбрасываю незавершённое слово")
                 word.removeAll()
+                droppedPrefix = ""
             }
             lastSwitch = nil
             lastCompletedWord = nil
@@ -358,13 +371,19 @@ final class Switcher {
         if keyCode == 53 /* Escape */ {
             if let last = lastSwitch,
                Date().timeIntervalSince(last.timestamp) < Switcher.undoWindow {
+                // Хвост (цифры нового набора) — до сброса буфера, иначе тоггл
+                // снесёт его стиранием, как в кейсе «гит 3»
+                let bufText = word.map { $0.chars }.joined()
+                let tail = bufText.contains(where: { $0.isLetter }) ? "" : droppedPrefix + bufText
                 // НЕ обнуляем lastSwitch — оставляем чтобы можно было ещё раз тоггнуть
                 word.removeAll()
-                DispatchQueue.main.async { [weak self] in self?.toggleLastSwitch(last) }
+                droppedPrefix = ""
+                DispatchQueue.main.async { [weak self] in self?.toggleLastSwitch(last, tail: tail) }
                 return nil
             }
             // Иначе пропускаем Esc как обычно
             word.removeAll()
+            droppedPrefix = ""
             return Unmanaged.passUnretained(event)
         }
 
@@ -386,6 +405,7 @@ final class Switcher {
 
         if !Config.shared.enabled || isCurrentAppExcluded {
             word.removeAll()
+            droppedPrefix = ""
             return Unmanaged.passUnretained(event)
         }
 
@@ -397,6 +417,7 @@ final class Switcher {
                 guard let self = self else { return }
                 if let sel = self.readSelection(restoreClipboard: false), !sel.isEmpty, sel.count <= 5000 {
                     self.word.removeAll()
+                    self.droppedPrefix = ""
                     self.lastSwitch = nil
                     self.lastCompletedWord = nil
                     self.swapSelectedText(sel)
@@ -409,6 +430,7 @@ final class Switcher {
 
         if flags.contains(.maskCommand) || flags.contains(.maskControl) {
             word.removeAll()
+            droppedPrefix = ""
             return Unmanaged.passUnretained(event)
         }
 
@@ -441,6 +463,7 @@ final class Switcher {
 
         if keyCode == 51 /* Backspace */ {
             if !word.isEmpty { word.removeLast() }
+            else if !droppedPrefix.isEmpty { droppedPrefix.removeLast() }
             lastSwitch = nil
             lastCompletedWord = nil
             return Unmanaged.passUnretained(event)
@@ -452,10 +475,25 @@ final class Switcher {
         let firstChar = chars.first
         let isLayoutPunct = firstChar.map { layoutPunctChars.contains($0) } ?? false
 
-        // Граница слова: пробел/Enter/Tab или «настоящая» пунктуация (но не layout-pun)
+        // Знаки с «двухсимвольных» клавиш, зависящих от раскладки. Это цифровой
+        // ряд с Shift (RU Shift+2='"', EN='@') и Shift-варианты буквенно-
+        // пунктуационных клавиш (EN Shift+скобка даёт фиг.скобку, RU той же клавиши='Х').
+        // Если слова с буквами нет — знак часть набора: ручной свап переведёт
+        // его по КЕЙКОДУ через другую раскладку. При наборе обычного слова
+        // знак остаётся границей, как раньше.
+        let dualLayoutKeys: Set<CGKeyCode> = [
+            18, 19, 20, 21, 23, 22, 26, 28, 25, 29,  // цифровой ряд 1-0
+            33, 30, 41, 39, 50, 42, 43, 47, 44,      // [ ] ; ' ` \ , . /
+        ]
+        let bufferLacksLetters = !word.contains { $0.chars.contains { $0.isLetter } }
+        let isShiftedDigitInNumericRun =
+            dualLayoutKeys.contains(keyCode)
+            && isPunctuation(chars) && bufferLacksLetters
+
+        // Граница слова: пробел/Enter/Tab или «настоящая» пунктуация (но не layout-punct)
         let isWordEnd =
             keyCode == 49 || keyCode == 36 || keyCode == 76 || keyCode == 48 ||
-            (isPunctuation(chars) && !isLayoutPunct)
+            (isPunctuation(chars) && !isLayoutPunct && !isShiftedDigitInNumericRun)
 
         if isWordEnd {
             if !word.isEmpty {
@@ -484,6 +522,7 @@ final class Switcher {
                     let replay = word
                     let trigger = Keystroke(keyCode: keyCode, flags: flags, chars: chars)
                     word.removeAll()
+                    droppedPrefix = ""
                     // В истории сохраняем уже свапнутую версию
                     let swapped = Detector.shared.swap(text)
                     appendToHistory(swapped)
@@ -503,9 +542,12 @@ final class Switcher {
                 lastCompletedWord = LastCompletedWord(
                     chars: text,
                     triggerKeyCode: keyCode,
-                    lang: cur
+                    lang: cur,
+                    prefix: droppedPrefix,
+                    keys: word
                 )
                 word.removeAll()
+                droppedPrefix = ""
             }
             lastSwitch = nil
             return Unmanaged.passUnretained(event)
@@ -518,6 +560,7 @@ final class Switcher {
         ]
         if resetKeys.contains(keyCode) {
             word.removeAll()
+            droppedPrefix = ""
             lastSwitch = nil
             lastCompletedWord = nil
             return Unmanaged.passUnretained(event)
@@ -543,11 +586,13 @@ final class Switcher {
 
             if incomingIsCyrillic && bufferIsOnlyPunct {
                 // Накопленная пунктуация была самостоятельной — слово начинается здесь
-                print("[buf] пунктуация '\(bufferText)' отброшена — дальше кириллица")
+                print("[buf] пунктуация '\(bufferText)' отброшена — дальше кириллица (префикс сохранён)")
+                droppedPrefix = bufferText
                 word.removeAll()
             } else if !incomingIsLetter && layoutPunctChars.contains(incoming ?? " ") && bufferHasCyrillic {
                 // Пунктуация после кириллического слова — это конец слова, не его часть
                 word.removeAll()
+                droppedPrefix = ""
                 lastCompletedWord = nil
                 return Unmanaged.passUnretained(event)
             }
@@ -649,6 +694,7 @@ final class Switcher {
                 SecureLog.shared.append("[selSwap/AX] \(original.count) симв")
                 DispatchQueue.main.async {
                     self.word.removeAll()
+                    self.droppedPrefix = ""
                     self.lastSwitch = nil
                     self.lastCompletedWord = nil
                     self.syncHistoryTail(with: result)
@@ -669,6 +715,7 @@ final class Switcher {
             print("[selSwap] выделение (\(selected.count) симв) → swap")
             DispatchQueue.main.async {
                 self.word.removeAll()
+                self.droppedPrefix = ""
                 self.lastSwitch = nil
                 self.lastCompletedWord = nil
             }
@@ -779,23 +826,39 @@ final class Switcher {
     private func handleBufferSwap(explicitLearn: Bool = false) {
         pendingExplicitLearn = explicitLearn
         defer { pendingExplicitLearn = false }
-        // 1. Буфер содержит новое слово
+        // Текущий незавершённый набор. Критерий — меняет ли его КЕЙКОДНЫЙ свап:
+        // '3,3' (numpad-точка в RU) → '3.3' меняет — свапаем БУФЕР; чистое '3'
+        // свап не меняет — это ХВОСТ: при свапе завершённого слова его нужно
+        // стереть вместе со словом и вернуть на место, иначе стирание сносило
+        // его («гит 3» превращалось в «гubn»: съедало пробел и цифры).
+        let bufText = word.map { $0.chars }.joined()
+        let bufFull = droppedPrefix + bufText
+        var bufSwapProbe = bufFull
         if !word.isEmpty {
-            print("[bufSwap] свап буфера ('\(word.map{$0.chars}.joined())')")
+            let cur = InputSource.currentLanguage()
+            bufSwapProbe = droppedPrefix
+                + (swapByKeycodes(word, from: cur) ?? Detector.shared.swap(bufText))
+        }
+        let tail = (bufSwapProbe == bufFull) ? bufFull : ""
+
+        // 1. Буфер есть и его свап что-то меняет — свапаем буфер
+        if !word.isEmpty && tail.isEmpty {
+            print("[bufSwap] свап буфера ('\(bufText)')")
             lastSwitch = nil
             forceSwitchLastWord()
             return
         }
         // 2. Тоггл последнего свитча
         if let last = lastSwitch {
-            print("[bufSwap] тоггл последнего свитча")
-            toggleLastSwitch(last)
+            print("[bufSwap] тоггл последнего свитча" + (tail.isEmpty ? "" : ", хвост '\(tail)'"))
+            toggleLastSwitch(last, tail: tail)
             return
         }
         // 3. Последнее завершённое слово
         if let lastWord = lastCompletedWord {
-            print("[bufSwap] свап последнего завершённого слова '\(lastWord.chars)'")
-            swapLastCompletedWord(lastWord)
+            print("[bufSwap] свап последнего завершённого слова '\(lastWord.chars)'"
+                + (tail.isEmpty ? "" : ", хвост '\(tail)'"))
+            swapLastCompletedWord(lastWord, tail: tail)
             return
         }
         print("[bufSwap] нечего свапать")
@@ -804,9 +867,13 @@ final class Switcher {
     /// Свапнуть последнее завершённое слово задним числом.
     /// Курсор сейчас стоит ПОСЛЕ триггера (например после пробела).
     /// Удаляем триггер + слово, печатаем свапнутое слово + тот же триггер.
-    private func swapLastCompletedWord(_ last: LastCompletedWord) {
-        let original = last.chars
-        let translated = Detector.shared.swap(original)
+    private func swapLastCompletedWord(_ last: LastCompletedWord, tail: String = "") {
+        let original = last.prefix + last.chars
+        let translated = last.prefix + (
+            last.keys.isEmpty
+                ? Detector.shared.swap(last.chars)
+                : (swapByKeycodes(last.keys, from: last.lang) ?? Detector.shared.swap(last.chars))
+        )
         guard translated != original else {
             print("[manual-completed] свап равен оригиналу — нечего менять")
             return
@@ -816,7 +883,9 @@ final class Switcher {
         let target: InputSource.Lang = Switcher.langOf(translated)
             ?? ((last.lang == .ru) ? .en : .ru)
         let triggerCount = (last.triggerKeyCode != 0) ? 1 : 0
-        let toDelete = original.count + triggerCount
+        // Хвост — уже набранное после триггера (цифровой префикс нового слова):
+        // стираем вместе со словом и возвращаем на место после триггера.
+        let toDelete = original.count + triggerCount + tail.count
 
         beginGate()
         emitQueue.async { [weak self] in
@@ -828,6 +897,7 @@ final class Switcher {
             // Триггер возвращаем ЗДЕСЬ и только здесь. Раньше он отправлялся
             // дважды — второй раз снаружи async-блока — и плодил лишние пробелы.
             if triggerCount > 0 { self.postVirtualKey(last.triggerKeyCode) }
+            if !tail.isEmpty { self.postUnicode(tail) }
         }
 
         // Сохраняем как тоггл-состояние, чтобы Option повторно можно было откатить назад
@@ -843,7 +913,8 @@ final class Switcher {
         // Обучение — ТОЛЬКО по явной команде Shift + правый Option.
         // Обычный свап это разовое действие, а не заявка на вечное правило.
         if pendingExplicitLearn {
-            LearnedRules.shared.learnForce(original)
+            // Учим само слово, без цифро-пунктуационного префикса
+            LearnedRules.shared.learnForce(last.chars)
         }
     }
 
@@ -1004,14 +1075,39 @@ final class Switcher {
         playSound(shouldSwitchLayout ? .convertAndSwitch : .convertOnly)
     }
 
+    /// Свап кейстроков по кейкодам через ПРОТИВОПОЛОЖНУЮ раскладку — как Punto.
+    /// Символьная карта для знаков неоднозначна: '\"' это и RU-Shift+2, и
+    /// EN-клавиша «э», по символу '2\"' свапалось в '2Э' вместо '2@'.
+    /// По кейкоду однозначно. nil — нет данных раскладок, откат на символьный swap.
+    private func swapByKeycodes(_ keys: [Keystroke], from cur: InputSource.Lang) -> String? {
+        let target: InputSource.Lang = (cur == .ru) ? .en : .ru
+        var out = ""
+        for k in keys {
+            guard let s = LayoutResolver.translate(
+                keyCode: k.keyCode,
+                shift: k.flags.contains(.maskShift),
+                capsLock: k.flags.contains(.maskAlphaShift),
+                to: target), !s.isEmpty else { return nil }
+            out += s
+        }
+        return out
+    }
+
     func forceSwitchLastWord() {
         guard !word.isEmpty else { return }
         let cur = InputSource.currentLanguage()
         let replay = word
+        let prefix = droppedPrefix
         word.removeAll()
+        droppedPrefix = ""
 
-        let original = replay.map { $0.chars }.joined()
-        let translated: String = Detector.shared.swap(original)
+        // Ручной свап — как Punto: конвертируем весь набранный кусок, включая
+        // цифро-пунктуационный префикс ('10ю0ю0ю1' → '10.0.0.1' целиком).
+        // Цифры проходят через swap как есть.
+        let wordText = replay.map { $0.chars }.joined()
+        let original = prefix + wordText
+        let translated: String = prefix
+            + (swapByKeycodes(replay, from: cur) ?? Detector.shared.swap(wordText))
         // Целевая раскладка — по содержимому результата, не по currentLanguage()
         let target: InputSource.Lang = Switcher.langOf(translated)
             ?? ((cur == .ru) ? .en : .ru)
@@ -1042,7 +1138,7 @@ final class Switcher {
 
     /// Тоггл последнего свитча — переключает между исходным и конвертированным.
     /// Без лимита по времени — пока буфер не разрушен пользовательским действием.
-    private func toggleLastSwitch(_ last: LastSwitch) {
+    private func toggleLastSwitch(_ last: LastSwitch, tail: String = "") {
         let triggerCount = (last.triggerKeyCode != 0) ? 1 : 0
 
         let currentText: String
@@ -1059,7 +1155,7 @@ final class Switcher {
         }
         last.timestamp = Date()
 
-        let deleteCount = currentText.count + triggerCount
+        let deleteCount = currentText.count + triggerCount + tail.count
         let triggerKey = last.triggerKeyCode
         beginGate()
         emitQueue.async { [weak self] in
@@ -1071,6 +1167,7 @@ final class Switcher {
             }
             self.postUnicode(targetText)
             if triggerKey != 0 { self.postVirtualKey(triggerKey) }
+            if !tail.isEmpty { self.postUnicode(tail) }
         }
 
         // Тоггл НЕ обучает.
