@@ -26,7 +26,9 @@ internal static class Program
         var logger = new BufferedLogger(Path.Combine(DataDir, "qswitcher.log"));
         void Log(string msg) => logger.Write(msg);
 
-        Log($"===== QSwitcher {AppVersion.Version} запущен =====");
+        var exe = Environment.ProcessPath ?? "?";
+        var built = exe != "?" ? File.GetLastWriteTime(exe).ToString("yyyy-MM-dd HH:mm") : "?";
+        Log($"===== QSwitcher {AppVersion.Version} запущен (сборка {built}, {exe}) =====");
 
         var cfg = AppConfig.Load(DataDir, Log);
         var pair = LayoutPair.RuEn();

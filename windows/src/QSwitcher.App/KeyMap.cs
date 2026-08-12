@@ -38,13 +38,33 @@ internal static class KeyMap
         [0xBC] = (',','б'),   // OEM_COMMA
         [0xBE] = ('.','ю'),   // OEM_PERIOD
         [0xC0] = ('`','ё'),   // OEM_3
+        [0xBF] = ('/','.'),   // OEM_2: RU-раскладка даёт вторую точку
+        [0xDC] = ('\\','\\'),  // OEM_5
+    };
+
+    /// <summary>Shift-варианты для пунктуации РУССКОЙ стороны OEM-клавиш
+    /// (аналог LatinShift): RU Shift+/ = ',', RU Shift+\ = '/'.</summary>
+    private static readonly Dictionary<char, char> OtherShift = new()
+    {
+        ['.'] = ',', ['\\'] = '/',
+    };
+
+    /// <summary>Знаки цифрового ряда с Shift: (латиница, кириллица).
+    /// Нужны для наборов вида '3$': в RU Shift+4 даёт ';', и свап по кейкоду
+    /// превращает его обратно в '$'. По символу это неоднозначно (';' — ещё
+    /// и EN-клавиша 'ж'), по кейкоду — точно.</summary>
+    private static readonly Dictionary<uint, (char lat, char oth)> DigitShift = new()
+    {
+        [0x31] = ('!','!'), [0x32] = ('@','"'), [0x33] = ('#','№'), [0x34] = ('$',';'),
+        [0x35] = ('%','%'), [0x36] = ('^',':'), [0x37] = ('&','?'), [0x38] = ('*','*'),
+        [0x39] = ('(','('), [0x30] = (')',')'),
     };
 
     /// <summary>Символы, которые меняются при Shift в ЛАТИНСКОЙ раскладке.</summary>
     private static readonly Dictionary<char, char> LatinShift = new()
     {
         ['['] = '{', [']'] = '}', [';'] = ':', ['\''] = '"',
-        [','] = '<', ['.'] = '>', ['`'] = '~',
+        [','] = '<', ['.'] = '>', ['`'] = '~', ['/'] = '?', ['\\'] = '|',
     };
 
     /// <summary>
@@ -53,7 +73,12 @@ internal static class KeyMap
     /// </summary>
     public static string Translate(uint vk, bool otherLayout, bool shift, bool caps)
     {
-        if (!Table.TryGetValue(vk, out var pair)) return string.Empty;
+        if (!Table.TryGetValue(vk, out var pair))
+        {
+            if (shift && DigitShift.TryGetValue(vk, out var d))
+                return (otherLayout ? d.oth : d.lat).ToString();
+            return string.Empty;
+        }
 
         char c = otherLayout ? pair.oth : pair.lat;
         bool upper = shift ^ caps;
@@ -66,6 +91,8 @@ internal static class KeyMap
             return shifted.ToString();
         if (shift && otherLayout && char.IsLetter(c))
             return char.ToUpperInvariant(c).ToString();
+        if (shift && otherLayout && OtherShift.TryGetValue(c, out var os))
+            return os.ToString();
         return c.ToString();
     }
 

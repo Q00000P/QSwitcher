@@ -261,6 +261,14 @@ public sealed class KeyboardMonitor : IDisposable
 
     private const uint ManualSwapMarker = 0xFFFF_FFFE;
 
+    /// Цифровой префикс, набранный вплотную перед текущим словом ('10' перед
+    /// 'ю0ю0ю1' в IP). Ручной свап конвертирует его вместе со словом — как
+    /// Punto: '10ю0ю0ю1' → '10.0.0.1'. Живёт строго вместе с _word.
+    private string _droppedPrefix = "";
+    /// Префикс последнего завершённого слова (для ручного свапа задним числом).
+    private string _lastCompletedPrefix = "";
+    private const int PrefixCap = 32;
+
     private bool _shiftDown;
     private bool _capsOn;
 
@@ -290,6 +298,7 @@ public sealed class KeyboardMonitor : IDisposable
         if (vk == ResetMarkerVk)
         {
             if (_word.Count > 0) _word.Clear();
+            _droppedPrefix = "";
             InvalidateHistory("клик мышью");
             return;
         }
@@ -319,10 +328,13 @@ public sealed class KeyboardMonitor : IDisposable
             case 0x2E:                          // Delete
             case 0x1B:                          // Esc
                 _word.Clear();
+                _droppedPrefix = "";
                 InvalidateHistory("навигация");
                 return;
             case 0x08: // Backspace — убираем последний символ из буфера
                 if (_word.Count > 0) _word.RemoveAt(_word.Count - 1);
+                else if (_droppedPrefix.Length > 0)
+                    _droppedPrefix = _droppedPrefix[..^1];
                 return;
         }
 
@@ -336,10 +348,32 @@ public sealed class KeyboardMonitor : IDisposable
             case 0x09: OnWordBoundary(new Keystroke(vk, "\t")); return;
         }
 
-        // Цифры и всё, чего нет в таблице (F-клавиши, NumPad), слово прерывают
-        if (vk is >= 0x30 and <= 0x39 or >= 0x60 and <= 0x69)
+        // Цифры: внутри слова ('ю0ю0ю1' в IP-адресе) — часть слова, кладём
+        // готовым символом (цифры от раскладки не зависят). Перед словом —
+        // копим как префикс, чтобы ручной свап конвертировал его вместе со
+        // словом ('10ю0ю0ю1' → '10.0.0.1', как Punto). Раньше любая цифра
+        // просто стирала буфер и IP-кейс был мёртв.
+        // Shift+цифра верхнего ряда — знак, зависящий от раскладки: как раньше, граница.
+        if (vk is >= 0x30 and <= 0x39 && !shift || vk is >= 0x60 and <= 0x69)
         {
-            _word.Clear();
+            char digit = (char)('0' + (int)(vk <= 0x39 ? vk - 0x30 : vk - 0x60));
+            bool bufferHasLetters = _word.Count > 0 && _word.Any(k =>
+                k.Chars.Length == 0 || k.Chars.Any(char.IsLetter));
+            if (bufferHasLetters)
+                _word.Add(new Keystroke(vk, digit.ToString(), shift, caps));
+            else if (_droppedPrefix.Length < PrefixCap)
+                _droppedPrefix += digit;
+            return;
+        }
+        if (vk is >= 0x30 and <= 0x39)
+        {
+            // Shift+цифра — знак, зависящий от раскладки: '3$' в RU дало '3;'.
+            // Если слово с буквами уже набирается — как раньше, сброс.
+            // Иначе знак — часть набора: кладём кейкодом, ручной свап переведёт
+            // его через противоположную раскладку (';' → '$').
+            bool lettersInWord = _word.Any(k => k.Chars.Length == 0 || k.Chars.Any(char.IsLetter));
+            if (lettersInWord) { _word.Clear(); _droppedPrefix = ""; }
+            else _word.Add(new Keystroke(vk, "", shift, caps));
             return;
         }
 
@@ -355,7 +389,7 @@ public sealed class KeyboardMonitor : IDisposable
         // Всё остальное (знаки препинания вне таблицы, F-клавиши) — граница
         string punct = KeyMap.Translate(vk, false, shift, caps);
         if (punct.Length > 0) OnWordBoundary(new Keystroke(vk, punct));
-        else _word.Clear();
+        else { _word.Clear(); _droppedPrefix = ""; }
     }
 
     private Lang? _lastWordLang;
@@ -395,7 +429,7 @@ public sealed class KeyboardMonitor : IDisposable
     /// обнуляет. Без этого ретроконверсия пересобирала слова из прошлых
     /// сеансов поверх текущего текста: одно набранное 'й' превращалось
     /// в 'q q q', съедая соседние символы.
-    private readonly List<(string Text, string Trigger, Lang Lang, DateTime At)> _history = new();
+    private readonly List<(string Text, string Trigger, Lang Lang, DateTime At, IReadOnlyList<Keystroke>? Keys)> _history = new();
 
     /// Насколько долго слово считается «рядом с курсором».
     private static readonly TimeSpan HistoryTtl = TimeSpan.FromSeconds(8);
@@ -403,10 +437,11 @@ public sealed class KeyboardMonitor : IDisposable
     private void OnWordBoundary(Keystroke trigger)
     {
         if (_word.Count == 0) return;
-        if (Paused) { _word.Clear(); return; }
+        if (Paused) { _word.Clear(); _droppedPrefix = ""; return; }
         if (Exclusions.IsExcluded())
         {
             _word.Clear();
+            _droppedPrefix = "";
             return;
         }
 
@@ -418,6 +453,10 @@ public sealed class KeyboardMonitor : IDisposable
                                : KeyMap.Translate(k.VirtualKey, otherLayout, k.Shift, k.Caps)));
         var wordCopy = _word.ToList();
         _word.Clear();
+        // Слово завершено — его префикс переезжает к завершённому слову,
+        // чтобы ручной свап задним числом конвертировал их вместе.
+        _lastCompletedPrefix = _droppedPrefix;
+        _droppedPrefix = "";
         if (text.Length == 0) return;
 
         // Язык по содержимому — выбранной раскладке не доверяем, урок мака
@@ -478,7 +517,7 @@ public sealed class KeyboardMonitor : IDisposable
         {
             _lastWordLang = current;
             _lastSwitch = null;
-            PushHistory(text, trigger.Chars);
+            PushHistory(text, trigger.Chars, wordCopy);
             _consecutive = 0;
             _lastTarget = null;
         }
@@ -542,7 +581,46 @@ public sealed class KeyboardMonitor : IDisposable
     /// Свап последнего завершённого слова. Повтор — свап обратно.
     private void ManualSwap(bool learn = false)
     {
-        // Уже свапали это слово — работает ТОГГЛ: возвращаем ровно тот вариант,
+        // 1. Буфер содержит незавершённое слово — свапаем его (вместе с
+        // цифровым префиксом: '10ю0ю0ю1' → '10.0.0.1', как Punto).
+        // Раньше незавершённый буфер вообще нельзя было свапнуть вручную.
+        if (_word.Count > 0)
+        {
+            bool other = KeyMap.QueryOtherLayoutActive();
+            string bufText = string.Concat(_word.Select(k =>
+                k.Chars.Length > 0 ? k.Chars
+                                   : KeyMap.Translate(k.VirtualKey, other, k.Shift, k.Caps)));
+            string full = _droppedPrefix + bufText;
+            // Свап ПО КЕЙКОДАМ через противоположную раскладку, а не по
+            // символьной карте: знак ';' по символу неоднозначен ('ж' в EN
+            // против Shift+4 в RU), по кейкоду — однозначен ('3;' → '3$').
+            // Готовые символы (цифры, доввод) свапаются посимвольно.
+            string swappedFull = _droppedPrefix + string.Concat(_word.Select(k =>
+                k.Chars.Length > 0 ? _pair.Swap(k.Chars)
+                                   : KeyMap.Translate(k.VirtualKey, !other, k.Shift, k.Caps)));
+            _word.Clear();
+            _droppedPrefix = "";
+            if (full.Length == 0) return;
+            if (swappedFull == full)
+            {
+                _log($"[manual-buf] '{full}' — свап равен оригиналу");
+                return;
+            }
+            _log($"[manual-buf] '{full}' → '{swappedFull}'{(learn ? " + запомнить" : "")}");
+            if (learn && bufText.Length > 0)
+                LearnForceConsistent(bufText, _pair.Swap(bufText)); // учим слово, не префикс
+            _lastSwitch = new LastSwitch(full, swappedFull, "");
+            _lastWordLang = LangOf(swappedFull);
+            _replacer.Enqueue(new ReplaceJob(
+                EraseCount: full.Length,
+                Text: swappedFull,
+                TriggerChar: "",
+                SwitchLayout: true));
+            Sounds.Play(SoundKind.ConvertAndSwitch);
+            return;
+        }
+
+        // 2. Уже свапали это слово — работает ТОГГЛ: возвращаем ровно тот вариант,
         // что был, а не свапаем текущий заново.
         if (_lastSwitch is { } last && (DateTime.UtcNow - last.At).TotalSeconds < 60)
         {
@@ -572,21 +650,33 @@ public sealed class KeyboardMonitor : IDisposable
             return;
         }
 
-        var (text, triggerChar, _, at) = _history[^1];
+        var (text, triggerChar, _, at, histKeys) = _history[^1];
         if (DateTime.UtcNow - at > HistoryTtl)
         {
             _log("[manual] последнее слово слишком старое — не трогаю");
             _history.Clear();
             return;
         }
-        string swapped = _pair.Swap(text);
-        _log($"[manual] '{text}' → '{swapped}'{(learn ? " + запомнить" : "")}");
-        if (learn) LearnForceConsistent(text, swapped);
+        string fullText = _lastCompletedPrefix + text;
+        string swapped;
+        if (histKeys is not null)
+        {
+            // По кейкодам: точный перевод знаков (см. буферную ветку выше).
+            // Направление — от текущей раскладки: между набором и свапом её
+            // обычно не меняли.
+            bool otherNow = KeyMap.QueryOtherLayoutActive();
+            swapped = _lastCompletedPrefix + string.Concat(histKeys.Select(k =>
+                k.Chars.Length > 0 ? _pair.Swap(k.Chars)
+                                   : KeyMap.Translate(k.VirtualKey, !otherNow, k.Shift, k.Caps)));
+        }
+        else swapped = _pair.Swap(fullText);
+        _log($"[manual] '{fullText}' → '{swapped}'{(learn ? " + запомнить" : "")}");
+        if (learn) LearnForceConsistent(text, _pair.Swap(text)); // учим слово, не префикс
 
-        _lastSwitch = new LastSwitch(text, swapped, triggerChar);
+        _lastSwitch = new LastSwitch(fullText, swapped, triggerChar);
         _lastWordLang = LangOf(swapped);
         _replacer.Enqueue(new ReplaceJob(
-            EraseCount: text.Length + triggerChar.Length,
+            EraseCount: fullText.Length + triggerChar.Length,
             Text: swapped,
             TriggerChar: triggerChar,
             SwitchLayout: true));
@@ -594,9 +684,9 @@ public sealed class KeyboardMonitor : IDisposable
     }
 
     /// Добавить слово в историю (для ретроконверсии и ручного свапа).
-    private void PushHistory(string text, string trigger)
+    private void PushHistory(string text, string trigger, IReadOnlyList<Keystroke>? keys = null)
     {
-        _history.Add((text, trigger, LangOf(text), DateTime.UtcNow));
+        _history.Add((text, trigger, LangOf(text), DateTime.UtcNow, keys));
         if (_history.Count > 12) _history.RemoveAt(0);
     }
 
@@ -607,6 +697,7 @@ public sealed class KeyboardMonitor : IDisposable
         if (this.Trace) _log($"[trace] история сброшена: {why}");
         _history.Clear();
         _lastSwitch = null;
+        _lastCompletedPrefix = "";
     }
 
     /// Цепочка одиночных букв непосредственно перед текущим словом,
