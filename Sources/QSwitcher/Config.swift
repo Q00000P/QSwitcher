@@ -35,6 +35,15 @@ final class Config {
     /// Пауза между отдельными нажатиями при стирании и печати, миллисекунды.
     private(set) var keyIntervalMs: Int = 3
 
+    // MARK: - Обновления
+    /// Манифест на своём сервере. Домен, а не IP — чтобы пережить переезд;
+    /// порт нестандартный. Меняется в config.json без пересборки.
+    private(set) var updateManifestURL = "https://qsw.05.gs:8843/qswitcher/version-mac.json"
+    private(set) var updateRepo = "Q00000P/QSwitcher"
+    private(set) var updateReleasesPage = "https://github.com/Q00000P/QSwitcher/releases"
+    /// Автопроверка при запуске и раз в сутки.
+    private(set) var updateCheckOnLaunch = true
+
     /// Звук когда текст исправлен, но раскладка НЕ менялась.
     private(set) var soundConvertOnly: String = "Tink"
     /// Звук когда исправлен текст И переключена раскладка.
@@ -136,6 +145,10 @@ final class Config {
             switchLayoutAfter  = json["switchLayoutAfter"]  as? Int ?? 2
             replaceStartDelayMs = json["replaceStartDelayMs"] as? Int ?? 0
             keyIntervalMs       = json["keyIntervalMs"]       as? Int ?? 3
+            updateManifestURL   = json["updateManifestURL"]   as? String ?? updateManifestURL
+            updateRepo          = json["updateRepo"]          as? String ?? updateRepo
+            updateReleasesPage  = json["updateReleasesPage"]  as? String ?? updateReleasesPage
+            updateCheckOnLaunch = json["updateCheckOnLaunch"] as? Bool ?? true
             soundConvertOnly      = json["soundConvertOnly"]      as? String ?? "Tink"
             soundConvertAndSwitch = json["soundConvertAndSwitch"] as? String ?? "Pop"
 

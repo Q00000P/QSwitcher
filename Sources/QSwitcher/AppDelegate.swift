@@ -24,6 +24,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
 
+        // Проверка обновлений: при старте (с задержкой, чтобы не мешать
+        // запуску) и раз в сутки. Тихая — молчит, если новой версии нет.
+        if Config.shared.updateCheckOnLaunch {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                self?.checkUpdatesSilently()
+            }
+            updateTimer = Timer.scheduledTimer(withTimeInterval: 86400, repeats: true) { [weak self] _ in
+                self?.checkUpdatesSilently()
+            }
+        }
+
         if !trusted {
             updateStatusBar(trusted: false, lang: .en)
             fputs("⚠️  Нет прав Accessibility. Жду выдачи…\n", stderr)
@@ -184,6 +195,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let resetLearn = NSMenuItem(title: "Сбросить выученное…", action: #selector(resetLearned), keyEquivalent: "")
         resetLearn.target = self
         menu.addItem(resetLearn)
+
+        updateItem = NSMenuItem(title: "Проверить обновления…",
+                                action: #selector(checkUpdates), keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
 
         let about = NSMenuItem(title: "О программе…", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
@@ -609,6 +625,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn {
             LearnedRules.shared.reset()
+        }
+    }
+
+    // MARK: - Обновления
+
+    private var updateItem: NSMenuItem!
+    private var updateTimer: Timer?
+
+    /// Ручная проверка из меню: показываем результат всегда, даже «актуальна».
+    @objc private func checkUpdates() {
+        updateItem.title = "Проверяю обновления…"
+        UpdateChecker.check { [weak self] result in
+            guard let self = self else { return }
+            self.updateItem.title = "Проверить обновления…"
+            guard let r = result else {
+                let a = NSAlert()
+                a.messageText = "Не удалось проверить обновления"
+                a.informativeText = "Сервер обновлений и GitHub недоступны. Проверьте соединение."
+                a.runModal()
+                return
+            }
+            self.presentResult(r, silentIfUpToDate: false)
+        }
+    }
+
+    /// Фоновая проверка: молчим, если новой версии нет.
+    private func checkUpdatesSilently() {
+        UpdateChecker.check { [weak self] result in
+            guard let self = self, let r = result, r.isNewer else { return }
+            self.presentResult(r, silentIfUpToDate: true)
+        }
+    }
+
+    private func presentResult(_ r: UpdateChecker.Result, silentIfUpToDate: Bool) {
+        let alert = NSAlert()
+        if r.isNewer {
+            alert.messageText = "Доступна версия \(r.latest)"
+            alert.informativeText = "У вас \(r.current). Источник: \(r.source)."
+            // Автообновление — только при sha256 из манифеста (наш сервер).
+            // GitHub-фолбэк хеша не даёт: непроверенный бинарь не ставим,
+            // предлагаем страницу.
+            let canAutoUpdate = !r.sha256.isEmpty
+            if canAutoUpdate {
+                alert.addButton(withTitle: "Обновить и перезапустить")
+            }
+            alert.addButton(withTitle: "Открыть страницу загрузки")
+            alert.addButton(withTitle: "Позже")
+            let resp = alert.runModal()
+            if canAutoUpdate && resp == .alertFirstButtonReturn {
+                startInstall(r)
+            } else if (canAutoUpdate && resp == .alertSecondButtonReturn)
+                   || (!canAutoUpdate && resp == .alertFirstButtonReturn) {
+                if let url = URL(string: r.url) { NSWorkspace.shared.open(url) }
+            }
+        } else if !silentIfUpToDate {
+            alert.messageText = "Установлена последняя версия"
+            alert.informativeText = "\(r.current). Источник: \(r.source)."
+            alert.runModal()
+        }
+    }
+
+    /// Скачивание и установка. Меню на время блокируем, при ошибке — алерт,
+    /// при успехе приложение завершится само и helper перезапустит новое.
+    private func startInstall(_ r: UpdateChecker.Result) {
+        updateItem.title = "Скачиваю обновление…"
+        updateItem.isEnabled = false
+        UpdateInstaller.install(r) { [weak self] errText in
+            guard let self = self else { return }
+            self.updateItem.title = "Проверить обновления…"
+            self.updateItem.isEnabled = true
+            let a = NSAlert()
+            a.messageText = "Обновление не установилось"
+            a.informativeText = errText + "\n\nТекущая версия продолжает работать."
+            a.runModal()
         }
     }
 

@@ -151,38 +151,11 @@ final class Switcher {
     // MARK: - Lifecycle
 
     func start() {
-        // Слушаем keyDown И flagsChanged (для дабл-Shift)
-        // Клики мыши тоже слушаем: после них курсор в другом месте, и накопленное
-        // недописанное слово там уже не рядом. Без этого буфер тащил старые буквы
-        // и склеивал их со следующим словом ('приложений' + 'что' → 'приложенийчто').
-        let mask: CGEventMask =
-            (1 << CGEventType.keyDown.rawValue) |
-            (1 << CGEventType.flagsChanged.rawValue) |
-            (1 << CGEventType.leftMouseDown.rawValue) |
-            (1 << CGEventType.rightMouseDown.rawValue)
-        let userInfo = Unmanaged.passUnretained(self).toOpaque()
-
-        let cb: CGEventTapCallBack = { _, type, event, ctx in
-            let me = Unmanaged<Switcher>.fromOpaque(ctx!).takeUnretainedValue()
-            return me.handle(type: type, event: event)
-        }
-
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .defaultTap,
-            eventsOfInterest: mask,
-            callback: cb,
-            userInfo: userInfo
-        ) else {
+        guard createTap() else {
             fputs("❌ Не удалось создать event tap. Проверь права Accessibility.\n", stderr)
             return
         }
-
-        eventTap = tap
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+        startTrustMonitor()
         KeyTranslate.installObserver()
 
         // Смена раскладки посреди слова означает что дальше пойдут символы
@@ -252,7 +225,13 @@ final class Switcher {
 
     // MARK: - Tap handler
 
+    /// Tap подвешен (отзыв прав): обработчик пропускает ВСЁ мгновенно,
+    /// без единого вызова — любая работа в callback при мёртвых правах
+    /// рискует задержать системную очередь событий.
+    private var tapSuspended = false
+
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if tapSuspended { return Unmanaged.passUnretained(event) }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             // По таймауту переподнимаем ТОЛЬКО при живых правах.
             // По userInput (в т.ч. отзыв Accessibility) — НЕ воюем немедленным
@@ -263,14 +242,10 @@ final class Switcher {
             if type == .tapDisabledByTimeout, AXIsProcessTrusted() {
                 if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
             } else {
-                print("[tap] отключён (\(type == .tapDisabledByUserInput ? "userInput/отзыв прав" : "timeout без прав")) — жду возврата прав")
-                activeReplays = 0
-                pendingRealEvents.removeAll()
-                gateWatchdog?.invalidate()
-                gateWatchdog = nil
-                word.removeAll()
-                droppedPrefix = ""
-                scheduleTapRecovery()
+                // Страховка: обычно отзыв прав ловит монитор ДО этого события
+                let why = type == .tapDisabledByUserInput ? "userInput/отзыв прав" : "timeout без прав"
+                lastTrusted = false
+                DispatchQueue.main.async { [weak self] in self?.teardownTap(reason: why) }
             }
             return Unmanaged.passUnretained(event)
         }
@@ -767,22 +742,104 @@ final class Switcher {
         InputSource.switchTo(target)
     }
 
-    // MARK: - Tap recovery
+    // MARK: - Tap lifecycle + монитор прав
 
-    private var tapRecoveryTimer: Timer?
+    /// Создать tap с нуля. false — система отказала (обычно нет прав).
+    @discardableResult
+    private func createTap() -> Bool {
+        // Слушаем keyDown И flagsChanged (для дабл-Shift)
+        // Клики мыши тоже: после них курсор в другом месте, и накопленное
+        // недописанное слово там уже не рядом.
+        let mask: CGEventMask =
+            (1 << CGEventType.keyDown.rawValue) |
+            (1 << CGEventType.flagsChanged.rawValue) |
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.rightMouseDown.rawValue)
+        let userInfo = Unmanaged.passUnretained(self).toOpaque()
+        let cb: CGEventTapCallBack = { _, type, event, ctx in
+            let me = Unmanaged<Switcher>.fromOpaque(ctx!).takeUnretainedValue()
+            return me.handle(type: type, event: event)
+        }
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: cb,
+            userInfo: userInfo
+        ) else { return false }
 
-    /// Ждём возврата прав Accessibility и только тогда включаем tap обратно.
-    private func scheduleTapRecovery() {
-        guard tapRecoveryTimer == nil else { return }
-        tapRecoveryTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            guard AXIsProcessTrusted() else { return }
-            if let tap = self.eventTap {
-                CGEvent.tapEnable(tap: tap, enable: true)
-                print("[tap] права вернулись — tap включён")
+        eventTap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        tapSuspended = false
+        return true
+    }
+
+    /// ПОЛНЫЙ демонтаж tap: инвалидируем mach-порт и снимаем с runloop.
+    /// Просто tapEnable(false) недостаточно: при отзыве прав WindowServer
+    /// продолжал ждать наш порт, события копились и ВЕСЬ мак замерзал
+    /// наглухо до жёсткого выключения питанием. Инвалидированный порт
+    /// система не ждёт.
+    private func teardownTap(reason: String) {
+        print("[tap] демонтаж (\(reason))")
+        tapSuspended = true
+        if let src = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes)
+        }
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+        }
+        runLoopSource = nil
+        eventTap = nil
+        activeReplays = 0
+        pendingRealEvents.removeAll()
+        gateWatchdog?.invalidate()
+        gateWatchdog = nil
+        word.removeAll()
+        droppedPrefix = ""
+    }
+
+    /// Проактивный монитор прав: НЕ ждём события tapDisabled — при отзыве
+    /// прав система фризится раньше, чем успевает его доставить. Раз в
+    /// секунду сверяем AXIsProcessTrusted и сами управляем жизнью tap.
+    private var trustMonitorTimer: Timer?
+    private var lastTrusted = true
+
+    private func startTrustMonitor() {
+        // Мгновенный канал: TCC рассылает это уведомление при ЛЮБОМ изменении
+        // прав Accessibility. Секундный поллинг ниже остаётся страховкой —
+        // уведомление недокументированное и однажды может перестать приходить.
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.accessibility.api"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            // TCC шлёт уведомление ДО того, как AXIsProcessTrusted начинает
+            // отвечать по-новому — перепроверяем с небольшой задержкой.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self?.reactToTrustChange()
             }
-            self.tapRecoveryTimer?.invalidate()
-            self.tapRecoveryTimer = nil
+        }
+        trustMonitorTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.reactToTrustChange()
+        }
+    }
+
+    private func reactToTrustChange() {
+        let trusted = AXIsProcessTrusted()
+        if trusted == lastTrusted { return }
+        lastTrusted = trusted
+        if !trusted {
+            teardownTap(reason: "права Accessibility отозваны")
+        } else if eventTap == nil {
+            if createTap() {
+                print("[tap] права вернулись — tap пересоздан")
+            } else {
+                print("[tap] права вернулись, но tap не создался — повторю")
+                lastTrusted = false   // попробуем на следующем тике
+            }
         }
     }
 
