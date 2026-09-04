@@ -58,6 +58,45 @@ Write-Host "✅ Релиз собран: $Zip"
 Write-Host "   Версия: $Version"
 Write-Host "   SHA256: $Sha"
 Write-Host "════════════════════════════════════════"
+# === Манифест обновлений на свой VPS ===
+# Клиент сначала спрашивает его, и только при недоступности идёт в GitHub API.
+# Адрес и порт — в переменных окружения (в скрипт не зашиваем):
+#   $env:QS_DEPLOY_HOST = "user@updates.u-0.ru"   # домен, не IP — переезд без пересборки
+#   $env:QS_DEPLOY_PORT = "2222"                  # ssh-порт
+#   $env:QS_DEPLOY_PATH = "/var/www/qswitcher"    # куда nginx смотрит
+$manifestName = "version-win.json"
+$manifestPath = Join-Path $Root $manifestName
+$manifest = [ordered]@{
+    version   = $Version
+    sha256    = $Sha
+    url       = "https://github.com/Q00000P/QSwitcher/releases/download/win-$Version/QSwitcher-win-$Version.zip"
+    page      = "https://github.com/Q00000P/QSwitcher/releases/tag/win-$Version"
+    published = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+}
+$manifest | ConvertTo-Json | Set-Content -Path $manifestPath -Encoding UTF8
+Write-Host "📄 Манифест: $manifestPath"
+
+if ($env:QS_DEPLOY_HOST) {
+    $port = if ($env:QS_DEPLOY_PORT) { $env:QS_DEPLOY_PORT } else { "22" }
+    $path = if ($env:QS_DEPLOY_PATH) { $env:QS_DEPLOY_PATH } else { "/var/www/qswitcher" }
+    Write-Host "🚀 Заливаю на $($env:QS_DEPLOY_HOST):$path/"
+    & scp -P $port $manifestPath "$($env:QS_DEPLOY_HOST):$path/$manifestName"
+    if ($LASTEXITCODE -eq 0) { Write-Host "   ✅ Манифест опубликован" }
+    else { Write-Host "   ⚠️  Не залился — выложи $manifestName вручную" }
+}
+else {
+    # Нет ssh-доступа со сборочной машины — печатаем готовую строку для
+    # вставки в сессию сервера (MobaXterm), scp не нужен.
+    Write-Host "ℹ️  QS_DEPLOY_HOST не задан — заливать по scp не буду."
+    Write-Host ""
+    Write-Host "   Вставь эту строку в сессию сервера (MobaXterm):"
+    Write-Host ""
+    Write-Host "   cat > /var/www/qswitcher/$manifestName <<'JSON'"
+    Get-Content $manifestPath | ForEach-Object { Write-Host $_ }
+    Write-Host "JSON"
+    Write-Host ""
+}
+
 Write-Host ""
 Write-Host "Дальше:"
 Write-Host "  gh release create win-$Version `"$Zip`" --title `"QSwitcher для Windows $Version`""
