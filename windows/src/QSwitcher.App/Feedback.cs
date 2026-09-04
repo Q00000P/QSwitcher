@@ -123,6 +123,10 @@ public sealed class AppExclusions
 
     public AppExclusions(Func<IReadOnlyCollection<string>> excluded) => _excluded = excluded;
 
+    /// Источник имени процесса по событиям (ForegroundTracker). Если задан —
+    /// никаких фоновых обновлений и обращений к процессу отсюда.
+    public Func<string>? ProcessNameSource { get; set; }
+
     /// Текущее приложение в списке исключений?
     public bool IsExcluded()
     {
@@ -137,6 +141,7 @@ public sealed class AppExclusions
 
     private string CachedProcessName()
     {
+        if (ProcessNameSource is { } src) return src();
         lock (_lock)
         {
             bool stale = (DateTime.UtcNow - _refreshedAt).TotalMilliseconds > 400;

@@ -166,10 +166,42 @@ public sealed class LearnedRules
         catch { /* повреждённый файл — начинаем с чистого */ }
     }
 
+    private int _savePending;
+    private readonly ManualResetEventSlim _saved = new(true);
+
+    /// Запись на диск — отложенно, в фоне: правила учатся из потока хука
+    /// (Shift+тап), а файловая операция в хуке недопустима. Несколько правок
+    /// подряд схлопываются в одну запись.
     private void Save()
     {
-        var s = new Stored(_stop.OrderBy(x => x).ToList(), _force.OrderBy(x => x).ToList());
-        File.WriteAllText(_path, JsonSerializer.Serialize(s,
-            new JsonSerializerOptions { WriteIndented = true }));
+        _saved.Reset();
+        if (Interlocked.Exchange(ref _savePending, 1) == 1) return;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Interlocked.Exchange(ref _savePending, 0);
+            try { WriteNow(); }
+            catch { }
+            finally { if (Volatile.Read(ref _savePending) == 0) _saved.Set(); }
+        });
+    }
+
+    private void WriteNow()
+    {
+        string json;
+        lock (_lock)
+        {
+            var s = new Stored(_stop.OrderBy(x => x).ToList(), _force.OrderBy(x => x).ToList());
+            json = JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true });
+        }
+        File.WriteAllText(_path, json);
+    }
+
+    /// Дождаться отложенной записи (перед выходом).
+    public void Flush()
+    {
+        if (!_saved.Wait(2000))
+        {
+            try { WriteNow(); } catch { }
+        }
     }
 }

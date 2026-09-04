@@ -55,11 +55,29 @@ public record ReplaceJob(int EraseCount, string Text, string TriggerChar, bool S
 
     /// Если задано — это операция над выделением, а не замена набранного.
     public (KeyboardMonitor.SelectionOp op, Func<string, string> transform)? Selection { get; init; }
+
+    /// Для «правого Ctrl по-Punto»: выделения нет → вызвать это (свап набранного).
+    /// Выделение ищется ТОЛЬКО через UIA — буфер обмена на каждый тап недопустим.
+    public Action? IfNoSelection { get; init; }
+
+    /// Вызывается с выделенным текстом до замены (обучение по выделенному слову).
+    public Action<string>? OnSelected { get; init; }
 }
 
 /// <summary>
-/// Отправка синтетического ввода. ОДИН поток, задания строго по очереди —
-/// урок macOS, где параллельные замены съедали текст и роняли процесс.
+/// Отправка синтетического ввода.
+///
+/// ДВА ДВИЖКА:
+///  • v4 (по умолчанию) — «хук как замок». Замена набранного уходит ОДНИМ
+///    вызовом SendInput прямо из потока хука, пока callback ещё не вернулся:
+///    всё, что нажато после, физически стоит в очереди позади батча. Ни пауз
+///    перед стиранием, ни хвоста, ни гейта — вклиниться некуда.
+///  • legacy — прежняя схема: очередь → рабочий поток → пауза → батч → гейт.
+///    Оставлена как откат (config.json: "Engine": "legacy").
+///
+/// Операции над ВЫДЕЛЕНИЕМ на обоих движках идут в рабочем потоке: чтение
+/// через UIA (аналог AX на маке), вывод — набором поверх выделения тем же
+/// батчем; Ctrl+V и гонка с возвратом буфера обмена убраны совсем.
 /// </summary>
 public sealed class TextReplacer : IDisposable
 {
@@ -68,8 +86,14 @@ public sealed class TextReplacer : IDisposable
     private readonly Action<string> _log;
     private readonly ushort _otherLangId;
 
-    /// Пауза перед стиранием, миллисекунды. Слишком мало — гонка с доставкой
-    /// клавиши-границы, слишком много — человек успевает набрать дальше.
+    /// Новый движок: замена набранного выполняется синхронно из хука.
+    public bool V4 { get; init; } = true;
+
+    /// ДИАГНОСТИКА: QSWITCHER_NOSWITCH=1 — раскладку после замены не трогать.
+    public static readonly bool NoLayoutSwitch =
+        Environment.GetEnvironmentVariable("QSWITCHER_NOSWITCH") == "1";
+
+    /// LEGACY: пауза перед стиранием, миллисекунды.
     public int StartDelayMs { get; init; } = 25;
     private void Log(string m) => _log(m);
 
@@ -81,22 +105,38 @@ public sealed class TextReplacer : IDisposable
         _worker.Start();
     }
 
-    public void Enqueue(ReplaceJob job) => _queue.Add(job);
+    /// <summary>
+    /// Отправить замену набранного. v4 — выполняется НЕМЕДЛЕННО в потоке
+    /// вызывающего (хук); legacy — в очередь рабочего потока.
+    /// </summary>
+    public bool Submit(ReplaceJob job)
+    {
+        if (!V4) { _queue.Add(job); return true; }
+        try { return Execute(job); }
+        catch (Exception ex) { _log($"[replace] ошибка: {ex.Message}"); return false; }
+    }
 
-    /// Операция над выделенным текстом: копируем, преобразуем, вставляем.
-    /// На Windows нет аналога macOS Accessibility API для чтения выделения,
-    /// так что буфер обмена — единственный надёжный путь. Содержимое буфера
-    /// сохраняем и возвращаем.
+    /// Операция над выделенным текстом — всегда в рабочем потоке:
+    /// UIA и буфер обмена в хуке недопустимы.
     public void EnqueueSelection(KeyboardMonitor.SelectionOp op, Func<string, string> transform)
         => _queue.Add(new ReplaceJob(0, "", "", false) { Selection = (op, transform) });
 
     /// <summary>
-    /// Идёт отправка синтетического ввода.
-    ///
-    /// Пока true, перехватчик обязан игнорировать ВСЁ. Одной метки
-    /// dwExtraInfo оказалось мало: наша же замена возвращалась в обработку,
-    /// детектор конвертировал её обратно, и получался бесконечный круг
-    /// ('q' → 'й' → 'q' …), засыпающий текст мусором.
+    /// По-Punto: если есть выделение (по UIA) — преобразовать его, иначе —
+    /// выполнить fallback (свап набранного). Буфер обмена здесь не трогается:
+    /// это путь тапа правого Ctrl, он срабатывает постоянно.
+    /// </summary>
+    public void EnqueueSelectionOrElse(Func<string, string> transform, Action fallback, Action<string>? onSelected = null)
+        => _queue.Add(new ReplaceJob(0, "", "", false)
+        {
+            Selection = (KeyboardMonitor.SelectionOp.Swap, transform),
+            IfNoSelection = fallback,
+            OnSelected = onSelected,
+        });
+
+    /// <summary>
+    /// LEGACY: идёт отправка синтетического ввода — хук задерживает реальный
+    /// ввод. В v4 не поднимается никогда.
     /// </summary>
     public volatile bool Injecting;
 
@@ -104,16 +144,26 @@ public sealed class TextReplacer : IDisposable
     {
         foreach (var job in _queue.GetConsumingEnumerable())
         {
+            if (job.Selection is { } sel)
+            {
+                try { ExecuteSelection(sel.transform, job.IfNoSelection, job.OnSelected); }
+                catch (Exception ex) { _log($"[selection] ошибка: {ex.Message}"); }
+                continue;
+            }
+
+            // LEGACY-путь
             Injecting = true;
-            try { Execute(job); }
+            try
+            {
+                _jobLayout = ForegroundLayoutHandle();
+                if (StartDelayMs > 0) Thread.Sleep(StartDelayMs);
+                Execute(job);
+            }
             catch (Exception ex) { _log($"[replace] ошибка: {ex.Message}"); }
             finally
             {
-                // Небольшой хвост: события доходят до приложений с задержкой,
-                // и последние из них могут прилететь в хук уже после Execute.
                 Thread.Sleep(30);
                 Injecting = false;
-                // Доввод реального ввода, съеденного хуком во время замены.
                 FlushDelayed();
             }
         }
@@ -122,126 +172,178 @@ public sealed class TextReplacer : IDisposable
     /// Сколько замен уже отправлено — для диагностики в логе.
     private int _jobCounter;
 
-    private void Execute(ReplaceJob job)
+    /// <summary>
+    /// Батч замены: backspace'ы + текст + триггер + хвост — ОДИН SendInput.
+    /// Порядок внутри гарантирует системная очередь ввода.
+    /// </summary>
+    private bool Execute(ReplaceJob job)
     {
-        if (job.Selection is { } sel)
-        {
-            ExecuteSelection(sel.transform);
-            return;
-        }
-
         int id = ++_jobCounter;
-        Log($"[replace #{id}] стираю {job.EraseCount}, печатаю '{job.Text}'");
+        Log($"[replace #{id}] стираю {job.EraseCount}, печатаю '{job.Text}'"
+            + $" (ctrl={(GetAsyncKeyState(0x11) & 0x8000) != 0}, shift={(GetAsyncKeyState(0x10) & 0x8000) != 0}, поток {Thread.CurrentThread.Name})");
 
-        // Раскладка окна ДО любых наших действий: по ней будут переведены
-        // задержанные шлюзом нажатия. После замены раскладка может смениться,
-        // а человек жал клавиши ещё при старой — довводить надо её символы.
-        _jobLayout = ForegroundLayoutHandle();
-
-        // Пауза перед стиранием. Хук пропускает клавишу-границу дальше и сразу
-        // ставит слово в очередь — но приложение может ещё не успеть её
-        // обработать. Тогда backspace'ы стирают на символ больше, чем реально
-        // напечатано, и текст уезжает назад. Пауза нужна маленькая: она должна
-        // покрыть доставку одного события, а не ожидание человека.
-        if (StartDelayMs > 0) Thread.Sleep(StartDelayMs);
-
-        // ОДИН вызов SendInput со всем пакетом: backspace'ы + замена + триггер
-        // встают в системную очередь атомарно — между ними физически не может
-        // вклиниться другой ввод. Паузы между событиями убраны: порядок
-        // гарантирует сама очередь, пейсинг лишь растягивал окно гонки.
-        var batch = new List<INPUT>(job.EraseCount * 2 + (job.Text.Length + 2) * 2);
+        var batch = new List<INPUT>(job.EraseCount * 2 + (job.Text.Length + job.TailText.Length + 2) * 2);
         for (int i = 0; i < job.EraseCount; i++)
         {
             batch.Add(VkInput(0x08, false));
             batch.Add(VkInput(0x08, true));
         }
-        foreach (char c in job.Text)
-        {
-            batch.Add(CharInput(c, false));
-            batch.Add(CharInput(c, true));
-        }
+        AppendText(batch, job.Text);
 
-        // Триггер: печатные символы юникодом (код клавиши прогнался бы через
-        // текущую раскладку и дал не тот символ), а Enter и Tab — виртуальными
-        // клавишами: как юникод они вставляют не перевод строки, а мусор.
-        if (job.TriggerChar == "\r") { batch.Add(VkInput(0x0D, false)); batch.Add(VkInput(0x0D, true)); }
-        else if (job.TriggerChar == "\t") { batch.Add(VkInput(0x09, false)); batch.Add(VkInput(0x09, true)); }
-        else foreach (char c in job.TriggerChar)
-        {
-            batch.Add(CharInput(c, false));
-            batch.Add(CharInput(c, true));
-        }
-
-        foreach (char c in job.TailText)
-        {
-            batch.Add(CharInput(c, false));
-            batch.Add(CharInput(c, true));
-        }
+        // Триггер: пробел/Enter/Tab — виртуальными клавишами (как юникод они
+        // дают не то или мусор), остальное — юникодом.
+        AppendTrigger(batch, job.TriggerChar);
+        AppendText(batch, job.TailText);
 
         uint sent = SendInput((uint)batch.Count, batch.ToArray(), Marshal.SizeOf<INPUT>());
         if (sent != batch.Count)
+        {
             Log($"[replace #{id}] отправлено {sent}/{batch.Count} событий (err={Marshal.GetLastWin32Error()})");
+            if (sent == 0) return false;   // ничего не ушло — границу не съедать
+        }
 
-        // Раскладку переключаем ПОСЛЕ печати. PostMessage асинхронный, и если
-        // делать это раньше, часть символов уходит в старой раскладке, часть
-        // в новой — отсюда каша тем сильнее, чем больше набрано.
-        if (job.SwitchLayout)
+        // Раскладку переключаем ПОСЛЕ печати. Батч юникодный и от раскладки не
+        // зависит; posted-сообщение приложение обработает раньше своих очередных
+        // клавиш — так последующий набор человека уже пойдёт в новой раскладке.
+        if (job.SwitchLayout && !NoLayoutSwitch)
             SwitchForegroundLayout(job.Text);
 
         Log($"[replace #{id}] готово");
+        return true;
     }
 
-    /// Читаем выделение через Ctrl+C, преобразуем, вставляем через Ctrl+V.
-    private void ExecuteSelection(Func<string, string> transform)
+    /// Текст в батч: печатные — юникодом, переводы строк и табы — клавишами.
+    private static void AppendText(List<INPUT> batch, string text)
     {
-        string? saved = null;
-        try
+        for (int i = 0; i < text.Length; i++)
         {
-            // Сохраняем текущий буфер, чтобы вернуть его человеку
-            saved = ClipboardText();
-
-            // ВАЖНО: перед копированием кладём в буфер метку.
-            // Если выделения нет, Ctrl+C ничего не меняет, и старое содержимое
-            // буфера принимается за «выделенный текст». Именно так в документ
-            // однажды влетели команды из терминала, свапнутые в кириллицу.
-            const string sentinel = "\u0001QSWITCHER_NO_SELECTION\u0001";
-            SetClipboardText(sentinel);
-            Thread.Sleep(30);
-
-            SendCombo(0x11 /*Ctrl*/, 0x43 /*C*/);
-
-            // Ждём пока буфер реально изменится, но не дольше 400 мс
-            string selected = "";
-            for (int i = 0; i < 20; i++)
+            char c = text[i];
+            if (c == '\r')
             {
-                Thread.Sleep(20);
-                var now = ClipboardText() ?? "";
-                if (now != sentinel && now.Length > 0) { selected = now; break; }
+                batch.Add(VkInput(0x0D, false)); batch.Add(VkInput(0x0D, true));
+                if (i + 1 < text.Length && text[i + 1] == '\n') i++;
+                continue;
             }
-
-            if (selected.Length == 0)
-            {
-                Log("[selection] выделения нет — ничего не делаю");
-                return;
-            }
-
-            string result = transform(selected);
-            if (result == selected) { Log("[selection] без изменений"); return; }
-
-            SetClipboardText(result);
-            Thread.Sleep(40);
-            SendCombo(0x11, 0x56 /*V*/);
-            Thread.Sleep(120);
-            Log($"[selection] '{Trim(selected)}' → '{Trim(result)}'");
+            if (c == '\n') { batch.Add(VkInput(0x0D, false)); batch.Add(VkInput(0x0D, true)); continue; }
+            if (c == '\t') { batch.Add(VkInput(0x09, false)); batch.Add(VkInput(0x09, true)); continue; }
+            batch.Add(CharInput(c, false));
+            batch.Add(CharInput(c, true));
         }
-        catch (Exception ex) { Log($"[selection] ошибка: {ex.Message}"); }
-        finally
+    }
+
+    private static void AppendTrigger(List<INPUT> batch, string trigger)
+    {
+        switch (trigger)
         {
-            if (saved is not null) { Thread.Sleep(60); SetClipboardText(saved); }
+            case "": return;
+            case " ":  batch.Add(VkInput(0x20, false)); batch.Add(VkInput(0x20, true)); return;
+            case "\r": batch.Add(VkInput(0x0D, false)); batch.Add(VkInput(0x0D, true)); return;
+            case "\t": batch.Add(VkInput(0x09, false)); batch.Add(VkInput(0x09, true)); return;
+            default:   AppendText(batch, trigger); return;
         }
+    }
+
+    // ==== Выделение ====
+
+    /// Лимит на размер выделения для набора поверх: больше — отказ с логом.
+    private const int SelectionCap = 20000;
+
+    /// <summary>
+    /// Прочитать выделение, преобразовать, напечатать поверх.
+    /// 1) UIA TextPattern — без буфера обмена. 2) Фолбэк: Ctrl+C и проверка,
+    ///    что буфер РЕАЛЬНО изменился (номер последовательности буфера, а не
+    ///    сравнение содержимого), исходный буфер возвращается сразу после чтения.
+    /// Вывод — набором: заменяет выделение в любом поле, Ctrl+V и гонки с
+    /// возвратом буфера нет.
+    /// </summary>
+    private void ExecuteSelection(Func<string, string> transform, Action? ifNoSelection = null, Action<string>? onSelected = null)
+    {
+        string? selected = UiaText.ReadSelection();
+        string source = "UIA";
+
+        if (string.IsNullOrEmpty(selected) && ifNoSelection is not null)
+        {
+            // По-Punto: выделения (по UIA) нет — свап набранного
+            Log("[selection] выделения нет → свап набранного");
+            ifNoSelection();
+            return;
+        }
+        if (string.IsNullOrEmpty(selected))
+        {
+            source = "clipboard";
+            selected = ReadSelectionViaClipboard();
+        }
+
+        if (string.IsNullOrEmpty(selected))
+        {
+            Log("[selection] выделения нет — ничего не делаю");
+            return;
+        }
+        if (selected.Length > SelectionCap)
+        {
+            Log($"[selection] выделение {selected.Length} символов — слишком большое, не трогаю");
+            return;
+        }
+
+        onSelected?.Invoke(selected);
+        string result = transform(selected);
+        if (result == selected) { Log($"[selection/{source}] без изменений"); return; }
+
+        // Сочетание (RCtrl+T и т.п.) — человек ещё держит модификатор, а набор
+        // под Ctrl превращается в шорткаты. Ждём физического отпускания:
+        // это ожидание действия человека, а не гонка по времени.
+        WaitModifiersReleased();
+
+        var batch = new List<INPUT>(result.Length * 2 + 4);
+        AppendText(batch, result);
+        uint sent = SendInput((uint)batch.Count, batch.ToArray(), Marshal.SizeOf<INPUT>());
+        if (sent != batch.Count)
+            Log($"[selection] отправлено {sent}/{batch.Count} (err={Marshal.GetLastWin32Error()})");
+        Log($"[selection/{source}] '{Trim(selected)}' → '{Trim(result)}'");
+    }
+
+    /// <summary>
+    /// Фолбэк без UIA: Ctrl+C, ждём смены номера последовательности буфера.
+    /// Ожидание ограничено сверху как ПРЕДОХРАНИТЕЛЬ ОТКАЗА (не успело —
+    /// «выделения нет»), а не как настройка: неправильный результат по
+    /// таймингу здесь невозможен, только отсутствие действия.
+    /// </summary>
+    private string? ReadSelectionViaClipboard()
+    {
+        string? saved = ClipboardText();
+        uint before = GetClipboardSequenceNumber();
+
+        SendCombo(0x11 /*Ctrl*/, 0x43 /*C*/);
+
+        bool changed = false;
+        for (int i = 0; i < 160; i++)          // до ~800 мс
+        {
+            Thread.Sleep(5);
+            if (GetClipboardSequenceNumber() != before) { changed = true; break; }
+        }
+        if (!changed) return null;
+
+        string? selected = ClipboardText();
+
+        // Буфер человека возвращаем СРАЗУ: вставки дальше не будет, гонки нет.
+        if (saved is not null) SetClipboardText(saved);
+        return selected;
     }
 
     private static string Trim(string s) => s.Length <= 30 ? s : s[..30] + "…";
+
+    /// Дождаться, пока Ctrl/Alt/Win/Shift физически отпущены (предохранитель 3 с).
+    private static void WaitModifiersReleased()
+    {
+        for (int i = 0; i < 600; i++)
+        {
+            bool held = false;
+            foreach (int vk in new[] { 0x11, 0x12, 0x10, 0x5B, 0x5C })
+                if ((GetAsyncKeyState(vk) & 0x8000) != 0) { held = true; break; }
+            if (!held) return;
+            Thread.Sleep(5);
+        }
+    }
 
     private static string? ClipboardText()
     {
@@ -252,18 +354,21 @@ public sealed class TextReplacer : IDisposable
             catch { }
         });
         t.SetApartmentState(ApartmentState.STA);
-        t.Start(); t.Join(500);
+        t.Start(); t.Join(1000);
         return result;
     }
 
-    private static void SetClipboardText(string text)
+    private bool SetClipboardText(string text)
     {
+        bool ok = false;
         var t = new Thread(() =>
         {
-            try { Clipboard.SetText(text); } catch { }
+            try { Clipboard.SetText(text); ok = true; } catch { }
         });
         t.SetApartmentState(ApartmentState.STA);
-        t.Start(); t.Join(500);
+        t.Start(); t.Join(1000);
+        if (!ok) Log("[selection] не удалось вернуть буфер обмена (занят другим процессом)");
+        return ok;
     }
 
     private void SendCombo(uint modifier, uint key)
@@ -276,52 +381,44 @@ public sealed class TextReplacer : IDisposable
         SendInput(4, inputs, Marshal.SizeOf<INPUT>());
     }
 
-    // === Input-gate: реальный ввод, съеденный хуком во время замены ===
+    // === LEGACY input-gate: реальный ввод, съеденный хуком во время замены ===
 
     private readonly System.Collections.Concurrent.ConcurrentQueue<(uint Vk, ushort Scan, bool Up, bool Ext, bool Shift, bool Caps)> _delayed = new();
     private const int DelayedCap = 128;
 
-    /// Раскладка окна на момент старта текущего задания (см. Execute).
+    /// LEGACY: раскладка окна на момент старта текущего задания.
     private IntPtr _jobLayout;
 
-    /// Довведённый юникодом текст сюда: монитор кладёт его в буфер слова
-    /// готовыми символами (сам он эти события не видит — они с маркером).
+    /// LEGACY: довведённый юникодом текст — монитор кладёт его в буфер слова.
     public Action<string>? OnReplayedText;
 
-    /// Отложить реальное нажатие. Зовётся из потока LL-хука — только быстрая
-    /// постановка в очередь, никакого WinAPI и логов.
+    /// LEGACY: отложить реальное нажатие (из потока хука).
     public void DelayRealKey(uint vk, ushort scan, bool up, bool extended, bool shift, bool caps)
     {
         if (_delayed.Count < DelayedCap)
             _delayed.Enqueue((vk, scan, up, extended, shift, caps));
     }
 
-    /// Доввод задержанного. ПЕЧАТНЫЕ клавиши переводим в символы по раскладке
-    /// НА МОМЕНТ НАЖАТИЯ (_jobLayout) и шлём юникодом с маркером: замена могла
-    /// переключить раскладку, и сканкоды легли бы на экран не теми буквами —
-    /// именно так после свапа 'ТД'→'NL' кириллица превращалась в 'z ndjq'.
-    /// КОНТРОЛЬНЫЕ (пробел, Enter, backspace, стрелки) от раскладки не зависят —
-    /// идут сканкодами БЕЗ маркера, чтобы штатно пройти хук как границы/сбросы.
-    /// Вызывать строго ПОСЛЕ Injecting = false.
+    /// LEGACY: доввод задержанного — печатные юникодом по раскладке на момент
+    /// нажатия, контрольные сканкодами без маркера.
     private void FlushDelayed()
     {
         if (_delayed.IsEmpty) return;
         var list = new List<INPUT>();
-        var replayedText = new System.Text.StringBuilder();
+        var replayedText = new StringBuilder();
         var unicodeDowns = new HashSet<uint>();
 
         while (_delayed.TryDequeue(out var k))
         {
             if (k.Up)
             {
-                // Пара down этой клавиши ушла юникодом — up уже отправлен с ней
                 if (unicodeDowns.Remove(k.Vk)) continue;
                 list.Add(RealKeyInput(k.Vk, k.Scan, true, k.Ext));
                 continue;
             }
 
             string s = "";
-            if (k.Vk != 0x20) // пробел — всегда сканкодом: это граница слова
+            if (k.Vk != 0x20)
             {
                 var state = new byte[256];
                 if (k.Shift) state[0x10] = 0x80;
@@ -363,8 +460,7 @@ public sealed class TextReplacer : IDisposable
         return GetKeyboardLayout(threadId);
     }
 
-    /// Клавиша доввода: со скан-кодом и extended-флагом как у оригинала,
-    /// dwExtraInfo = 0 — хук обработает её как реальный ввод.
+    /// Клавиша доввода (legacy): со скан-кодом как у оригинала, dwExtraInfo = 0.
     private static INPUT RealKeyInput(uint vk, ushort scan, bool up, bool extended) => new()
     {
         type = 1,
@@ -392,7 +488,6 @@ public sealed class TextReplacer : IDisposable
         IntPtr hwnd = GetForegroundWindow();
         if (hwnd == IntPtr.Zero) return;
 
-        // Раскладки: язык нужного семейства ищем среди установленных
         var list = new IntPtr[16];
         int n = GetKeyboardLayoutList(list.Length, list);
         for (int i = 0; i < n; i++)
@@ -425,9 +520,7 @@ public sealed class TextReplacer : IDisposable
     /// Виртуальная клавиша ВМЕСТЕ со скан-кодом.
     ///
     /// Без скан-кода часть приложений (игры, Electron, некоторые поля ввода)
-    /// синтетические нажатия игнорирует. Именно так терялись backspace'ы:
-    /// стирание не происходило, а замена дописывалась следом — 'й' + 'q'
-    /// вместо 'q'.
+    /// синтетические нажатия игнорирует. Именно так терялись backspace'ы.
     private static INPUT VkInput(uint vk, bool up)
     {
         ushort scan = (ushort)MapVirtualKey(vk, 0 /*MAPVK_VK_TO_VSC*/);
@@ -459,7 +552,7 @@ public sealed class TextReplacer : IDisposable
     // Объединение ОБЯЗАНО включать MOUSEINPUT: он самый большой (32 байта),
     // и именно по нему Windows считает размер INPUT (40 на x64). С одним
     // KEYBDINPUT размер выходит 32, SendInput видит неверный cbSize и молча
-    // отбрасывает весь пакет — replacement не печатался именно из-за этого.
+    // отбрасывает весь пакет.
     [StructLayout(LayoutKind.Explicit)]
     private struct InputUnion
     {
@@ -495,4 +588,6 @@ public sealed class TextReplacer : IDisposable
     [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint idThread);
     [DllImport("user32.dll")] private static extern int GetKeyboardLayoutList(int nBuff, [Out] IntPtr[] lpList);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
 }

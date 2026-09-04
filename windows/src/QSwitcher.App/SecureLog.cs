@@ -29,7 +29,14 @@ public sealed class SecureLog : IDisposable
     private readonly Action<string> _log;
     private byte[]? _key;
 
-    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _queue = new();
+    /// Строка + поколение фокуса на момент набора (см. ForegroundTracker).
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(string line, int gen, int tries)> _queue = new();
+
+    /// Поколение фокуса сейчас (по событиям). Не задано — старый синхронный детект.
+    public Func<int>? FocusGeneration { get; set; }
+
+    /// Поле пароля для поколения: true/false, null — ещё не решено.
+    public Func<int, bool?>? PasswordAt { get; set; }
     private readonly System.Threading.Timer _flushTimer;
 
     public bool Enabled { get; set; } = true;
@@ -79,8 +86,26 @@ public sealed class SecureLog : IDisposable
     public void Append(string text)
     {
         if (!Enabled || text.Length == 0) return;
-        if (!LogPasswords && IsPasswordFieldFocused()) return;
-        _queue.Enqueue($"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\t{text}");
+        int gen = -1;
+        if (!LogPasswords)
+        {
+            if (FocusGeneration is { } fg) gen = fg();
+            else if (IsPasswordFieldFocused()) return;   // без трекера — как раньше
+        }
+        _queue.Enqueue(($"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\t{text}", gen, 0));
+    }
+
+    /// Решить, писать ли запись: поле пароля определяется трекером по
+    /// событиям, в момент набора ответ мог быть ещё не готов — тогда запись
+    /// откладывается до следующего сброса (не более нескольких раз).
+    private bool ShouldWrite((string line, int gen, int tries) rec, out bool retry)
+    {
+        retry = false;
+        if (LogPasswords || rec.gen < 0 || PasswordAt is null) return true;
+        var pwd = PasswordAt(rec.gen);
+        if (pwd is bool b) return !b;
+        if (rec.tries < 3) { retry = true; return false; }
+        return true;   // так и не решилось — как раньше при сбое детекта: пишем
     }
 
     private void Flush()
@@ -90,14 +115,21 @@ public sealed class SecureLog : IDisposable
         {
             var key = GetOrCreateKey();
             using var fs = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.Read);
-            while (_queue.TryDequeue(out var line))
+            var deferred = new List<(string line, int gen, int tries)>();
+            while (_queue.TryDequeue(out var rec))
             {
-                var record = EncryptRecord(key, line);
+                if (!ShouldWrite(rec, out bool retry))
+                {
+                    if (retry) deferred.Add((rec.line, rec.gen, rec.tries + 1));
+                    continue;
+                }
+                var record = EncryptRecord(key, rec.line);
                 // Длина записи впереди — чтобы читать файл последовательно
                 fs.Write(BitConverter.GetBytes(record.Length));
                 fs.Write(record);
             }
             fs.Flush();
+            foreach (var d in deferred) _queue.Enqueue(d);
             TrimIfNeeded();
         }
         catch (Exception ex) { _log($"[securelog] запись не удалась: {ex.Message}"); }

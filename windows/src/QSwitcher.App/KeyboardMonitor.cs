@@ -7,17 +7,46 @@ namespace QSwitcher.App;
 /// <summary>
 /// Низкоуровневый перехват клавиатуры (WH_KEYBOARD_LL) и буфер текущего слова.
 ///
-/// Уроки macOS-версии, применённые здесь с первого дня:
-/// 1. Обработчик хука — в общем конвейере ввода. НИКАКИХ долгих операций
-///    внутри: ни запросов к другим процессам, ни ожиданий, ни файловых
-///    операций. Иначе встаёт ввод во всей системе.
-/// 2. Замена текста (стирание + печать) — строго последовательно, в одном
-///    рабочем потоке. Параллельные замены перемешивают события.
-/// 3. Клик мыши сбрасывает буфер: курсор уехал, накопленное слово уже не там.
-/// 4. Смена раскладки сбрасывает недописанное слово — иначе склейка алфавитов.
+/// ДВИЖОК 4.0 — «хук как замок». Пока callback хука не вернулся, система не
+/// отдаёт никому следующие события ввода — они стоят в очереди за ним. Этим
+/// и пользуемся: решение о свапе принимается прямо в хуке (словари в памяти,
+/// микросекунды), клавиша-граница СЪЕДАЕТСЯ, а батч «backspace'ы + текст +
+/// граница» уходит одним SendInput до возврата из callback'а. Всё, что нажато
+/// после, физически стоит позади батча — вклиниться некуда. Ни пауз, ни
+/// гейта, ни флага «идёт замена»: гонка с собственным вводом устранена
+/// порядком очереди, а не таймингами.
+///
+/// Цена: из хука уходит всё, что ходит в чужой процесс или на диск. Имя
+/// процесса и поле пароля — из ForegroundTracker (по событиям), звук/лог/
+/// защищённый лог — через очереди, правила — отложенная запись.
+/// Сторож: если поток хука замирал (GC, стоп-мир), хук переустанавливается —
+/// Windows снимает медленные хуки молча и навсегда.
+///
+/// Прежний движок (очередь → рабочий поток → пауза → батч → гейт) оставлен
+/// целиком как откат: config.json "Engine": "legacy".
 /// </summary>
 public sealed class KeyboardMonitor : IDisposable
 {
+    /// Новый движок (замена из хука). false — legacy.
+    public bool EngineV4 { get; init; } = true;
+
+    /// Слежение за фокусом по событиям; ставится в потоке хука.
+    public ForegroundTracker? Foreground { get; init; }
+
+    /// Кольцевой журнал ввода (для починки по журналу).
+    public KeyJournal Journal { get; } = new();
+
+    /// Отпускание этой клавиши съесть: её нажатие ушло в батче (граница).
+    private uint _eatUpVk;
+
+    /// Поток хука — сюда шлём внешние команды (свап из трея).
+    private uint _hookThreadId;
+    private const uint WM_QS_MANUAL_SWAP = 0x8000 + 1;   // WM_APP+1
+    private const uint WM_QS_ACTION = 0x8000 + 2;        // WM_APP+2, wParam = HotkeyAction
+    private const uint WM_TIMER = 0x0113;
+    private nuint _watchdogTimerId;
+    private long _lastTimerTick;
+    private long _slowestCallbackMs;
     private const int WH_KEYBOARD_LL = 13;
     private const int WH_MOUSE_LL = 14;
     private const int WM_KEYDOWN = 0x0100;
@@ -92,59 +121,140 @@ public sealed class KeyboardMonitor : IDisposable
         _hookThread.SetApartmentState(ApartmentState.STA);
         _hookThread.Start();
 
-        _processor = new Thread(ProcessLoop) { IsBackground = true, Name = "QSwitcher.Keys" };
-        _processor.Start();
+        if (!EngineV4)
+        {
+            _processor = new Thread(ProcessLoop) { IsBackground = true, Name = "QSwitcher.Keys" };
+            _processor.Start();
+        }
 
         KeyMap.PrimeLayout();
     }
 
-    private void HookThreadLoop()
+    private IntPtr _hModule;
+
+    private bool InstallHooks()
     {
-        using var process = Process.GetCurrentProcess();
-        using var module = process.MainModule!;
-        var hModule = GetModuleHandle(module.ModuleName);
-        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, hModule, 0);
-        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hModule, 0);
+        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, _hModule, 0);
+        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, _hModule, 0);
         if (_keyboardHook == IntPtr.Zero)
         {
             _log($"❌ Хук не установился: {Marshal.GetLastWin32Error()}");
-            return;
+            return false;
         }
-        _log("Перехват клавиатуры активен (выделенный поток)");
+        return true;
+    }
+
+    private void RemoveHooks()
+    {
+        if (_keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(_keyboardHook);
+        if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
+        _keyboardHook = IntPtr.Zero;
+        _mouseHook = IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// Переустановить хук. Windows снимает LL-хук молча, если поток не
+    /// ответил за LowLevelHooksTimeout (300 мс); проверить «жив ли хук» API
+    /// не даёт. Поэтому при любом признаке замирания потока — переставляем:
+    /// снятие несуществующего хука безвредно, а живой просто перевешивается.
+    /// </summary>
+    private void Rehook(string why)
+    {
+        RemoveHooks();
+        bool ok = InstallHooks();
+        _log($"[hook] переустановлен ({why}){(ok ? "" : " — НЕУДАЧНО")}");
+    }
+
+    private void HookThreadLoop()
+    {
+        using (var process = Process.GetCurrentProcess())
+        using (var module = process.MainModule!)
+            _hModule = GetModuleHandle(module.ModuleName);
+        _hookThreadId = GetCurrentThreadId();
+
+        if (!InstallHooks()) return;
+        _log($"Перехват клавиатуры активен (выделенный поток, движок {(EngineV4 ? "v4" : "legacy")})");
+
+        // Слежение за фокусом живёт здесь же: OUTOFCONTEXT-события WinEvent
+        // приходят через цикл сообщений установившего потока.
+        try { Foreground?.Install(); }
+        catch (Exception ex) { _log($"[fg] трекер не поднялся: {ex.Message}"); }
+
+        // Сторож: секундный таймер. Если между двумя тиками прошло заметно
+        // больше секунды — поток замирал, хук мог быть снят системой.
+        // Таймер без окна: идентификатор выдаёт система (nIDEvent игнорируется)
+        _watchdogTimerId = SetTimer(IntPtr.Zero, 0, 1000, IntPtr.Zero);
+        _lastTimerTick = Environment.TickCount64;
 
         // Прокачка сообщений обязательна: низкоуровневый хук работает только
         // в потоке, который её ведёт. Ставить его откуда-то ещё бесполезно.
         while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
+            if (msg.message == WM_QS_MANUAL_SWAP)
+            {
+                try { ManualSwap(learn: msg.wParam != 0); }
+                catch (Exception ex) { _log($"[keys] ошибка: {ex.Message}"); }
+                continue;
+            }
+            if (msg.message == WM_QS_ACTION)
+            {
+                if (Trace) _log($"[trace] действие {(HotkeyAction)(uint)msg.wParam} (из очереди потока хука)");
+                try { DispatchNow((HotkeyAction)(uint)msg.wParam); }
+                catch (Exception ex) { _log($"[keys] ошибка: {ex.Message}"); }
+                continue;
+            }
+            if (msg.message == WM_TIMER && msg.hwnd == IntPtr.Zero && msg.wParam == _watchdogTimerId)
+            {
+                long now = Environment.TickCount64;
+                long gap = now - _lastTimerTick;
+                _lastTimerTick = now;
+                if (gap > 1350) Rehook($"поток замирал {gap - 1000} мс");
+                continue;
+            }
             TranslateMessage(ref msg);
             DispatchMessage(ref msg);
         }
     }
 
+    /// <summary>
+    /// Разбор одного события из хука. В v4 — синхронно, прямо в callback'е;
+    /// в legacy — через очередь рабочего потока. Возвращает true, если
+    /// нажатие надо СЪЕСТЬ (его роль выполнил батч).
+    /// </summary>
+    private bool Submit(PendingKey key)
+    {
+        if (EngineV4) return ProcessKey(key);
+        _pending.Add(key);
+        return false;
+    }
+
+    private bool ProcessKey(PendingKey key)
+    {
+        try
+        {
+            if (key.Vk is ManualSwapMarker or ManualLearnMarker)
+            {
+                ManualSwap(learn: key.Vk == ManualLearnMarker);
+                return false;
+            }
+            if (key.Text is not null)
+            {
+                // LEGACY: готовые символы довведённого шлюзом текста — сразу в буфер
+                foreach (char c in key.Text)
+                    _word.Add(new Keystroke(0, c.ToString()));
+                return false;
+            }
+            return HandleKeyDown(key.Vk, key.Shift, key.Caps, key.OtherLayout);
+        }
+        catch (Exception ex) { _log($"[keys] ошибка: {ex.Message}"); return false; }
+    }
+
     /// Разбор нажатий вне хука: тут можно и словари, и WinAPI, и лог.
+    /// LEGACY: разбор нажатий в отдельном потоке.
     private void ProcessLoop()
     {
         foreach (var key in _pending.GetConsumingEnumerable())
-        {
-            try
-            {
-                if (key.Vk == ManualSwapMarker)
-                {
-                    ManualSwap(learn: false);
-                    continue;
-                }
-                if (key.Text is not null)
-                {
-                    // Готовые символы довведённого шлюзом текста — сразу в буфер,
-                    // на границе слова они пойдут как есть, без перевода по vk.
-                    foreach (char c in key.Text)
-                        _word.Add(new Keystroke(0, c.ToString()));
-                    continue;
-                }
-                HandleKeyDown(key.Vk, key.Shift, key.Caps, key.OtherLayout);
-            }
-            catch (Exception ex) { _log($"[keys] ошибка: {ex.Message}"); }
-        }
+            ProcessKey(key);
     }
 
     private IntPtr KeyboardCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -153,19 +263,40 @@ public sealed class KeyboardMonitor : IDisposable
 
         var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
 
+        int msg = wParam.ToInt32();
+
         // Свои синтетические события пропускаем без обработки.
         if (info.dwExtraInfo == InjectedMarker)
+        {
+            if (Trace) _log($"[trace] inj {(msg is WM_KEYUP or WM_SYSKEYUP ? "up  " : "down")} vk=0x{info.vkCode:X2} scan=0x{info.scanCode:X2} flags=0x{info.flags:X2}");
             return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        }
+        if (Trace && (info.flags & 0x10) != 0)
+            _log($"[trace] чужой инжект {(msg is WM_KEYUP or WM_SYSKEYUP ? "up  " : "down")} vk=0x{info.vkCode:X2} extra=0x{(ulong)info.dwExtraInfo:X}");
 
-        int msg = wParam.ToInt32();
+        // v4: весь разбор здесь, синхронно. Меряем длительность — сторожу
+        // и для диагностики: медленный callback = риск снятия хука.
+        if (EngineV4)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            bool eat = HandleHookEventV4(msg, in info);
+            long ms = (Stopwatch.GetTimestamp() - t0) * 1000 / Stopwatch.Frequency;
+            if (ms > _slowestCallbackMs)
+            {
+                _slowestCallbackMs = ms;
+                if (ms >= 20) _log($"[hook] медленный callback: {ms} мс (vk=0x{info.vkCode:X2})");
+            }
+            if (ms >= 250) Rehook($"callback {ms} мс");
+            return eat ? (IntPtr)1 : CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        }
+
+        // ===== LEGACY ниже =====
 
         // Идёт замена — РЕАЛЬНЫЙ ввод в приложение не пропускаем: иначе он
         // вклинится между backspace и печатью замены, и backspace съест свежие
         // буквы (те самые «наслоения» при живой печати). Съедаем, откладываем,
         // довводим после завершения задания — в исходном порядке, через хук,
         // так что нажатия попадут и в буфер слова, и в приложение.
-        // Раньше здесь был простой pass-through — ввод летел прямо под backspace,
-        // а детектор его вдобавок не видел.
         if (_replacer.Injecting)
         {
             // Инжектированные события (LLKHF_INJECTED ставит сама система для
@@ -223,6 +354,51 @@ public sealed class KeyboardMonitor : IDisposable
         return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
     }
 
+    /// <summary>
+    /// v4: разбор события хука прямо в callback'е. Возвращает true — съесть.
+    /// Съедается только граница слова, чьё нажатие ушло в батче замены,
+    /// и её же отпускание.
+    /// </summary>
+    private bool HandleHookEventV4(int msg, in KBDLLHOOKSTRUCT info)
+    {
+        uint vk = info.vkCode;
+
+        if (msg is WM_KEYUP or WM_SYSKEYUP)
+        {
+            if (_eatUpVk != 0 && vk == _eatUpVk)
+            {
+                _eatUpVk = 0;
+                return true;
+            }
+            if (HotkeyDetector.IsTrackableModifier(vk))
+                Submit(new PendingKey(ModifierUpVk | vk, _shiftDown, _capsOn, false));
+            // Флаг сбрасываем ПОСЛЕ разбора: иначе отпускание Ctrl сразу за
+            // отпусканием Shift теряет признак.
+            if (vk is 0x10 or 0xA0 or 0xA1) _shiftDown = false;
+            return false;
+        }
+
+        if (msg is WM_KEYDOWN or WM_SYSKEYDOWN)
+        {
+            if (Passive) return false;
+
+            // Shift и Caps считаем САМИ по событиям: GetKeyboardState из потока
+            // хука возвращает состояние своей очереди, а не реальное.
+            if (vk is 0x10 or 0xA0 or 0xA1) { _shiftDown = true; }
+            if (vk == 0x14) { _capsOn = !_capsOn; }
+
+            bool isTrackable = HotkeyDetector.IsTrackableModifier(vk);
+            bool isNoise = !isTrackable &&
+                (vk is 0x10 or 0xA0 or 0xA1 or 0x11 or 0x12 or 0x14 or 0x5B or 0x5C);
+            if (isNoise) return false;
+
+            bool eat = Submit(new PendingKey(vk, _shiftDown, _capsOn, false));
+            if (eat) _eatUpVk = vk;
+            return eat;
+        }
+        return false;
+    }
+
     private IntPtr MouseCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode >= 0)
@@ -231,8 +407,8 @@ public sealed class KeyboardMonitor : IDisposable
             if (msg is WM_LBUTTONDOWN or WM_RBUTTONDOWN)
             {
                 // Клик — курсор в другом месте, недописанное слово уже не рядом.
-                // Через ту же очередь: буфер принадлежит рабочему потоку.
-                _pending.Add(new PendingKey(ResetMarkerVk, false, false, false));
+                // v4: мышиный хук в том же потоке, разбираем сразу; legacy — очередь.
+                Submit(new PendingKey(ResetMarkerVk, false, false, false));
             }
         }
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -256,10 +432,20 @@ public sealed class KeyboardMonitor : IDisposable
 
     /// Свап последнего слова из меню трея. Через очередь — ManualSwap
     /// работает с состоянием processing-потока, из UI его звать нельзя.
-    public void RequestManualSwap() =>
-        _pending.Add(new PendingKey(ManualSwapMarker, false, false, false));
+    public void RequestManualSwap() => RequestManual(learn: false);
+
+    private void RequestManualLearnSwap() => RequestManual(learn: true);
+
+    private void RequestManual(bool learn)
+    {
+        if (EngineV4 && _hookThreadId != 0)
+            PostThreadMessage(_hookThreadId, WM_QS_MANUAL_SWAP, (UIntPtr)(learn ? 1u : 0u), IntPtr.Zero);
+        else
+            _pending.Add(new PendingKey(learn ? ManualLearnMarker : ManualSwapMarker, false, false, false));
+    }
 
     private const uint ManualSwapMarker = 0xFFFF_FFFE;
+    private const uint ManualLearnMarker = 0xFFFF_FFFD;
 
     /// Цифровой префикс, набранный вплотную перед текущим словом ('10' перед
     /// 'ю0ю0ю1' в IP). Ручной свап конвертирует его вместе со словом — как
@@ -278,7 +464,9 @@ public sealed class KeyboardMonitor : IDisposable
     /// Маркер «модификатор отпущен» в старших битах кода клавиши.
     private const uint ModifierUpVk = 0xFF00_0000;
 
-    private void HandleKeyDown(uint vk, bool shift, bool caps, bool _unusedLayout)
+    /// Разбор нажатия. Возвращает true, если нажатие надо съесть (v4: граница
+    /// слова ушла в батче замены).
+    private bool HandleKeyDown(uint vk, bool shift, bool caps, bool _unusedLayout)
     {
         if (this.Trace)
         {
@@ -292,7 +480,7 @@ public sealed class KeyboardMonitor : IDisposable
             var tap = Hotkeys?.ModifierUp(real, shift);
             if (this.Trace) _log($"[trace] отпущен модификатор 0x{real:X2} shift={shift} → тап: {tap?.ToString() ?? "нет"}");
             if (tap is not null) Dispatch(tap.Value);
-            return;
+            return false;
         }
 
         if (vk == ResetMarkerVk)
@@ -300,7 +488,8 @@ public sealed class KeyboardMonitor : IDisposable
             if (_word.Count > 0) _word.Clear();
             _droppedPrefix = "";
             InvalidateHistory("клик мышью");
-            return;
+            Journal.Add(KeyJournal.Kind.Reset);
+            return false;
         }
 
         // Модификаторы: следим за тапами, в буфер не идут
@@ -308,7 +497,7 @@ public sealed class KeyboardMonitor : IDisposable
         {
             Hotkeys?.ModifierDown(vk, shift);
             if (this.Trace) _log($"[trace] нажат модификатор 0x{vk:X2} shift={shift}");
-            return;
+            return false;
         }
 
         // Обычная клавиша — тап отменяется, но может быть сочетанием
@@ -317,7 +506,7 @@ public sealed class KeyboardMonitor : IDisposable
         if (combo is not null)
         {
             Dispatch(combo.Value);
-            return;
+            return false;
         }
 
         // Навигация и редактирование сбрасывают слово
@@ -330,12 +519,14 @@ public sealed class KeyboardMonitor : IDisposable
                 _word.Clear();
                 _droppedPrefix = "";
                 InvalidateHistory("навигация");
-                return;
+                Journal.Add(KeyJournal.Kind.Reset, vk);
+                return false;
             case 0x08: // Backspace — убираем последний символ из буфера
                 if (_word.Count > 0) _word.RemoveAt(_word.Count - 1);
                 else if (_droppedPrefix.Length > 0)
                     _droppedPrefix = _droppedPrefix[..^1];
-                return;
+                Journal.Add(KeyJournal.Kind.Backspace, vk);
+                return false;
         }
 
         // Границы слова проверяем ДО перевода: пробела, Enter и Tab нет в нашей
@@ -343,9 +534,9 @@ public sealed class KeyboardMonitor : IDisposable
         // не завершив слово — буфер копился бесконечно, замена не срабатывала.
         switch (vk)
         {
-            case 0x20: OnWordBoundary(new Keystroke(vk, " "));  return;
-            case 0x0D: OnWordBoundary(new Keystroke(vk, "\r")); return;
-            case 0x09: OnWordBoundary(new Keystroke(vk, "\t")); return;
+            case 0x20: return OnWordBoundary(new Keystroke(vk, " "));
+            case 0x0D: return OnWordBoundary(new Keystroke(vk, "\r"));
+            case 0x09: return OnWordBoundary(new Keystroke(vk, "\t"));
         }
 
         // Цифры: внутри слова ('ю0ю0ю1' в IP-адресе) — часть слова, кладём
@@ -363,7 +554,8 @@ public sealed class KeyboardMonitor : IDisposable
                 _word.Add(new Keystroke(vk, digit.ToString(), shift, caps));
             else if (_droppedPrefix.Length < PrefixCap)
                 _droppedPrefix += digit;
-            return;
+            Journal.Add(KeyJournal.Kind.Key, vk, shift, caps);
+            return false;
         }
         if (vk is >= 0x30 and <= 0x39)
         {
@@ -374,7 +566,8 @@ public sealed class KeyboardMonitor : IDisposable
             bool lettersInWord = _word.Any(k => k.Chars.Length == 0 || k.Chars.Any(char.IsLetter));
             if (lettersInWord) { _word.Clear(); _droppedPrefix = ""; }
             else _word.Add(new Keystroke(vk, "", shift, caps));
-            return;
+            Journal.Add(KeyJournal.Kind.Key, vk, shift, caps);
+            return false;
         }
 
         // Клавиша есть в нашей таблице — значит это часть слова.
@@ -383,13 +576,16 @@ public sealed class KeyboardMonitor : IDisposable
         if (KeyMap.IsWordKey(vk))
         {
             _word.Add(new Keystroke(vk, "", shift, caps));
-            return;
+            Journal.Add(KeyJournal.Kind.Key, vk, shift, caps);
+            return false;
         }
 
         // Всё остальное (знаки препинания вне таблицы, F-клавиши) — граница
         string punct = KeyMap.Translate(vk, false, shift, caps);
-        if (punct.Length > 0) OnWordBoundary(new Keystroke(vk, punct));
-        else { _word.Clear(); _droppedPrefix = ""; }
+        if (punct.Length > 0) return OnWordBoundary(new Keystroke(vk, punct));
+        _word.Clear(); _droppedPrefix = "";
+        Journal.Add(KeyJournal.Kind.Reset, vk);
+        return false;
     }
 
     private Lang? _lastWordLang;
@@ -434,19 +630,21 @@ public sealed class KeyboardMonitor : IDisposable
     /// Насколько долго слово считается «рядом с курсором».
     private static readonly TimeSpan HistoryTtl = TimeSpan.FromSeconds(8);
 
-    private void OnWordBoundary(Keystroke trigger)
+    /// Граница слова. Возвращает true, если клавишу-границу надо съесть:
+    /// в v4 она уходит в батче замены вместе с текстом.
+    private bool OnWordBoundary(Keystroke trigger)
     {
-        if (_word.Count == 0) return;
-        if (Paused) { _word.Clear(); _droppedPrefix = ""; return; }
+        if (_word.Count == 0) { Journal.Add(KeyJournal.Kind.Boundary, trigger.VirtualKey, text: trigger.Chars); return false; }
+        if (Paused) { _word.Clear(); _droppedPrefix = ""; return false; }
         if (Exclusions.IsExcluded())
         {
             _word.Clear();
             _droppedPrefix = "";
-            return;
+            return false;
         }
 
-        // Раскладку спрашиваем ОДИН РАЗ на слово, здесь, в рабочем потоке.
-        // Дёшево (одно слово вместо каждой буквы) и точно (без отставания кэша).
+        // Раскладку спрашиваем ОДИН РАЗ на слово. Это системный вызов
+        // (окно → поток → раскладка), не обращение к процессу окна.
         bool otherLayout = KeyMap.QueryOtherLayoutActive();
         string text = string.Concat(_word.Select(k =>
             k.Chars.Length > 0 ? k.Chars
@@ -457,7 +655,10 @@ public sealed class KeyboardMonitor : IDisposable
         // чтобы ручной свап задним числом конвертировал их вместе.
         _lastCompletedPrefix = _droppedPrefix;
         _droppedPrefix = "";
-        if (text.Length == 0) return;
+        if (text.Length == 0) return false;
+
+        Journal.Add(KeyJournal.Kind.Word, trigger.VirtualKey, text: text);
+        Journal.Add(KeyJournal.Kind.Boundary, trigger.VirtualKey, text: trigger.Chars);
 
         // Язык по содержимому — выбранной раскладке не доверяем, урок мака
         Lang current = text.Any(c => _pair.IsOtherLetter(c)) ? Lang.Other : Lang.Latin;
@@ -469,6 +670,11 @@ public sealed class KeyboardMonitor : IDisposable
         SecureLog?.Append(verdict.ShouldSwap && verdict.Replacement is not null
             ? $"{text} → {verdict.Replacement}"
             : text);
+
+        // Enter/Tab — конец строки/поля: то, что было слева, уже не «рядом
+        // с курсором» (в чате сообщение ушло). Ретро и ручной свап через
+        // перевод строки склеивали текст в мусор ('м↵…').
+        bool lineBreak = trigger.Chars is "\r" or "\t";
 
         if (verdict.ShouldSwap && verdict.Replacement is not null)
         {
@@ -490,28 +696,39 @@ public sealed class KeyboardMonitor : IDisposable
             if (!switchLayout)
                 _log($"[layout] раскладку не трогаем ({_consecutive}/{SwitchLayoutAfter} подряд)");
 
+            // v4: граница ещё НЕ дошла до приложения (мы её съедаем), стирать
+            // её не надо — батч напечатает её сам. legacy: граница уже
+            // прошла, стираем вместе со словом.
+            int triggerErase = EngineV4 ? 0 : trigger.Chars.Length;
+
+            ReplaceJob job;
             if (retro.Count > 0)
             {
                 // Стираем цепочку вместе с их разделителями и печатаем заново
                 int extra = retro.Sum(r => r.Text.Length + r.Trigger.Length);
                 string rebuilt = string.Concat(retro.Select(r => _pair.Swap(r.Text) + r.Trigger));
                 _log($"[retro] пересобираю {retro.Count} одиночных: '{rebuilt.Trim()}'");
-                _replacer.Enqueue(new ReplaceJob(
-                    EraseCount: extra + wordCopy.Count + trigger.Chars.Length,
+                job = new ReplaceJob(
+                    EraseCount: extra + wordCopy.Count + triggerErase,
                     Text: rebuilt + verdict.Replacement,
                     TriggerChar: trigger.Chars,
-                    SwitchLayout: switchLayout));
+                    SwitchLayout: switchLayout);
             }
             else
             {
-                _replacer.Enqueue(new ReplaceJob(
-                    EraseCount: wordCopy.Count + trigger.Chars.Length,
+                job = new ReplaceJob(
+                    EraseCount: wordCopy.Count + triggerErase,
                     Text: verdict.Replacement,
                     TriggerChar: trigger.Chars,
-                    SwitchLayout: switchLayout));
+                    SwitchLayout: switchLayout);
             }
+            Journal.Add(KeyJournal.Kind.Replaced, text: job.Text);
+            bool sentOk = _replacer.Submit(job);
 
             Sounds.Play(switchLayout ? SoundKind.ConvertAndSwitch : SoundKind.ConvertOnly);
+            if (lineBreak) InvalidateHistory("перевод строки");
+            // v4: батч ушёл — граница уже напечатана им, физическую съедаем
+            return EngineV4 && sentOk;
         }
         else
         {
@@ -520,20 +737,54 @@ public sealed class KeyboardMonitor : IDisposable
             PushHistory(text, trigger.Chars, wordCopy);
             _consecutive = 0;
             _lastTarget = null;
+            if (lineBreak) InvalidateHistory("перевод строки");
+            return false;
         }
     }
 
+    /// <summary>
     /// Выполнить действие горячей клавиши.
+    ///
+    /// v4: НЕ из callback'а. Тап срабатывает на отпускании модификатора, и
+    /// батч, отправленный прямо из callback'а этого отпускания, приходит в
+    /// приложение раньше, чем оно узнало, что Ctrl отпущен: Electron видел
+    /// Ctrl+Backspace (стирал слово целиком) и Ctrl+буквы (тоггл панели).
+    /// Поэтому действие откладывается сообщением в поток хука — оно
+    /// выполнится сразу ПОСЛЕ того, как отпускание ушло дальше по цепочке.
+    /// Автосвап это не касается: он идёт с пробела, модификаторов там нет.
+    /// </summary>
     private void Dispatch(HotkeyAction action)
+    {
+        if (EngineV4 && _hookThreadId != 0)
+        {
+            PostThreadMessage(_hookThreadId, WM_QS_ACTION, (UIntPtr)(uint)action, IntPtr.Zero);
+            return;
+        }
+        DispatchNow(action);
+    }
+
+    private void DispatchNow(HotkeyAction action)
     {
         switch (action)
         {
+            // По-Punto: есть выделение — свапается оно, нет — набранное/последнее.
+            // Проверка выделения (UIA) идёт в рабочем потоке реплейсера, а свап
+            // набранного возвращается сюда сообщением — хук не ждёт чужой процесс.
             case HotkeyAction.SwapWord:
-                ManualSwap(learn: false);
+                _replacer.EnqueueSelectionOrElse(_pair.Swap, RequestManualSwap);
                 break;
 
             case HotkeyAction.SwapAndLearn:
-                ManualSwap(learn: true);
+                _replacer.EnqueueSelectionOrElse(_pair.Swap, RequestManualLearnSwap, selected =>
+                {
+                    // Выделено одно слово — учим его (как Shift+тап по набранному)
+                    string w = selected.Trim();
+                    if (w.Length > 0 && !w.Any(char.IsWhiteSpace) && w.Any(char.IsLetter))
+                    {
+                        LearnForceConsistent(w, _pair.Swap(w));
+                        _log($"[learn] по выделению: '{w}' → переключать");
+                    }
+                });
                 break;
 
             case HotkeyAction.SwapSelection:
@@ -628,7 +879,7 @@ public sealed class KeyboardMonitor : IDisposable
                 LearnForceConsistent(bufText, _pair.Swap(bufText)); // учим слово (с буквами), не префикс
             _lastSwitch = new LastSwitch(full, swappedFull, "");
             _lastWordLang = LangOf(swappedFull);
-            _replacer.Enqueue(new ReplaceJob(
+            _replacer.Submit(new ReplaceJob(
                 EraseCount: full.Length,
                 Text: swappedFull,
                 TriggerChar: "",
@@ -651,7 +902,7 @@ public sealed class KeyboardMonitor : IDisposable
             if (learn) ApplyLearn(to);
 
             _lastWordLang = LangOf(to);
-            _replacer.Enqueue(new ReplaceJob(
+            _replacer.Submit(new ReplaceJob(
                 EraseCount: from.Length + last.TriggerChar.Length + tail.Length,
                 Text: to,
                 TriggerChar: last.TriggerChar,
@@ -693,7 +944,7 @@ public sealed class KeyboardMonitor : IDisposable
 
         _lastSwitch = new LastSwitch(fullText, swapped, triggerChar);
         _lastWordLang = LangOf(swapped);
-        _replacer.Enqueue(new ReplaceJob(
+        _replacer.Submit(new ReplaceJob(
             EraseCount: fullText.Length + triggerChar.Length + tail.Length,
             Text: swapped,
             TriggerChar: triggerChar,
@@ -732,6 +983,10 @@ public sealed class KeyboardMonitor : IDisposable
     private static readonly HashSet<string> RetroPrepositions = new()
     { "а", "и", "в", "к", "с", "о", "у", "я", "б", "ж" };
 
+    /// Одиночные буквы, являющиеся словами своего языка, — ретро их не трогает.
+    private static readonly HashSet<string> ValidSingles = new()
+    { "а", "и", "в", "к", "с", "о", "у", "я", "a", "i" };
+
     /// Цепочка одиночных букв перед текущим словом, набранных не в целевом
     /// языке. Раз следующее слово уверенно свапнулось — почти наверняка они
     /// набраны там же по ошибке.
@@ -748,6 +1003,13 @@ public sealed class KeyboardMonitor : IDisposable
             if (now - h.At > HistoryTtl) break;
             if (h.Text.Length != 1 || !char.IsLetter(h.Text[0])) break;
             if (h.Lang == target) break;
+            // Через перевод строки/таб не тянем: текст за ним уже не рядом
+            if (h.Trigger is "\r" or "\t") break;
+            // Одиночная буква, которая сама по себе валидное слово своего языка
+            // («и», «я», «в», английские a/i), набранная в СВОЕЙ раскладке —
+            // не ошибка раскладки, а слово. По логу: «х и ву» → «[ b du»,
+            // «я днс» → «z lyc» — ретро тащило за ложным свапом честные слова.
+            if (ValidSingles.Contains(h.Text.ToLowerInvariant())) break;
 
             if (RetroPrepositionsOnly)
             {
@@ -796,8 +1058,7 @@ public sealed class KeyboardMonitor : IDisposable
     public void Dispose()
     {
         _pending.CompleteAdding();
-        if (_keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(_keyboardHook);
-        if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
+        RemoveHooks();
     }
 
     // ==== P/Invoke ====
@@ -834,6 +1095,9 @@ public sealed class KeyboardMonitor : IDisposable
     }
 
     [DllImport("user32.dll")] private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint min, uint max);
+    [DllImport("user32.dll")] private static extern bool PostThreadMessage(uint idThread, uint msg, UIntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern nuint SetTimer(IntPtr hWnd, nuint nIDEvent, uint uElapse, IntPtr lpTimerFunc);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] private static extern bool TranslateMessage(ref MSG lpMsg);
     [DllImport("user32.dll")] private static extern IntPtr DispatchMessage(ref MSG lpMsg);
 

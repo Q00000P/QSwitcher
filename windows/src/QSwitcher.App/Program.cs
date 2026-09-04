@@ -21,6 +21,11 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         Directory.CreateDirectory(DataDir);
 
+        // Хук живёт в управляемом потоке: полная сборка мусора останавливает
+        // и его, а Windows снимает хук, не ответивший за 300 мс. Режим низкой
+        // задержки убирает блокирующие сборки gen2 в обычной работе.
+        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
+
         // Лог буферизованный: запись в файл на каждой строке тормозит разбор
         // нажатий, а он и так в горячем пути.
         var logger = new BufferedLogger(Path.Combine(DataDir, "qswitcher.log"));
@@ -28,9 +33,28 @@ internal static class Program
 
         var exe = Environment.ProcessPath ?? "?";
         var built = exe != "?" ? File.GetLastWriteTime(exe).ToString("yyyy-MM-dd HH:mm") : "?";
-        Log($"===== QSwitcher {AppVersion.Version} запущен (сборка {built}, {exe}) =====");
+        Log($"===== QSwitcher {AppVersion.Version} ({AppVersion.Build}) запущен (сборка {built}, {exe}) =====");
+
+        // Один экземпляр: новый запуск завершает старый. Иначе при обновлении
+        // руками поднимались две иконки с двумя хуками.
+        foreach (var other in System.Diagnostics.Process.GetProcessesByName("QSwitcher"))
+        {
+            if (other.Id == Environment.ProcessId) continue;
+            try
+            {
+                other.Kill();
+                other.WaitForExit(3000);
+                Log($"Завершён предыдущий экземпляр (pid {other.Id})");
+            }
+            catch (Exception ex) { Log($"⚠️ Не смог завершить предыдущий экземпляр pid {other.Id}: {ex.Message}"); }
+            finally { other.Dispose(); }
+        }
 
         var cfg = AppConfig.Load(DataDir, Log);
+        bool engineV4 = !string.Equals(cfg.Engine, "legacy", StringComparison.OrdinalIgnoreCase);
+        Log(engineV4
+            ? "Движок: v4 — замена из хука, без таймингов"
+            : "Движок: legacy — очередь/пауза/гейт (откат)");
         var pair = LayoutPair.RuEn();
 
         var dict = WordDictionary.Load(Res.Open, Log);
@@ -96,9 +120,10 @@ internal static class Program
         bool passive = Environment.GetEnvironmentVariable("QSWITCHER_PASSIVE") == "1";
         if (passive) Log("⚠️ ПАССИВНЫЙ РЕЖИМ: хук установлен, обработка отключена");
 
-        using var replacer = new TextReplacer(Log) { StartDelayMs = cfg.ReplaceStartDelayMs };
+        using var replacer = new TextReplacer(Log) { StartDelayMs = cfg.ReplaceStartDelayMs, V4 = engineV4 };
         bool trace = Environment.GetEnvironmentVariable("QSWITCHER_TRACE") == "1";
         if (trace) Log("🔎 ТРАССИРОВКА включена");
+        if (TextReplacer.NoLayoutSwitch) Log("🧪 QSWITCHER_NOSWITCH: раскладка после замены не переключается");
         var hotkeys = new HotkeyDetector(cfg.Hotkeys);
         var sounds = new SoundPlayerService(
             () => cfg.SoundEnabled,
@@ -107,8 +132,17 @@ internal static class Program
             () => cfg.SoundUndo);
         var exclusions = new AppExclusions(() => cfg.ExcludedProcesses);
 
+        // Фокус — по событиям: имя процесса для исключений и поле пароля для
+        // защищённого лога узнаются заранее, хук читает готовое.
+        using var foreground = new ForegroundTracker(Log);
+        exclusions.ProcessNameSource = () => foreground.ProcessName;
+        secureLog.FocusGeneration = () => foreground.Generation;
+        secureLog.PasswordAt = foreground.PasswordAt;
+
         using var monitor = new KeyboardMonitor(detector, pair, replacer, learned, Log)
         {
+            EngineV4 = engineV4,
+            Foreground = foreground,
             Passive = passive,
             Trace = trace,
             Hotkeys = hotkeys,
@@ -131,6 +165,7 @@ internal static class Program
 
         monitor.Start();
         Application.Run();
+        learned.Flush();
     }
 }
 
@@ -152,7 +187,7 @@ public sealed class BufferedLogger : IDisposable
 
     public void Write(string msg)
     {
-        _queue.Enqueue($"[{DateTime.Now:HH:mm:ss}] {msg}");
+        _queue.Enqueue($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {msg}");
         System.Diagnostics.Debug.WriteLine(msg);
     }
 
@@ -170,7 +205,9 @@ public sealed class BufferedLogger : IDisposable
 /// <summary>Версия приложения.</summary>
 public static class AppVersion
 {
-    public const string Version = "3.3";
+    public const string Version = "4.0";
+    /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
+    public const string Build = "wave2";
 }
 
 /// <summary>
@@ -187,6 +224,11 @@ public sealed class AppConfig
     };
     public int MinWordLength { get; set; } = 2;
 
+    /// Движок ввода: "v4" — замена из хука без таймингов (по умолчанию),
+    /// "legacy" — прежняя схема (очередь → пауза → батч → гейт). Откат на
+    /// случай регрессий; применяется после перезапуска.
+    public string Engine { get; set; } = "v4";
+
     /// <summary>Горячие клавиши. Переназначаются через меню трея.</summary>
     public HotkeyMap Hotkeys { get; set; } = new();
 
@@ -200,8 +242,8 @@ public sealed class AppConfig
         "putty", "mintty", "wt",
     };
 
-    /// Пауза перед стиранием при замене, миллисекунды.
-    /// Если текст иногда уезжает назад — увеличь до 40-60.
+    /// LEGACY-движок: пауза перед стиранием при замене, миллисекунды.
+    /// В v4 не используется — там таймингов нет.
     public int ReplaceStartDelayMs { get; set; } = 25;
 
     /// После скольких конвертаций подряд менять раскладку. 0 — никогда, 1 — сразу.
@@ -310,7 +352,7 @@ public sealed class AppConfig
         ForceWords.Clear(); ForceWords.UnionWith(fresh.ForceWords);
         StopWords.Clear(); StopWords.UnionWith(fresh.StopWords);
         ExcludedProcesses.Clear(); ExcludedProcesses.AddRange(fresh.ExcludedProcesses);
-        log("🔄 Конфиг перечитан (горячие клавиши — после перезапуска)");
+        log("🔄 Конфиг перечитан (горячие клавиши и движок — после перезапуска)");
     }
 
     public void Save()
@@ -562,7 +604,8 @@ public sealed class TrayUi : IDisposable
 
         var aboutItem = new ToolStripMenuItem("О программе…");
         aboutItem.Click += (_, _) => MessageBox.Show(
-            $"QSwitcher для Windows {AppVersion.Version}" + Environment.NewLine + Environment.NewLine +
+            $"QSwitcher для Windows {AppVersion.Version} ({AppVersion.Build})" + Environment.NewLine + Environment.NewLine +
+            $"Движок: {(string.Equals(cfg.Engine, "legacy", StringComparison.OrdinalIgnoreCase) ? "legacy" : "v4 (хук как замок)")}" + Environment.NewLine +
             $"Конфиг: {cfg.PathOnDisk}" + Environment.NewLine +
             "Автопереключение раскладки RU↔EN, самообучение, защищённый лог.",
             "QSwitcher");

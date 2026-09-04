@@ -181,7 +181,10 @@ public sealed class HotkeyDetector
     public HotkeyAction? ModifierUp(uint vk, bool shiftNow = false)
     {
         if (IsShift(vk)) return null;
-        if (_heldModifier != vk) { Reset(); return null; }
+        // Отпускание НЕ того модификатора, что удерживается (в т.ч. фантомный
+        // LCtrl-up, который Windows шлёт при смене раскладки) — не тап и не
+        // повод сбрасывать слежение за настоящим удержанием.
+        if (_heldModifier != vk) return null;
 
         var held = (DateTime.UtcNow - _heldSince).TotalMilliseconds;
         bool wasTap = !_contaminated && held <= TapMaxMs;
