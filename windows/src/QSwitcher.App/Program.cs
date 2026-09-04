@@ -122,6 +122,7 @@ internal static class Program
         using var tray = new TrayUi(cfg, learned, secureLog, pair, Log);
         tray.IsPaused = () => monitor.Paused;
         tray.TogglePause = monitor.TogglePause;
+        tray.StartUpdateChecks(cfg, Log);
         tray.SwapLastWord = monitor.RequestManualSwap;
         secureLog.Enabled = cfg.SecureLogEnabled;
         secureLog.LogPasswords = cfg.SecureLogPasswords;
@@ -220,6 +221,15 @@ public sealed class AppConfig
     /// Писать ли в защищённый лог набор в полях паролей (детект через UIA IsPassword).
     public bool SecureLogPasswords { get; set; } = true;
 
+    // === Обновления ===
+    /// Манифест на своём сервере. Домен, а не IP — чтобы пережить переезд;
+    /// порт нестандартный. Меняется в config.json без пересборки.
+    public string UpdateManifestUrl { get; set; } = "https://qsw.05.gs:8843/qswitcher/version-win.json";
+    public string UpdateRepo { get; set; } = "Q00000P/QSwitcher";
+    public string UpdateReleasesPage { get; set; } = "https://github.com/Q00000P/QSwitcher/releases";
+    /// Автопроверка при запуске и раз в сутки.
+    public bool UpdateCheckOnLaunch { get; set; } = true;
+
     /// Интервал сброса буфера защищённого лога на диск, сек.
     public int SecureLogFlushSec { get; set; } = 3;
 
@@ -287,6 +297,10 @@ public sealed class AppConfig
         RetroPrepositionsOnly = fresh.RetroPrepositionsOnly;
         SecureLogEnabled = fresh.SecureLogEnabled;
         SecureLogPasswords = fresh.SecureLogPasswords;
+        UpdateManifestUrl = fresh.UpdateManifestUrl;
+        UpdateRepo = fresh.UpdateRepo;
+        UpdateReleasesPage = fresh.UpdateReleasesPage;
+        UpdateCheckOnLaunch = fresh.UpdateCheckOnLaunch;
         SecureLogFlushSec = fresh.SecureLogFlushSec;
         SecureLogMaxMb = fresh.SecureLogMaxMb;
         SoundEnabled = fresh.SoundEnabled;
@@ -527,6 +541,24 @@ public sealed class TrayUi : IDisposable
             }
         };
         menu.Items.Add(resetLearnedItem);
+
+        var updateItem = new ToolStripMenuItem("Проверить обновления…");
+        updateItem.Click += async (_, _) =>
+        {
+            updateItem.Enabled = false;
+            updateItem.Text = "Проверяю обновления…";
+            var r = await UpdateChecker.CheckAsync(cfg, log);
+            updateItem.Text = "Проверить обновления…";
+            updateItem.Enabled = true;
+            if (r is null)
+            {
+                MessageBox.Show("Сервер обновлений и GitHub недоступны. Проверьте соединение.",
+                    "Не удалось проверить обновления", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            ShowUpdateResult(r, silentIfUpToDate: false);
+        };
+        menu.Items.Add(updateItem);
 
         var aboutItem = new ToolStripMenuItem("О программе…");
         aboutItem.Click += (_, _) => MessageBox.Show(
@@ -773,6 +805,83 @@ public sealed class TrayUi : IDisposable
         };
         form.ShowDialog();
         form.Dispose();
+    }
+
+    /// Показ результата проверки. Тихий режим молчит, если версия актуальна.
+    /// Автообновление — только при sha256 из манифеста (наш сервер); GitHub-
+    /// фолбэк хеша не даёт, там предлагаем страницу.
+    private async void ShowUpdateResult(UpdateChecker.Result r, bool silentIfUpToDate)
+    {
+        if (r.IsNewer)
+        {
+            if (r.Sha256.Length > 0)
+            {
+                var answer = MessageBox.Show(
+                    $"У вас {r.Current}. Источник: {r.Source}." + Environment.NewLine + Environment.NewLine +
+                    "Да — скачать, проверить и перезапуститься." + Environment.NewLine +
+                    "Нет — открыть страницу загрузки.",
+                    $"Доступна версия {r.Latest} — обновить сейчас?",
+                    MessageBoxButtons.YesNoCancel, MessageBoxIcon.Information);
+                if (answer == DialogResult.Yes)
+                {
+                    string? err = await UpdateInstaller.InstallAsync(r, _updateLog);
+                    if (err is null)
+                    {
+                        Application.Exit(); // новый exe уже запущен
+                        return;
+                    }
+                    MessageBox.Show(err + Environment.NewLine + Environment.NewLine +
+                        "Текущая версия продолжает работать.",
+                        "Обновление не установилось", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                else if (answer == DialogResult.No) OpenUrl(r.Url);
+            }
+            else
+            {
+                var answer = MessageBox.Show(
+                    $"У вас {r.Current}. Источник: {r.Source}." + Environment.NewLine + Environment.NewLine +
+                    "Открыть страницу загрузки?",
+                    $"Доступна версия {r.Latest}", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (answer == DialogResult.Yes) OpenUrl(r.Url);
+            }
+        }
+        else if (!silentIfUpToDate)
+        {
+            MessageBox.Show($"{r.Current}. Источник: {r.Source}.",
+                "Установлена последняя версия", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    private Action<string> _updateLog = _ => { };
+
+    private static void OpenUrl(string url)
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(
+                new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch { }
+    }
+
+    /// Фоновая проверка при запуске и раз в сутки.
+    public void StartUpdateChecks(AppConfig cfg, Action<string> log)
+    {
+        _updateLog = log;
+        UpdateInstaller.CleanupOldBinary(log);
+        if (!cfg.UpdateCheckOnLaunch) return;
+        async void CheckSilently()
+        {
+            var r = await UpdateChecker.CheckAsync(cfg, log);
+            if (r is not null && r.IsNewer) ShowUpdateResult(r, silentIfUpToDate: true);
+        }
+        // Задержка на старте, чтобы не мешать инициализации
+        var startupDelay = new System.Windows.Forms.Timer { Interval = 5000 };
+        startupDelay.Tick += (s, _) => { startupDelay.Stop(); CheckSilently(); };
+        startupDelay.Start();
+        var daily = new System.Windows.Forms.Timer { Interval = 24 * 60 * 60 * 1000 };
+        daily.Tick += (_, _) => CheckSilently();
+        daily.Start();
     }
 
     private void UpdateIndicator()
