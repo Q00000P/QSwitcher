@@ -51,6 +51,59 @@ final class Switcher {
     private let emitQueue = DispatchQueue(label: "local.QSwitcher.emit", qos: .userInitiated)
 
     private static let magic: Int64 = 0x4150_5357
+    /// Маркер «выполни отложенный inline-батч»: событие с этим userData шлём
+    /// себе через HID-поток, tap ловит его и отправляет батч tapPostEvent'ом
+    /// прямо из callback'а. Так ручные замены получают те же гарантии
+    /// порядка, что и автосвап, а CGEventPost для текста не используется.
+    private static let inlineMarker: Int64 = 0x4150_5358
+
+    private let inlineLock = NSLock()
+    private var inlineJobs: [(CGEventTapProxy) -> Void] = []
+
+    /// Поставить батч на inline-отправку из tap-callback'а. Вызывать из фона.
+    private func emitInline(_ job: @escaping (CGEventTapProxy) -> Void) {
+        inlineLock.lock(); inlineJobs.append(job); inlineLock.unlock()
+        let src = CGEventSource(stateID: .privateState)
+        // flagsChanged с текущими флагами: если tap вдруг не поймает, для
+        // приложений это пустое событие без последствий.
+        if let marker = CGEvent(source: src) {
+            marker.type = .flagsChanged
+            marker.flags = CGEventSource.flagsState(.combinedSessionState)
+            marker.setIntegerValueField(.eventSourceUserData, value: Switcher.inlineMarker)
+            marker.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Единая отправка ручной замены. v4 — inline через tap (после ожидания
+    /// отпускания модификаторов, в фоне); legacy — прежний emitQueue со шлюзом.
+    private func emitBatch(erase: Int, text: String, triggerKey: CGKeyCode = 0,
+                           tail: String = "", switchTo target: InputSource.Lang?,
+                           gate: Bool = true) {
+        if Config.shared.engineV4 {
+            emitQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.waitModifiersReleased()
+                self.emitInline { proxy in
+                    for _ in 0..<erase { self.postVirtualKeyInline(proxy, 51) }
+                    self.postTextInline(proxy, text)
+                    if triggerKey != 0 { self.postVirtualKeyInline(proxy, triggerKey) }
+                    if !tail.isEmpty { self.postUnicodeInline(proxy, tail) }
+                }
+                if let t = target { DispatchQueue.main.async { InputSource.switchTo(t) } }
+            }
+            return
+        }
+        if gate { beginGate() }
+        emitQueue.async { [weak self] in
+            guard let self = self else { return }
+            defer { if gate { self.endGate() } }
+            self.sendBackspaces(erase)
+            if let t = target { InputSource.switchTo(t) }
+            self.postText(text)
+            if triggerKey != 0 { self.postVirtualKey(triggerKey) }
+            if !tail.isEmpty { self.postUnicode(tail) }
+        }
+    }
 
     /// Краткая метка времени для логов (HH:mm:ss).
     static func ts() -> String {
@@ -124,7 +177,6 @@ final class Switcher {
     /// Запланировано ли отложенное восстановление буфера обмена.
     /// readSelection ждёт его завершения, иначе примет восстановленное
     /// содержимое за «скопированное выделение» и вставит чужой текст.
-    private var pendingClipboardRestore = false
 
     // === Input-gate ===
     /// Счётчик активных заданий замены. Пока > 0 — реальные keyDown пользователя
@@ -230,7 +282,7 @@ final class Switcher {
     /// рискует задержать системную очередь событий.
     private var tapSuspended = false
 
-    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    private func handle(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if tapSuspended { return Unmanaged.passUnretained(event) }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             // По таймауту переподнимаем ТОЛЬКО при живых правах.
@@ -248,6 +300,16 @@ final class Switcher {
                 DispatchQueue.main.async { [weak self] in self?.teardownTap(reason: why) }
             }
             return Unmanaged.passUnretained(event)
+        }
+
+        // Маркер отложенного батча — выполняем его здесь, изнутри callback'а
+        if event.getIntegerValueField(.eventSourceUserData) == Switcher.inlineMarker {
+            inlineLock.lock()
+            let jobs = inlineJobs
+            inlineJobs.removeAll()
+            inlineLock.unlock()
+            for job in jobs { job(proxy) }
+            return nil
         }
 
         // === flagsChanged: ловим одиночный тап Option ===
@@ -518,9 +580,23 @@ final class Switcher {
                     // В истории сохраняем уже свапнутую версию
                     let swapped = Detector.shared.swap(text)
                     appendToHistory(swapped)
-                    // Шлюз открываем СИНХРОННО здесь, а не внутри performSwitch:
-                    // между return nil и async-блоком следующее нажатие успевает
-                    // проскочить в приложение и попасть под backspace.
+
+                    // v4 — «tap как замок»: собираем и отправляем замену ПРЯМО
+                    // ЗДЕСЬ, не выходя из callback'а. Пока он не вернулся,
+                    // система не отдаёт никому следующие события ввода, а
+                    // tapPostEvent вставляет наши на позиции tap'а — значит всё,
+                    // что человек нажмёт дальше, физически стоит ПОЗАДИ батча.
+                    // Клавишу-границу съедаем: её печатает сам батч.
+                    // Ни пауз, ни шлюза, ни очереди — гонка невозможна.
+                    if Config.shared.engineV4 {
+                        performSwitchInline(proxy: proxy, replay: replay, trigger: trigger, fromLang: cur)
+                        return nil
+                    }
+
+                    // LEGACY: шлюз открываем СИНХРОННО здесь, а не внутри
+                    // performSwitch: между return nil и async-блоком следующее
+                    // нажатие успевает проскочить в приложение и попасть под
+                    // backspace.
                     beginGate()
                     DispatchQueue.main.async { [weak self] in
                         self?.performSwitch(replay: replay, trigger: trigger, fromLang: cur)
@@ -756,9 +832,9 @@ final class Switcher {
             (1 << CGEventType.leftMouseDown.rawValue) |
             (1 << CGEventType.rightMouseDown.rawValue)
         let userInfo = Unmanaged.passUnretained(self).toOpaque()
-        let cb: CGEventTapCallBack = { _, type, event, ctx in
+        let cb: CGEventTapCallBack = { proxy, type, event, ctx in
             let me = Unmanaged<Switcher>.fromOpaque(ctx!).takeUnretainedValue()
-            return me.handle(type: type, event: event)
+            return me.handle(proxy: proxy, type: type, event: event)
         }
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -989,18 +1065,9 @@ final class Switcher {
         // стираем вместе со словом и возвращаем на место после триггера.
         let toDelete = original.count + triggerCount + tail.count
 
-        beginGate()
-        emitQueue.async { [weak self] in
-            guard let self = self else { return }
-            defer { self.endGate() }
-            self.sendBackspaces(toDelete)
-            InputSource.switchTo(target)
-            self.postUnicode(translated)
-            // Триггер возвращаем ЗДЕСЬ и только здесь. Раньше он отправлялся
-            // дважды — второй раз снаружи async-блока — и плодил лишние пробелы.
-            if triggerCount > 0 { self.postVirtualKey(last.triggerKeyCode) }
-            if !tail.isEmpty { self.postUnicode(tail) }
-        }
+        emitBatch(erase: toDelete, text: translated,
+                  triggerKey: triggerCount > 0 ? last.triggerKeyCode : 0,
+                  tail: tail, switchTo: target)
 
         // Сохраняем как тоггл-состояние, чтобы Option повторно можно было откатить назад
         lastSwitch = LastSwitch(
@@ -1092,6 +1159,74 @@ final class Switcher {
         return chain.reversed()  // от старого к новому
     }
 
+    /// v4: автозамена ЦЕЛИКОМ внутри tap-callback.
+    ///
+    /// Отличия от legacy-варианта ниже: события идут через tapPostEvent на
+    /// позиции tap'а (а не CGEventPost в общий поток), клавиша-границы не
+    /// стирается, а печатается батчем, пауз и шлюза нет вовсе.
+    private func performSwitchInline(proxy: CGEventTapProxy, replay: [Keystroke],
+                                     trigger: Keystroke, fromLang: InputSource.Lang) {
+        let original = replay.map { $0.chars }.joined()
+        let translated: String = Detector.shared.swap(original)
+        let target: InputSource.Lang = Switcher.langOf(translated)
+            ?? ((fromLang == .ru) ? .en : .ru)
+
+        if lastConversionTarget == target {
+            consecutiveConversions += 1
+        } else {
+            lastConversionTarget = target
+            consecutiveConversions = 1
+        }
+        let threshold = Config.shared.switchLayoutAfter
+        let shouldSwitchLayout = threshold > 0 && consecutiveConversions >= threshold
+        if !shouldSwitchLayout {
+            print("[layout] раскладку не трогаем (\(consecutiveConversions)/\(threshold) подряд)")
+        }
+
+        let retro = retroactiveChain(targetLang: target)
+        var eraseCount = original.count
+        var textToType = translated
+        if !retro.isEmpty {
+            eraseCount += retro.count * 2
+            textToType = retro.map { $0.swapped }.joined(separator: " ") + " " + translated
+            print("[retro] цепочка: \(retro.map { "\($0.original)→\($0.swapped)" }.joined(separator: ", "))")
+            for (offset, pair) in retro.enumerated() {
+                let idx = wordHistory.count - 2 - (retro.count - 1) + offset
+                if idx >= 0 && idx < wordHistory.count { wordHistory[idx] = pair.swapped }
+            }
+        }
+        print("[switch/v4] '\(original)' → '\(translated)'  (\(fromLang) → \(target))")
+
+        // Один батч: backspace'ы + текст + клавиша-границы.
+        for _ in 0..<eraseCount { postVirtualKeyInline(proxy, 51) }
+        postUnicodeInline(proxy, textToType)
+        let controlKeys: Set<CGKeyCode> = [49, 36, 48, 76]
+        if controlKeys.contains(trigger.keyCode) {
+            postVirtualKeyInline(proxy, trigger.keyCode)
+        } else if !trigger.chars.isEmpty {
+            postUnicodeInline(proxy, trigger.chars)
+        }
+
+        // Раскладка — ПОСЛЕ батча: текст печатается юникодом и от неё не зависит,
+        // а следующий набор человека должен пойти уже в новой. Смена раскладки —
+        // единственное, что здесь идёт мимо очереди событий, поэтому делаем её
+        // без ожиданий, на главном потоке.
+        if shouldSwitchLayout {
+            DispatchQueue.main.async { InputSource.switchTo(target) }
+        }
+
+        lastSwitch = LastSwitch(
+            originalChars: original,
+            convertedChars: translated,
+            triggerKeyCode: trigger.keyCode,
+            state: .converted,
+            wasAutomatic: true
+        )
+        lastCompletedWord = nil
+        playSound(shouldSwitchLayout ? .convertAndSwitch : .convertOnly)
+    }
+
+    /// LEGACY-путь автозамены (emitQueue + паузы + шлюз).
     private func performSwitch(replay: [Keystroke], trigger: Keystroke, fromLang: InputSource.Lang) {
         let original = replay.map { $0.chars }.joined()
         // Свап решает по содержимому — направление задавать не нужно
@@ -1224,15 +1359,7 @@ final class Switcher {
             ?? ((cur == .ru) ? .en : .ru)
         print("[manual] '\(original)' → '\(translated)'  (\(cur) → \(target))")
 
-        let deleteCount = original.count
-        beginGate()
-        emitQueue.async { [weak self] in
-            guard let self = self else { return }
-            defer { self.endGate() }
-            self.sendBackspaces(deleteCount)
-            InputSource.switchTo(target)
-            self.postUnicode(translated)
-        }
+        emitBatch(erase: original.count, text: translated, switchTo: target)
 
         lastSwitch = LastSwitch(
             originalChars: original,
@@ -1266,20 +1393,9 @@ final class Switcher {
         }
         last.timestamp = Date()
 
-        let deleteCount = currentText.count + triggerCount + tail.count
-        let triggerKey = last.triggerKeyCode
-        beginGate()
-        emitQueue.async { [weak self] in
-            guard let self = self else { return }
-            defer { self.endGate() }
-            self.sendBackspaces(deleteCount)
-            if let target = Switcher.langOf(targetText) {
-                InputSource.switchTo(target)
-            }
-            self.postUnicode(targetText)
-            if triggerKey != 0 { self.postVirtualKey(triggerKey) }
-            if !tail.isEmpty { self.postUnicode(tail) }
-        }
+        emitBatch(erase: currentText.count + triggerCount + tail.count, text: targetText,
+                  triggerKey: last.triggerKeyCode, tail: tail,
+                  switchTo: Switcher.langOf(targetText))
 
         // Тоггл НЕ обучает.
         //
@@ -1368,16 +1484,9 @@ final class Switcher {
 
         var result: String? = nil
         if copied {
-            // Содержимое может дописываться (text/RTF/HTML по очереди) — ждём стабилизации
-            usleep(40_000)
-            var prev = pb.string(forType: .string)
-            for _ in 0..<10 {
-                usleep(30_000)
-                let cur = pb.string(forType: .string)
-                if cur == prev { break }
-                prev = cur
-            }
-            if let s = prev, !s.isEmpty {
+            // changeCount растёт один раз на транзакцию записи — все форматы
+            // (text/RTF/HTML) кладутся вместе, ждать «стабилизации» нечего.
+            if let s = pb.string(forType: .string), !s.isEmpty {
                 result = s
             }
         }
@@ -1394,60 +1503,32 @@ final class Switcher {
         return result
     }
 
+    /// Запись поверх выделения — НАБОРОМ, без ⌘V.
+    ///
+    /// Раньше: текст в буфер обмена → ⌘V → через секунду вернуть старый буфер.
+    /// Медленные приложения (Electron) обрабатывали ⌘V позже возврата и
+    /// вставляли старое содержимое — те самые «куски предыдущих текстов»; а
+    /// сам ⌘V под ещё удерживаемым Option превращался в ⌘⌥V и терялся.
+    /// Набор юникодом заменяет выделение в любом поле, буфер обмена не
+    /// участвует вообще: то, что сохранил readSelection, возвращается СРАЗУ.
+    /// Переводы строк и табы — клавишами, как юникод они дают не то.
+    /// Запись поверх выделения — НАБОРОМ, без ⌘V.
+    ///
+    /// Раньше: текст в буфер обмена → ⌘V → через секунду вернуть старый буфер.
+    /// Медленные приложения (Electron) обрабатывали ⌘V позже возврата и
+    /// вставляли старое содержимое — те самые «куски предыдущих текстов»; а
+    /// сам ⌘V под ещё удерживаемым Option превращался в ⌘⌥V и терялся.
+    /// Набор заменяет выделение в любом поле, буфер обмена не участвует:
+    /// то, что сохранил readSelection, возвращается СРАЗУ. Сама отправка —
+    /// через tap (emitBatch), как и все ручные замены.
     private func writeSelection(_ s: String) {
-        let pb = NSPasteboard.general
-        // Берём сохранённый буфер из readSelection (если он был), иначе текущий
-        let savedItems: [NSPasteboardItem]?
-        if let fromRead = lastSavedClipboard {
-            savedItems = fromRead
+        if let saved = lastSavedClipboard {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.writeObjects(saved)
             lastSavedClipboard = nil
-        } else {
-            savedItems = pb.pasteboardItems?.compactMap { item -> NSPasteboardItem? in
-                let copy = NSPasteboardItem()
-                for type in item.types {
-                    if let data = item.data(forType: type) { copy.setData(data, forType: type) }
-                }
-                return copy
-            }
         }
-
-        pb.clearContents()
-        pb.setString(s, forType: .string)
-        usleep(30_000)  // даём pasteboard-серверу применить новое содержимое
-
-        // Ждём отпускания модификаторов (как в readSelection) чтобы ⌘V не стал ⌘⌥V
-        for _ in 0..<30 {
-            let cur = CGEventSource.flagsState(.combinedSessionState)
-            let hasModifiers = cur.contains(.maskAlternate) || cur.contains(.maskCommand)
-                            || cur.contains(.maskControl) || cur.contains(.maskShift)
-            if !hasModifiers { break }
-            usleep(10_000)
-        }
-
-        // ⌘V
-        postVirtualKey(9 /* V */, flags: .maskCommand)
-
-        // Восстанавливаем буфер ПОЗЖЕ — медленные приложения (Electron, браузеры)
-        // обрабатывают вставку до 0.5-1 сек. Если восстановить сразу — вставится
-        // старое содержимое буфера («куски предыдущих текстов»).
-        //
-        // ГОНКА которую это порождало: отложенное восстановление возвращало старое
-        // содержимое в буфер, changeCount дёргался, и если в этот момент шло новое
-        // чтение выделения — оно принимало восстановленный буфер за «скопированное
-        // выделение» и вставляло чужой текст. Поэтому: помечаем что восстановление
-        // запланировано, и readSelection ждёт его завершения перед своим ⌘C.
-        pendingClipboardRestore = true
-        let snapshotChangeCount = pb.changeCount
-        // Восстановление — на той же последовательной очереди что и чтение,
-        // иначе запись флага и его проверка идут из разных потоков.
-        emitQueue.asyncAfter(deadline: .now() + 1.0) {
-            defer { self.pendingClipboardRestore = false }
-            // Восстанавливаем только если буфер всё ещё наш (пользователь не копировал сам)
-            if pb.changeCount == snapshotChangeCount, let saved = savedItems {
-                pb.clearContents()
-                pb.writeObjects(saved)
-            }
-        }
+        emitBatch(erase: 0, text: s, switchTo: nil, gate: false)
     }
 
     private func nextCaseCycle(_ s: String) -> String {
@@ -1534,8 +1615,107 @@ final class Switcher {
         }
     }
 
+    /// Отправка ВНУТРИ callback'а: событие вставляется на позицию tap'а, то
+    /// есть впереди всего, что человек нажмёт после. Так батч замены не может
+    /// перемешаться с реальным вводом — в отличие от CGEventPost, который
+    /// кладёт событие в общий поток и порядок не гарантирует.
+    private func postUnicodeInline(_ proxy: CGEventTapProxy, _ s: String) {
+        let utf16 = Array(s.utf16)
+        guard !utf16.isEmpty else { return }
+        let src = CGEventSource(stateID: .privateState)
+        var i = 0
+        while i < utf16.count {
+            var end = min(i + 16, utf16.count)
+            if end < utf16.count, (0xD800...0xDBFF).contains(utf16[end - 1]) { end += 1 }
+            let chunk = Array(utf16[i..<end])
+            if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {
+                down.flags = []
+                down.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+                down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                down.tapPostEvent(proxy)
+            }
+            if let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+                up.flags = []
+                up.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+                up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                up.tapPostEvent(proxy)
+            }
+            i = end
+        }
+    }
+
+    /// Текст с переводами строк/табами: печатные — юникодом, \n/\t — клавишами.
+    private func postTextInline(_ proxy: CGEventTapProxy, _ s: String) {
+        var run = ""
+        for c in s {
+            switch c {
+            case "\r\n", "\n", "\r":
+                if !run.isEmpty { postUnicodeInline(proxy, run); run = "" }
+                postVirtualKeyInline(proxy, 36)
+            case "\t":
+                if !run.isEmpty { postUnicodeInline(proxy, run); run = "" }
+                postVirtualKeyInline(proxy, 48)
+            default:
+                run.append(c)
+            }
+        }
+        if !run.isEmpty { postUnicodeInline(proxy, run) }
+    }
+
+    /// LEGACY-аналог postTextInline.
+    private func postText(_ s: String) {
+        var run = ""
+        for c in s {
+            switch c {
+            case "\r\n", "\n", "\r":
+                if !run.isEmpty { postUnicode(run); run = "" }
+                postVirtualKey(36)
+            case "\t":
+                if !run.isEmpty { postUnicode(run); run = "" }
+                postVirtualKey(48)
+            default:
+                run.append(c)
+            }
+        }
+        if !run.isEmpty { postUnicode(run) }
+    }
+
+    private func postVirtualKeyInline(_ proxy: CGEventTapProxy, _ keyCode: CGKeyCode) {
+        let src = CGEventSource(stateID: .privateState)
+        if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true) {
+            down.flags = []
+            down.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+            down.tapPostEvent(proxy)
+        }
+        if let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
+            up.flags = []
+            up.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+            up.tapPostEvent(proxy)
+        }
+    }
+
+    /// Клавиша, при необходимости с модификаторами. Сочетание шлётся КАК
+    /// ЧЕЛОВЕК: модификатор вниз (flagsChanged) → клавиша → модификатор вверх.
+    /// Раньше уходила только клавиша с флагом Command, и HID-состояние
+    /// оставалось с «зажатым» Cmd до следующего настоящего flagsChanged —
+    /// ожидание отпускания модификаторов упиралось в предохранитель, каждая
+    /// ручная замена запаздывала на 2 с (hid=0x20100000 в логе).
     private func postVirtualKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
         let src = CGEventSource(stateID: .privateState)
+        // (флаг, keyCode модификатора)
+        let modifiers: [(CGEventFlags, CGKeyCode)] = [
+            (.maskCommand, 55), (.maskShift, 56), (.maskAlternate, 58), (.maskControl, 59),
+        ]
+        let held = modifiers.filter { flags.contains($0.0) }
+        var acc: CGEventFlags = []
+        for (flag, kc) in held {
+            acc.insert(flag)
+            if let e = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: true) {
+                e.flags = acc
+                e.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+                e.post(tap: .cghidEventTap)
+            }
+        }
         if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true) {
             down.flags = flags
             down.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
@@ -1545,6 +1725,14 @@ final class Switcher {
             up.flags = flags
             up.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
             up.post(tap: .cghidEventTap)
+        }
+        for (flag, kc) in held.reversed() {
+            acc.remove(flag)
+            if let e = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: false) {
+                e.flags = acc
+                e.setIntegerValueField(.eventSourceUserData, value: Switcher.magic)
+                e.post(tap: .cghidEventTap)
+            }
         }
     }
 
@@ -1565,17 +1753,45 @@ final class Switcher {
         }
     }
 
+    /// Дождаться, пока модификаторы физически отпущены.
+    ///
+    /// Ручные команды приходят по ТАПУ модификатора, и если отправить батч,
+    /// пока Option/Cmd ещё удерживается, приложение прочтёт его как сочетание:
+    /// на винде Electron ловил Ctrl+Backspace и стирал слово целиком, дёргая
+    /// интерфейс. Это ожидание действия человека, а не пауза «на всякий
+    /// случай»: обычно выходит меньше миллисекунды. Предохранитель — 2 с.
+    private func waitModifiersReleased() {
+        // ТОЛЬКО физическая клавиатура (hidSystemState). В combinedSessionState
+        // попадают и наши собственные события: ⌘C, ушедший с флагом Command,
+        // держал там Command «нажатым», ожидание упиралось в предохранитель —
+        // и каждая ручная замена запаздывала на 2 секунды.
+        // Shift не ждём: он часть жеста «свапнуть и запомнить» и на набор
+        // юникодом не влияет.
+        let mods: CGEventFlags = [.maskAlternate, .maskCommand, .maskControl]
+        for i in 0..<400 {
+            let flags = CGEventSource.flagsState(.hidSystemState)
+            if flags.intersection(mods).isEmpty {
+                if i > 0 { print("[emit] модификаторы отпущены через \(i * 5) мс") }
+                return
+            }
+            usleep(5_000)
+        }
+        print("[emit] модификаторы всё ещё удерживаются (hid=\(CGEventSource.flagsState(.hidSystemState).rawValue)) — отправляю как есть")
+    }
+
     private func sendBackspaces(_ n: Int) {
         guard n > 0 else { return }
-        // Settle ПЕРЕД первым backspace остаётся: медленным системным полям
-        // нужно принять последний реальный символ (см. коммент выше про 'йq').
-        usleep(UInt32(Config.shared.replaceStartDelayMs) * 1000)
-        // Между backspace пауз нет: события идут одной системной очередью,
-        // приложение обработает их по порядку в своём темпе.
+        // v4: пауз нет вовсе. Этот путь остался только для ручных команд
+        // (тап Option, выделение) — там человек не печатает в этот момент,
+        // а автозамена идёт inline из callback'а.
+        if !Config.shared.engineV4 {
+            // LEGACY: settle перед первым backspace — медленным системным полям
+            // нужно принять последний реальный символ (см. коммент выше про 'йq').
+            usleep(UInt32(Config.shared.replaceStartDelayMs) * 1000)
+        }
         for _ in 0..<n {
             postVirtualKey(51)
         }
-        // Короткий settle перед печатью замены
-        usleep(20_000)
+        if !Config.shared.engineV4 { usleep(20_000) }
     }
 }

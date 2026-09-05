@@ -32,6 +32,12 @@ final class Config {
     /// попадает не туда. Замена должна идти вплотную к нажатию.
     private(set) var replaceStartDelayMs: Int = 0
 
+    /// Движок ввода: "v4" — замена изнутри tap-callback, без пауз и шлюза
+    /// (по умолчанию); "legacy" — прежняя схема (emitQueue + usleep + шлюз).
+    /// Откат на случай регрессий, применяется после перезапуска.
+    private(set) var engine: String = "v4"
+    var engineV4: Bool { engine.lowercased() != "legacy" }
+
     /// Пауза между отдельными нажатиями при стирании и печати, миллисекунды.
     private(set) var keyIntervalMs: Int = 3
 
@@ -144,6 +150,7 @@ final class Config {
             maxConsonantRunRu  = json["maxConsonantRunRu"]  as? Int ?? 5
             switchLayoutAfter  = json["switchLayoutAfter"]  as? Int ?? 2
             replaceStartDelayMs = json["replaceStartDelayMs"] as? Int ?? 0
+            engine              = json["engine"]              as? String ?? "v4"
             keyIntervalMs       = json["keyIntervalMs"]       as? Int ?? 3
             updateManifestURL   = json["updateManifestURL"]   as? String ?? updateManifestURL
             updateRepo          = json["updateRepo"]          as? String ?? updateRepo

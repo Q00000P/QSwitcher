@@ -8,7 +8,9 @@ cd "$(dirname "$0")"
 # Раньше она дублировалась в Version.swift и в Info.plist, причём в plist была
 # захардкожена и никогда не обновлялась: система показывала 0.3 независимо
 # от реальной версии, и то же самое попадало в отчёты о падениях.
-APP_VERSION="3.3"
+APP_VERSION="4.0"
+# Метка волны разработки — видна в логе запуска и в «О программе».
+APP_WAVE="wave4d"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then
@@ -30,9 +32,11 @@ enum AppVersion {
     static let version = "$APP_VERSION"
     static let build = BuildInfo.number
     static let buildDate = BuildInfo.date
+    /// Метка волны разработки (задаётся в make-app.sh).
+    static let wave = "$APP_WAVE"
 
     static var fullString: String {
-        return "QSwitcher \\(version) (билд \\(build))"
+        return "QSwitcher \\(version) (\\(wave), билд \\(build))"
     }
 }
 
