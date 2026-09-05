@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 # от реальной версии, и то же самое попадало в отчёты о падениях.
 APP_VERSION="4.0"
 # Метка волны разработки — видна в логе запуска и в «О программе».
-APP_WAVE="wave5"
+APP_WAVE="wave6"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then
@@ -48,6 +48,16 @@ enum BuildInfo {
 VEREOF
 
 echo "🔢 Билд #$BUILD_NUM ($BUILD_DATE)"
+
+# Веса сети-детектора: nn/qsnet.bin (обучается nn/train.py) → ресурсы бандла.
+# Нет весов — приложение работает на словарях, сборка не ломается.
+if [ -f "nn/qsnet.bin" ]; then
+    cp nn/qsnet.bin Sources/QSwitcher/Resources/qsnet.bin
+    [ -f "nn/qsnet-selftest.json" ] && cp nn/qsnet-selftest.json Sources/QSwitcher/Resources/qsnet-selftest.json
+    echo "🧠 Веса сети: nn/qsnet.bin ($(du -h nn/qsnet.bin | cut -f1))"
+else
+    echo "⚠️  nn/qsnet.bin нет — сеть будет выключена (python3 nn/train.py)"
+fi
 
 # Если словарей нет — скачиваем
 if [ ! -f "Sources/QSwitcher/Resources/ru.txt" ] || [ ! -f "Sources/QSwitcher/Resources/en.txt" ]; then
@@ -96,6 +106,7 @@ done
 # Прямое копирование данных (надёжнее всего)
 cp Sources/QSwitcher/Resources/*.txt  "$APP/Contents/Resources/" 2>/dev/null || true
 cp Sources/QSwitcher/Resources/*.json "$APP/Contents/Resources/" 2>/dev/null || true
+cp Sources/QSwitcher/Resources/*.bin  "$APP/Contents/Resources/" 2>/dev/null || true
 
 # Иконка (если собрана через ./make-icon.sh)
 if [ -f "icon/QSwitcher.icns" ]; then

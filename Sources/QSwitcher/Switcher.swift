@@ -558,7 +558,6 @@ final class Switcher {
                 if let actual = Switcher.langOf(text), actual != cur {
                     print("[\(Switcher.ts())] [!] система говорит \(cur), а набрано \(actual) — доверяем набранному")
                 }
-                let willSwitch = Detector.shouldSwitch(word: text, currentLang: cur, context: context)
                 // Владелец фокуса ввода, а не «активное приложение»: системные
                 // накладки frontmost не занимают и остаются невидимыми для него.
                 let focusApp = AXSelection.focusedAppBundleIDCached()
@@ -566,6 +565,11 @@ final class Switcher {
                 // систему: в обработчике тапа любой лишний запрос — риск задержать
                 // ввод во всей системе.
                 let frontApp = lastUserAppBundleId ?? "?"
+                // Сети — три последних слова как они на экране (ближайшее первым)
+                // и приложение, где идёт ввод.
+                let recentWords = Array(wordHistory.suffix(3).reversed())
+                let willSwitch = Detector.shouldSwitch(word: text, currentLang: cur, context: context,
+                                                       history: recentWords, app: focusApp ?? lastUserAppBundleId)
                 let appMark = (focusApp != nil && focusApp != frontApp)
                     ? "\(frontApp)/фокус:\(focusApp!)" : frontApp
                 print("[\(Switcher.ts())] [boundary] '\(text)' (\(cur), ctx=\(context.map { String(describing: $0) } ?? "nil"), app=\(appMark)) → \(willSwitch ? "SWITCH" : "keep")")

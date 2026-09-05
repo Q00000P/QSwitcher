@@ -1,0 +1,697 @@
+[
+{
+"keys": "ghbdtn",
+"ctx": [],
+"app": "other",
+"layout": "en",
+"p": 0.953665
+},
+{
+"keys": "hello",
+"ctx": [],
+"app": "other",
+"layout": "en",
+"p": 0.022048
+},
+{
+"keys": "lyc",
+"ctx": [
+[
+"rjyabut",
+"ru"
+],
+[
+"d",
+"ru"
+],
+[
+"ghjgbcfk",
+"ru"
+]
+],
+"app": "chat",
+"layout": "ru",
+"p": 0.963006
+},
+{
+"keys": "dns",
+"ctx": [
+[
+null,
+"en"
+],
+[
+"cat",
+"en"
+]
+],
+"app": "terminal",
+"layout": "en",
+"p": 0.014351
+},
+{
+"keys": "yt",
+"ctx": [
+[
+"'njuj",
+"ru"
+],
+[
+"z",
+"ru"
+]
+],
+"app": "chat",
+"layout": "en",
+"p": 0.981002
+},
+{
+"keys": "he",
+"ctx": [
+[
+"jy",
+"ru"
+],
+[
+"f",
+"ru"
+]
+],
+"app": "chat",
+"layout": "ru",
+"p": 0.021967
+},
+{
+"keys": "`;",
+"ctx": [],
+"app": "other",
+"layout": "ru",
+"p": 0.981709
+},
+{
+"keys": "'nj",
+"ctx": [
+[
+"b",
+"ru"
+]
+],
+"app": "browser",
+"layout": "ru",
+"p": 0.97999
+},
+{
+"keys": "[jhjij",
+"ctx": [],
+"app": "code",
+"layout": "en",
+"p": 0.978945
+},
+{
+"keys": "ntcn",
+"ctx": [
+[
+"the",
+"en"
+],
+[
+"run",
+"en"
+]
+],
+"app": "terminal",
+"layout": "en",
+"p": 0.847616
+},
+{
+"keys": "jzdegx",
+"ctx": [],
+"app": "chat",
+"layout": "ru",
+"p": 0.910352
+},
+{
+"keys": "f",
+"ctx": [
+[
+"f]dh",
+"ru"
+],
+[
+"z",
+"ru"
+],
+[
+"i",
+"en"
+]
+],
+"app": "browser",
+"layout": "ru",
+"p": 0.978749
+},
+{
+"keys": "htlgmxged",
+"ctx": [
+[
+"u''xtpl",
+"none"
+]
+],
+"app": "terminal",
+"layout": "ru",
+"p": 0.620775
+},
+{
+"keys": "t.v;seh`[k",
+"ctx": [
+[
+null,
+"en"
+],
+[
+"uv",
+"none"
+]
+],
+"app": "code",
+"layout": "en",
+"p": 0.276267
+},
+{
+"keys": "'efr,edt;s",
+"ctx": [
+[
+"b'wkh.",
+"ru"
+],
+[
+"ipzz.",
+"ru"
+],
+[
+null,
+"en"
+]
+],
+"app": "chat",
+"layout": "en",
+"p": 0.862877
+},
+{
+"keys": "]r[",
+"ctx": [
+[
+"ojfljoo",
+"ru"
+],
+[
+"qsa",
+"ru"
+]
+],
+"app": "browser",
+"layout": "en",
+"p": 0.974546
+},
+{
+"keys": "ui`d'zzzzg",
+"ctx": [
+[
+"m",
+"ru"
+],
+[
+"khvdgajg",
+"en"
+],
+[
+"ny",
+"ru"
+]
+],
+"app": "code",
+"layout": "en",
+"p": 0.616786
+},
+{
+"keys": "x,hh.',,tf",
+"ctx": [
+[
+null,
+"en"
+]
+],
+"app": "code",
+"layout": "en",
+"p": 0.85468
+},
+{
+"keys": "kbnxjbtfqxkw",
+"ctx": [
+[
+"ompzom",
+"none"
+]
+],
+"app": "browser",
+"layout": "en",
+"p": 0.936442
+},
+{
+"keys": "bbr,qmw;wxfo",
+"ctx": [],
+"app": "terminal",
+"layout": "en",
+"p": 0.3284
+},
+{
+"keys": "vn,a",
+"ctx": [
+[
+"fhym,l",
+"en"
+],
+[
+"fz'zfk",
+"ru"
+],
+[
+"j",
+"none"
+]
+],
+"app": "browser",
+"layout": "ru",
+"p": 0.950391
+},
+{
+"keys": ",wjibagi]m",
+"ctx": [
+[
+null,
+"ru"
+]
+],
+"app": "code",
+"layout": "ru",
+"p": 0.507375
+},
+{
+"keys": "uq[idw'[`i",
+"ctx": [
+[
+";",
+"ru"
+]
+],
+"app": "chat",
+"layout": "ru",
+"p": 0.946193
+},
+{
+"keys": "lj,",
+"ctx": [],
+"app": "chat",
+"layout": "ru",
+"p": 0.979882
+},
+{
+"keys": ",gdpmr",
+"ctx": [],
+"app": "other",
+"layout": "en",
+"p": 0.927727
+},
+{
+"keys": "be;u``mr;",
+"ctx": [
+[
+"qm;i",
+"en"
+],
+[
+null,
+"en"
+],
+[
+"]ent",
+"ru"
+]
+],
+"app": "terminal",
+"layout": "en",
+"p": 0.479567
+},
+{
+"keys": "qi'",
+"ctx": [
+[
+"z.",
+"ru"
+]
+],
+"app": "terminal",
+"layout": "ru",
+"p": 0.149557
+},
+{
+"keys": "]`zv[mwufxbv",
+"ctx": [
+[
+"y",
+"en"
+],
+[
+"`ehog",
+"ru"
+],
+[
+"l",
+"en"
+]
+],
+"app": "terminal",
+"layout": "en",
+"p": 0.826379
+},
+{
+"keys": "qzj`.ufrdl]",
+"ctx": [],
+"app": "code",
+"layout": "ru",
+"p": 0.949004
+},
+{
+"keys": "fqfoeqh'av[",
+"ctx": [
+[
+"p",
+"ru"
+],
+[
+"dlmtt",
+"none"
+]
+],
+"app": "terminal",
+"layout": "en",
+"p": 0.827056
+},
+{
+"keys": "`lrwbqca",
+"ctx": [],
+"app": "chat",
+"layout": "ru",
+"p": 0.923563
+},
+{
+"keys": ",p;g].z`t",
+"ctx": [
+[
+"mizwdi",
+"ru"
+]
+],
+"app": "other",
+"layout": "en",
+"p": 0.944055
+},
+{
+"keys": "kdfy`sp",
+"ctx": [
+[
+null,
+"ru"
+],
+[
+null,
+"en"
+]
+],
+"app": "other",
+"layout": "en",
+"p": 0.625549
+},
+{
+"keys": "vupctn",
+"ctx": [
+[
+null,
+"en"
+],
+[
+"r`mp`afq",
+"ru"
+]
+],
+"app": "terminal",
+"layout": "en",
+"p": 0.103276
+},
+{
+"keys": "czbttofjyu",
+"ctx": [
+[
+null,
+"none"
+],
+[
+"c`]",
+"none"
+],
+[
+"`bo",
+"ru"
+]
+],
+"app": "other",
+"layout": "ru",
+"p": 0.895283
+},
+{
+"keys": "xgy",
+"ctx": [
+[
+"p",
+"en"
+],
+[
+"e`fe,qeq",
+"ru"
+],
+[
+"o'.y",
+"ru"
+]
+],
+"app": "browser",
+"layout": "en",
+"p": 0.542545
+},
+{
+"keys": "m",
+"ctx": [],
+"app": "chat",
+"layout": "ru",
+"p": 0.023298
+},
+{
+"keys": "qtia,d",
+"ctx": [
+[
+"n.",
+"en"
+],
+[
+"'''hm",
+"en"
+],
+[
+"bs'e`;ry",
+"ru"
+]
+],
+"app": "terminal",
+"layout": "ru",
+"p": 0.288782
+},
+{
+"keys": "fjqxi`rhxo",
+"ctx": [
+[
+"zbka.;zt",
+"none"
+],
+[
+null,
+"en"
+],
+[
+"va",
+"en"
+]
+],
+"app": "code",
+"layout": "en",
+"p": 0.479105
+},
+{
+"keys": "ma",
+"ctx": [
+[
+"zy",
+"none"
+],
+[
+null,
+"en"
+]
+],
+"app": "code",
+"layout": "ru",
+"p": 0.026226
+},
+{
+"keys": "gdsjp",
+"ctx": [
+[
+"mx]bzn",
+"none"
+],
+[
+null,
+"none"
+]
+],
+"app": "browser",
+"layout": "en",
+"p": 0.861795
+},
+{
+"keys": "is.dik,[vs",
+"ctx": [
+[
+"zpt,z",
+"ru"
+],
+[
+null,
+"ru"
+]
+],
+"app": "other",
+"layout": "ru",
+"p": 0.708512
+},
+{
+"keys": ".o;v;]imp",
+"ctx": [],
+"app": "terminal",
+"layout": "en",
+"p": 0.244632
+},
+{
+"keys": "fupxqmb[y",
+"ctx": [
+[
+"yrvd",
+"en"
+],
+[
+"i`nfrp",
+"en"
+],
+[
+"]tbic],.",
+"ru"
+]
+],
+"app": "other",
+"layout": "en",
+"p": 0.261236
+},
+{
+"keys": "';pgojjg'",
+"ctx": [],
+"app": "chat",
+"layout": "ru",
+"p": 0.782349
+},
+{
+"keys": "i",
+"ctx": [
+[
+"t",
+"ru"
+]
+],
+"app": "code",
+"layout": "en",
+"p": 0.020357
+},
+{
+"keys": "hgetmyqoaat'",
+"ctx": [
+[
+",ppb",
+"en"
+],
+[
+"dbm.[",
+"ru"
+]
+],
+"app": "code",
+"layout": "ru",
+"p": 0.14089
+},
+{
+"keys": "]xo.cv[xzma",
+"ctx": [
+[
+"n.",
+"ru"
+],
+[
+"o'oq",
+"en"
+]
+],
+"app": "other",
+"layout": "en",
+"p": 0.354795
+},
+{
+"keys": "lo.[djzdnb",
+"ctx": [
+[
+"l",
+"en"
+]
+],
+"app": "browser",
+"layout": "en",
+"p": 0.508721
+},
+{
+"keys": "hfkvml'ctyxv",
+"ctx": [
+[
+null,
+"ru"
+],
+[
+null,
+"ru"
+],
+[
+"ny",
+"en"
+]
+],
+"app": "code",
+"layout": "en",
+"p": 0.857867
+}
+]

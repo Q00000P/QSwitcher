@@ -17,3 +17,9 @@ Sources/QSwitcher/Resources/en.txt
 # Восстановленный мусор
 recup_dir.*/
 QSwitcher-source.tar.gz
+
+# Корпуса для обучения сети — качаются prepare_data.py
+nn/data/
+# Копии весов в ресурсах — делаются скриптами сборки из nn/qsnet.bin
+Sources/QSwitcher/Resources/qsnet.bin
+Sources/QSwitcher/Resources/qsnet-selftest.json

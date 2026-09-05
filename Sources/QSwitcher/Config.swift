@@ -37,6 +37,36 @@ final class Config {
     /// Откат на случай регрессий, применяется после перезапуска.
     private(set) var engine: String = "v4"
 
+    // Сеть-детектор (nn/qsnet.bin). Меняются на лету через config.json.
+    /// Включена ли сеть вообще.
+    private(set) var nnEnabled: Bool = true
+    /// Уверенность (max(p, 1−p)), ниже которой сеть молчит и решают словари.
+    private(set) var nnThreshold: Double = 0.85
+    /// "primary" — сеть решает до словарей; "arbiter" — только когда словари промолчали.
+    private(set) var nnMode: String = "primary"
+    /// Слова короче — сети не показываем (одиночные буквы и пары — правила/щит).
+    private(set) var nnMinLen: Int = 3
+    /// Класс приложения по подстроке bundle id (без учёта регистра). Пользовательские
+    /// записи из config.json ("appClasses": {"terminal": ["qterm"], …}) дополняют встроенные.
+    private(set) var appClasses: [String: [String]] = [:]
+    private static let builtinAppClasses: [String: [String]] = [
+        "terminal": ["com.apple.terminal", "iterm", "qterm", "alacritty", "kitty", "hyper", "warp", "ghostty", "wezterm"],
+        "code":     ["vscode", "xcode", "jetbrains", "sublime", "cursor", "todesktop", "zed", "nova", "bbedit", "textmate"],
+        "browser":  ["safari", "chrome", "firefox", "arc", "brave", "edge", "opera", "yandex", "vivaldi", "orion"],
+        "chat":     ["telegram", "slack", "discord", "whatsapp", "claude", "mobilesms", "messages", "mail", "zoom",
+                     "skype", "teams", "viber", "signal", "max"],
+    ]
+
+    /// Класс приложения для сети: сначала пользовательские подстроки, потом встроенные.
+    func appClass(for bundleId: String?) -> LayoutNet.AppClass {
+        guard let id = bundleId?.lowercased(), !id.isEmpty else { return .other }
+        for cls in LayoutNet.AppClass.allCases where cls != .other {
+            let subs = (appClasses[cls.name] ?? []) + (Config.builtinAppClasses[cls.name] ?? [])
+            if subs.contains(where: { id.contains($0.lowercased()) }) { return cls }
+        }
+        return .other
+    }
+
     /// Горячие клавиши — назначаемые (меню → «Настроить горячие клавиши…»).
     let hotkeys = HotkeyMap()
 
@@ -158,6 +188,11 @@ final class Config {
             switchLayoutAfter  = json["switchLayoutAfter"]  as? Int ?? 2
             replaceStartDelayMs = json["replaceStartDelayMs"] as? Int ?? 0
             engine              = json["engine"]              as? String ?? "v4"
+            nnEnabled           = json["nnEnabled"]           as? Bool ?? true
+            nnThreshold         = json["nnThreshold"]         as? Double ?? 0.85
+            nnMode              = (json["nnMode"]             as? String ?? "primary").lowercased()
+            nnMinLen            = json["nnMinLen"]            as? Int ?? 3
+            appClasses          = (json["appClasses"]         as? [String: [String]]) ?? [:]
             hotkeys.load(json: json["hotkeys"] as? [String: Any])
             keyIntervalMs       = json["keyIntervalMs"]       as? Int ?? 3
             updateManifestURL   = json["updateManifestURL"]   as? String ?? updateManifestURL

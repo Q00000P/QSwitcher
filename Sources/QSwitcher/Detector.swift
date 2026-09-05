@@ -152,7 +152,8 @@ final class Detector {
     /// Решает: переключать или нет. Вызывается на границе слова.
     /// Возвращает true если надо вызвать swap() и заменить.
     static func shouldSwitch(word raw: String, currentLang: InputSource.Lang,
-                             context: InputSource.Lang? = nil) -> Bool {
+                             context: InputSource.Lang? = nil,
+                             history: [String] = [], app: String? = nil) -> Bool {
         let cfg = Config.shared
         let lower = raw.lowercased()
         let layoutPunct: Set<Character> = [";", "[", "]", "'", "`", "\\", ",", "."]
@@ -179,7 +180,7 @@ final class Detector {
 
         guard effectiveChars.count >= cfg.minWordLength else { return false }
 
-        return shared.autoConvert(raw, context: context) != nil
+        return shared.autoConvert(raw, context: context, history: history, app: app) != nil
     }
 
     /// Свап одиночной буквы-предлога с учётом контекста.
@@ -216,7 +217,8 @@ final class Detector {
     ///   4. Свап слова — валидное слово в другом языке → SWAP
     ///   5. Взвешенный score по плохим подстрокам → SWAP если перевешивает в 1.8 раз
     ///   6. Если контекст явно противоречит языку слова — SWAP
-    func autoConvert(_ word: String, context: InputSource.Lang? = nil) -> String? {
+    func autoConvert(_ word: String, context: InputSource.Lang? = nil,
+                     history: [String] = [], app: String? = nil) -> String? {
         let dict = Dictionary.shared
         let lower = word.lowercased()
 
@@ -252,6 +254,27 @@ final class Detector {
             let normIsCyr = normLow.allSatisfy { isCyrillicLetter($0) }
             if normIsLat || normIsCyr { return normalized }
             return nil
+        }
+
+        let len = lower.count
+
+        // (1а) Щит коротких слов: короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА,
+        // против контекста не свапаем. Почти любая пара букв — чьё-то короткое
+        // слово в другом языке ('ру' при ctx=ru свапалось в 'he', 'рф' → 'ha').
+        // Стоит ВЫШЕ сети намеренно: 'he' в корпусах частое, «ру» — нет, и
+        // сеть уверенно ошибётся ровно там, где мы уже обжигались.
+        // Направление 'yt'→'не' при ctx=ru не задето: цель свапа = контекст.
+        if len <= 3, let ctx = context, ctx == (isLatin ? .en : .ru) {
+            print("  [det] '\(lower)' короткое, набрано в языке контекста (\(ctx)) → keep")
+            return nil
+        }
+
+        // (1б) Сеть — основной режим: решает до словарей, если уверена.
+        // Не уверена — молчит, и дальше работают словарные правила как раньше.
+        let cfg = Config.shared
+        if cfg.nnMode != "arbiter",
+           let verdict = netVerdict(word, lower: lower, isLatin: isLatin, history: history, app: app) {
+            return verdict
         }
 
         // (2) Слово целиком валидно в текущем языке — не трогаем.
@@ -298,7 +321,6 @@ final class Detector {
         // - 3 буквы: требуем доп. подтверждения (защита от dmg → вьп):
         //   длина 4+, плохая n-грамма, или контекст
         // - 4+ букв: разрешаем
-        let len = lower.count
         let canSwap: Bool = {
             if len <= 2 { return true }
             if len >= 4 { return true }
@@ -311,16 +333,7 @@ final class Detector {
         }()
 
 
-        // (4а) Короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА, против контекста
-        // не свапаем. Почти любая пара букв — чьё-то короткое слово в другом
-        // языке, из-за этого 'ру' при ctx=ru свапалось в 'he', 'рф' → 'ha'.
-        // Пишущий по-русски человек, набравший 2-3 кириллические буквы, почти
-        // никогда не имел в виду EN-слово — и наоборот. Направление 'yt'→'не'
-        // при ctx=ru не задето: там цель свапа совпадает с контекстом.
-        if len <= 3, let ctx = context, ctx == (isLatin ? .en : .ru) {
-            print("  [det] '\(lower)' короткое, набрано в языке контекста (\(ctx)) → keep")
-            return nil
-        }
+        // (4а) щит коротких слов переехал выше сети — см. (1а)
 
         if isLatin && dict.ru.contains(candidateLower) {
             if canSwap {
@@ -343,8 +356,45 @@ final class Detector {
         // валидных слов которых нет в словаре (пишешь → gbitim). Удалено: либо слово
         // в словаре другого языка (правило 4) → SWAP, либо ничего.
 
+        // (6) Режим «арбитр»: сеть спрашиваем только когда словари промолчали.
+        if cfg.nnMode == "arbiter",
+           let verdict = netVerdict(word, lower: lower, isLatin: isLatin, history: history, app: app) {
+            return verdict
+        }
+
         print("  [det] '\(lower)' (свап='\(candidate)') не подошло ни одно правило → keep")
         return nil
+    }
+
+    // MARK: - Сеть
+
+    /// Вердикт сети: свапнутая строка (SWAP), "" (уверенный keep) или nil (не уверена /
+    /// выключена / слово не кодируется — решают словари). Порог и режим — из конфига.
+    /// В логе всегда видно P(ru), контекст и класс приложения — решения остаются объяснимыми.
+    private func netVerdict(_ word: String, lower: String, isLatin: Bool,
+                            history: [String], app: String?) -> String?? {
+        let cfg = Config.shared
+        guard cfg.nnEnabled, LayoutNet.shared.loaded else { return nil }
+        guard lower.count >= cfg.nnMinLen else { return nil }
+        guard let keys = LayoutNet.shared.keys(for: lower, ruToEn: ruToEn) else { return nil }
+        let ctx = history.prefix(3).map { LayoutNet.shared.ctxWord($0, ruToEn: ruToEn) }
+        let appClass = cfg.appClass(for: app)
+        let p = LayoutNet.shared.probabilityRu(keys: keys, ctx: Array(ctx), app: appClass, layoutRu: !isLatin)
+        let intendedRu = p >= 0.5
+        let conf = max(p, 1 - p)
+        let ctxStr = history.prefix(3).joined(separator: " ")
+        let tag = String(format: "P(ru)=%.3f", p)
+        guard conf >= Float(cfg.nnThreshold) else {
+            print("  [det] сеть \(tag) не уверена (порог \(cfg.nnThreshold), ctx='\(ctxStr)', \(appClass.name)) → словари")
+            return nil
+        }
+        if intendedRu == !isLatin {
+            print("  [det] сеть \(tag) (ctx='\(ctxStr)', \(appClass.name)) → keep")
+            return .some(nil)
+        }
+        let candidate = swap(word)
+        print("  [det] сеть \(tag) (ctx='\(ctxStr)', \(appClass.name)) → SWAP к '\(candidate)'")
+        return .some(candidate)
     }
 
     /// Сумма взвешенных совпадений плохих подстрок длины 3-6.
