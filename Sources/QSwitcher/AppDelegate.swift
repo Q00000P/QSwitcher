@@ -89,6 +89,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switcher.onLanguageChanged = { [weak self] lang in
             self?.updateStatusBar(trusted: true, lang: lang)
         }
+        // Пауза хоткеем — перерисовать индикатор и меню
+        switcher.onPauseToggled = { [weak self] in
+            guard let self = self else { return }
+            self.updateStatusBar(trusted: AXIsProcessTrusted(), lang: self.switcher?.currentLang ?? .en)
+            self.refreshDynamicMenuItems()
+        }
         switcher.start()
         updateStatusBar(trusted: true, lang: switcher.currentLang)
     }
@@ -187,6 +193,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                               action: #selector(showHelp), keyEquivalent: "?")
         help.target = self
         menu.addItem(help)
+
+        let hotkeys = NSMenuItem(title: "Настроить горячие клавиши…",
+                                 action: #selector(showHotkeySettings), keyEquivalent: "")
+        hotkeys.target = self
+        menu.addItem(hotkeys)
 
         let learned = NSMenuItem(title: "Выученные правила…", action: #selector(showLearned), keyEquivalent: "")
         learned.target = self
@@ -797,35 +808,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Окно назначения хоткеев (живёт, пока открыто).
+    private var hotkeyWindow: HotkeySettingsWindow?
+
+    @objc private func showHotkeySettings() {
+        if hotkeyWindow == nil {
+            hotkeyWindow = HotkeySettingsWindow(
+                map: Config.shared.hotkeys,
+                capture: { [weak self] done in self?.switcher?.captureNextHotkey(done) },
+                onChange: { Config.shared.saveHotkeys() })
+        }
+        hotkeyWindow?.show()
+    }
+
     @objc private func showHelp() {
+        let hk = Config.shared.hotkeys
+        func b(_ a: HotkeyAction) -> String { hk.binding(for: a).display }
         showScrollableText(title: "QSwitcher — горячие клавиши", body: """
         ━━━ ПЕРЕКЛЮЧЕНИЕ ━━━
 
-        ПРАВЫЙ Option — переключить набранное / тоггл
+        \(b(.swapWord)) — переключить набранное / тоггл
             Свапает последнее набранное слово (буфер).
             Если уже свапнул — тоггл туда-обратно.
-            Удобно: рука на клавиатуре, набрал — тапнул правый Option.
 
-        ЛЕВЫЙ Option — переключить ВЫДЕЛЕННЫЙ мышкой текст
-            Выделил мышью слово/фразу → тапнул левый Option → свапнулось.
+        \(b(.swapSelection)) — переключить ВЫДЕЛЕННЫЙ мышкой текст
             Работает с любым текстом, без проверки словарей.
 
-        ⇧ + ПРАВЫЙ Option — переключить И ЗАПОМНИТЬ
-            Свитчер запомнит решение для этого слова навсегда.
-            Без Shift короткие слова (2–3 буквы) запоминаются сами,
-            длинные — только по этой команде.
+        \(b(.swapAndLearn)) — переключить И ЗАПОМНИТЬ
+            Единственный способ создать правило.
 
-        ⌘⇧Space — универсально (выделение если есть, иначе буфер)
+        \(b(.universal)) — универсально (выделение если есть, иначе буфер)
 
-        Esc — отменить последнее автопереключение
+        \(b(.undoLast)) — отменить последнее автопереключение
             (10 секунд после переключения)
+
+        \(b(.togglePause)) — пауза свитчера
+
+        Всё это назначается: меню → «Настроить горячие клавиши…».
+        Тап — нажать и отпустить модификатор, ничего больше не задев.
 
         ━━━ РАБОТА С ВЫДЕЛЕННЫМ ТЕКСТОМ ━━━
 
-        ⌃⇧U — циклическая смена регистра выделенного:
+        \(b(.changeCase)) — циклическая смена регистра выделенного:
             привет → Привет → ПРИВЕТ → привет
 
-        ⌃⇧T — транслит выделенного: кириллица → латиница
+        \(b(.translit)) — транслит выделенного: кириллица → латиница
             привет → privet
             (ГОСТ 7.79-2000)
 

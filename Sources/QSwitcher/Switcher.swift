@@ -329,9 +329,13 @@ final class Switcher {
                 return Unmanaged.passUnretained(event)
             }
             let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-            // Принимаем оба Option (левый 58 и правый 61), но по умолчанию ждём правый
-            if keyCode == Switcher.rightOptionKey || keyCode == Switcher.leftOptionKey {
-                let isPressed = event.flags.contains(.maskAlternate)
+            let kc = Int(keyCode)
+            let isShiftKey = (keyCode == Switcher.leftShiftKey || keyCode == Switcher.rightShiftKey)
+            // Модификатор, по которому назначен тап (или ловим любой в режиме захвата)
+            let isTapKey = !isShiftKey && (captureHandler != nil || Config.shared.hotkeys.tapKeyCodes.contains(kc))
+
+            if isTapKey, let flag = HotkeyBinding.modifierFlag(for: kc) {
+                let isPressed = event.flags.contains(flag)
                 if isPressed {
                     // Нажали — стартуем трекинг
                     modifierPressTime = Date()
@@ -349,20 +353,18 @@ final class Switcher {
                         let sinceLast = Date().timeIntervalSince(lastManualSwitchTime)
                         if held < Switcher.modifierTapWindow && sinceLast > Switcher.debounceWindow {
                             lastManualSwitchTime = Date()
-                            let isLeft = (keyCode == Switcher.leftOptionKey)
-                            let side = isLeft ? "левый" : "правый"
-                            // Shift зажат в момент отпускания Option — явная команда
-                            // «переключи и запомни», работает на словах любой длины.
+                            // Shift зажат в любой момент удержания — «переключи и запомни».
                             let withShift = event.flags.contains(.maskShift) || shiftDuringHold
-                            let shiftMark = withShift ? " +Shift(обучение)" : ""
-                            print("[\(Switcher.ts())] [opt-tap] \(side) Option\(shiftMark) (held=\(String(format: "%.3f", held))s)")
-                            DispatchQueue.main.async { [weak self] in
-                                if isLeft {
-                                    // Левый Option — ТОЛЬКО свап выделения (мышкой)
-                                    self?.handleSelectionSwap()
-                                } else {
-                                    // Правый Option — свап набранного / тоггл
-                                    self?.handleBufferSwap(explicitLearn: withShift)
+                            let name = HotkeyBinding.keyName(kc)
+                            if let handler = captureHandler {
+                                // Режим назначения: тап пойман — отдаём привязку
+                                captureHandler = nil
+                                print("[hotkeys] пойман тап \(name)\(withShift ? " +⇧" : "")")
+                                handler(HotkeyBinding(keyCode: kc, isTap: true, shift: withShift))
+                            } else if let action = Config.shared.hotkeys.tapAction(keyCode: kc, withShift: withShift) {
+                                print("[\(Switcher.ts())] [tap] \(name)\(withShift ? " +⇧" : "") → \(action.rawValue) (held=\(String(format: "%.3f", held))s)")
+                                DispatchQueue.main.async { [weak self] in
+                                    self?.dispatch(action)
                                 }
                             }
                         }
@@ -372,7 +374,7 @@ final class Switcher {
                     trackedModifierKey = nil
                     shiftDuringHold = false
                 }
-            } else if keyCode == Switcher.leftShiftKey || keyCode == Switcher.rightShiftKey {
+            } else if isShiftKey {
                 // Shift — часть жеста «переключи и запомни», а не помеха.
                 // Запоминаем что он был, и НЕ помечаем нажатие загрязнённым:
                 // иначе отпускание Shift раньше Option гасило бы весь тап.
@@ -380,8 +382,7 @@ final class Switcher {
                     shiftDuringHold = true
                 }
             } else {
-                // Остальные модификаторы (Cmd, Ctrl, Fn) во время удержания Option
-                // означают что жмут другое сочетание — не наше дело.
+                // Другой модификатор во время удержания — это уже сочетание, не тап.
                 if modifierPressTime != nil {
                     modifierContaminated = true
                 }
@@ -421,65 +422,62 @@ final class Switcher {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
 
-        // === Esc для отмены последнего свитча (тоггл) ===
-        if keyCode == 53 /* Escape */ {
-            if let last = lastSwitch,
-               Date().timeIntervalSince(last.timestamp) < Switcher.undoWindow {
-                // Хвост (цифры нового набора) — до сброса буфера, иначе тоггл
-                // снесёт его стиранием, как в кейсе «гит 3»
-                let bufText = word.map { $0.chars }.joined()
-                let tail = bufText.contains(where: { $0.isLetter }) ? "" : droppedPrefix + bufText
-                // НЕ обнуляем lastSwitch — оставляем чтобы можно было ещё раз тоггнуть
+        // Режим назначения хоткея: ловим сочетание. Esc — отмена.
+        if let handler = captureHandler {
+            captureHandler = nil
+            if keyCode == 53 {
+                print("[hotkeys] захват отменён")
+                handler(nil)
+            } else {
+                let b = HotkeyBinding(keyCode: Int(keyCode),
+                                      shift: flags.contains(.maskShift),
+                                      command: flags.contains(.maskCommand),
+                                      control: flags.contains(.maskControl),
+                                      option: flags.contains(.maskAlternate))
+                print("[hotkeys] поймано сочетание \(b.display)")
+                handler(b)
+            }
+            return nil
+        }
+
+        // Сочетания по карте хоткеев (⌃⇧U, ⌃⇧T, ⌘⇧Space, Esc… — что назначено)
+        if let action = Config.shared.hotkeys.comboAction(keyCode: Int(keyCode), flags: flags) {
+            if action == .undoLast {
+                // Отмена работает только в окне после свитча, иначе клавиша
+                // идёт в приложение как обычно (Esc остаётся Esc)
+                if let last = lastSwitch,
+                   Date().timeIntervalSince(last.timestamp) < Switcher.undoWindow {
+                    let bufText = word.map { $0.chars }.joined()
+                    let tail = bufText.contains(where: { $0.isLetter }) ? "" : droppedPrefix + bufText
+                    word.removeAll()
+                    droppedPrefix = ""
+                    DispatchQueue.main.async { [weak self] in self?.toggleLastSwitch(last, tail: tail) }
+                    return nil
+                }
                 word.removeAll()
                 droppedPrefix = ""
-                DispatchQueue.main.async { [weak self] in self?.toggleLastSwitch(last, tail: tail) }
-                return nil
+                return Unmanaged.passUnretained(event)
             }
-            // Иначе пропускаем Esc как обычно
+            if (action == .universal || action == .swapWord || action == .swapAndLearn)
+                && (!Config.shared.enabled || isCurrentAppExcluded) {
+                word.removeAll()
+                droppedPrefix = ""
+                return Unmanaged.passUnretained(event)
+            }
+            DispatchQueue.main.async { [weak self] in self?.dispatch(action) }
+            return nil
+        }
+
+        if keyCode == 53 /* Escape */ {
             word.removeAll()
             droppedPrefix = ""
             return Unmanaged.passUnretained(event)
-        }
-
-        // === ⌃⇧U — смена регистра выделенного ===
-        if keyCode == 32 /* U */,
-           flags.contains(.maskControl),
-           flags.contains(.maskShift) {
-            DispatchQueue.main.async { [weak self] in self?.toggleSelectionCase() }
-            return nil
-        }
-
-        // === ⌃⇧T — транслит выделенного ===
-        if keyCode == 17 /* T */,
-           flags.contains(.maskControl),
-           flags.contains(.maskShift) {
-            DispatchQueue.main.async { [weak self] in self?.transliterateSelection() }
-            return nil
         }
 
         if !Config.shared.enabled || isCurrentAppExcluded {
             word.removeAll()
             droppedPrefix = ""
             return Unmanaged.passUnretained(event)
-        }
-
-        // ⌘⇧Space — универсальная альтернатива: сначала выделение, потом буфер
-        if keyCode == 49,
-           flags.contains(.maskCommand),
-           flags.contains(.maskShift) {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                if let sel = self.readSelection(restoreClipboard: false), !sel.isEmpty, sel.count <= 5000 {
-                    self.word.removeAll()
-                    self.droppedPrefix = ""
-                    self.lastSwitch = nil
-                    self.lastCompletedWord = nil
-                    self.swapSelectedText(sel)
-                } else {
-                    self.handleBufferSwap()
-                }
-            }
-            return nil
         }
 
         if flags.contains(.maskCommand) || flags.contains(.maskControl) {
@@ -980,6 +978,52 @@ final class Switcher {
         }
         print("[gate] доввод \(pending.count) задержанных нажатий"
             + (typed.isEmpty ? "" : ", юникодом: '\(typed)'"))
+    }
+
+    // MARK: - Hotkeys
+
+    /// Замыкание режима назначения хоткея: следующий тап/сочетание уходит сюда.
+    private var captureHandler: ((HotkeyBinding?) -> Void)?
+
+    /// Поймать следующее нажатие для формы настройки хоткеев.
+    func captureNextHotkey(_ handler: @escaping (HotkeyBinding?) -> Void) {
+        captureHandler = handler
+    }
+
+    /// Свитчер поставлен/снят с паузы хоткеем — UI перерисовать.
+    var onPauseToggled: (() -> Void)?
+
+    /// Выполнить действие горячей клавиши (на main).
+    private func dispatch(_ action: HotkeyAction) {
+        switch action {
+        case .swapWord:      handleBufferSwap(explicitLearn: false)
+        case .swapAndLearn:  handleBufferSwap(explicitLearn: true)
+        case .swapSelection: handleSelectionSwap()
+        case .changeCase:    toggleSelectionCase()
+        case .translit:      transliterateSelection()
+        case .togglePause:
+            Config.shared.setEnabled(!Config.shared.enabled)
+            print("[hotkeys] пауза: \(Config.shared.enabled ? "снята" : "включена")")
+            onPauseToggled?()
+        case .undoLast:
+            if let last = lastSwitch { toggleLastSwitch(last) }
+        case .universal:
+            // Сначала выделение, потом набранное. Чтение выделения — в фоне.
+            emitQueue.async { [weak self] in
+                guard let self = self else { return }
+                if let sel = self.readSelection(restoreClipboard: false), !sel.isEmpty, sel.count <= 5000 {
+                    DispatchQueue.main.async {
+                        self.word.removeAll()
+                        self.droppedPrefix = ""
+                        self.lastSwitch = nil
+                        self.lastCompletedWord = nil
+                    }
+                    self.swapSelectedTextSync(sel)
+                } else {
+                    DispatchQueue.main.async { self.handleBufferSwap() }
+                }
+            }
+        }
     }
 
     /// ПРАВЫЙ Option — свап набранного / тоггл. Не трогает выделение вообще

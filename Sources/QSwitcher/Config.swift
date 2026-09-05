@@ -36,6 +36,13 @@ final class Config {
     /// (по умолчанию); "legacy" — прежняя схема (emitQueue + usleep + шлюз).
     /// Откат на случай регрессий, применяется после перезапуска.
     private(set) var engine: String = "v4"
+
+    /// Горячие клавиши — назначаемые (меню → «Настроить горячие клавиши…»).
+    let hotkeys = HotkeyMap()
+
+    func saveHotkeys() {
+        patchOnDisk { $0["hotkeys"] = self.hotkeys.json }
+    }
     var engineV4: Bool { engine.lowercased() != "legacy" }
 
     /// Пауза между отдельными нажатиями при стирании и печати, миллисекунды.
@@ -151,6 +158,7 @@ final class Config {
             switchLayoutAfter  = json["switchLayoutAfter"]  as? Int ?? 2
             replaceStartDelayMs = json["replaceStartDelayMs"] as? Int ?? 0
             engine              = json["engine"]              as? String ?? "v4"
+            hotkeys.load(json: json["hotkeys"] as? [String: Any])
             keyIntervalMs       = json["keyIntervalMs"]       as? Int ?? 3
             updateManifestURL   = json["updateManifestURL"]   as? String ?? updateManifestURL
             updateRepo          = json["updateRepo"]          as? String ?? updateRepo
