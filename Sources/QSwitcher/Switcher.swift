@@ -753,7 +753,7 @@ final class Switcher {
             var swappedTo: String? = nil
             let original = AXSelection.swapSelection { text in
                 guard text.count <= 5000 else { return text }
-                let result = Detector.shared.hardSwap(text)
+                let result = self.selectionSwapText(text)
                 swappedTo = result
                 return result
             }
@@ -997,8 +997,37 @@ final class Switcher {
     /// Свитчер поставлен/снят с паузы хоткеем — UI перерисовать.
     var onPauseToggled: (() -> Void)?
 
+    /// Раскладка в момент ручного действия: свап выделения без букв (одни знаки)
+    /// направление берёт отсюда. Снимаем на main до ухода в фон — TIS из фона нельзя.
+    private var manualLang: InputSource.Lang = .en
+
+    /// Последний свап выделения — для обратимости. Из одного знака не узнать,
+    /// EN-клавиша это `.` или RU-клавиша `/`: `/` → `.` верно, но `.` → `ю` —
+    /// уже не назад. Если выделено ровно то, что мы только что выдали, возвращаем
+    /// исходник (как правый Option через lastSwitch). Живёт в emitQueue.
+    private var lastSelSwap: (from: String, to: String)?
+
+    private func selectionSwapText(_ text: String) -> String {
+        // Сравниваем по обрезанному: клипбордный fallback может отдать текст с
+        // хвостом (перевод строки, пробел) — хвост сохраняем, ядро меняем.
+        let core = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let last = lastSelSwap, !core.isEmpty,
+           last.to.trimmingCharacters(in: .whitespacesAndNewlines) == core {
+            let back = text.replacingOccurrences(of: core,
+                                                 with: last.from.trimmingCharacters(in: .whitespacesAndNewlines))
+            lastSelSwap = (text, back)
+            print("[manual-sel] обратно к исходнику: '\(text)' → '\(back)'")
+            return back
+        }
+        let result = Detector.shared.hardSwap(text, currentLang: manualLang)
+        lastSelSwap = (text, result)
+        print("[manual-sel] '\(text)' → '\(result)'")
+        return result
+    }
+
     /// Выполнить действие горячей клавиши (на main).
     private func dispatch(_ action: HotkeyAction) {
+        manualLang = InputSource.currentLanguage()
         switch action {
         case .swapWord:      handleBufferSwap(explicitLearn: false)
         case .swapAndLearn:  handleBufferSwap(explicitLearn: true)
@@ -1145,7 +1174,7 @@ final class Switcher {
 
     /// Свап выделенного. Вызывается из фонового потока (usleep для ⌘V не блокирует main).
     private func swapSelectedTextSync(_ text: String) {
-        let swapped = Detector.shared.hardSwap(text)
+        let swapped = self.selectionSwapText(text)
         guard swapped != text else {
             print("[manual-sel] свап равен оригиналу — нечего менять")
             return

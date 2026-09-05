@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 # от реальной версии, и то же самое попадало в отчёты о падениях.
 APP_VERSION="4.0"
 # Метка волны разработки — видна в логе запуска и в «О программе».
-APP_WAVE="wave6"
+APP_WAVE="wave13"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then

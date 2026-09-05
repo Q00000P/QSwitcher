@@ -66,7 +66,36 @@ enum LayoutResolver {
             }
         }
 
+        enShiftPairs = shiftPairs(enData, kbdType: kbdType)
+        ruShiftPairs = shiftPairs(ruData, kbdType: kbdType)
+
         return (enToRu, ruToEn)
+    }
+
+    // MARK: - Знак ↔ его Shift-вариант на той же клавише
+
+    private static var enShiftPairs: Map = [:]
+    private static var ruShiftPairs: Map = [:]
+
+    /// Для знака, одинакового в обеих раскладках (на маке `/` и в RU `/`), свап
+    /// выделения делает то же, что правый Option по кейкоду: та же клавиша с Shift
+    /// (`/` ↔ `?`). Только знак ↔ знак: буквы и цифры не трогаем. Считается один
+    /// раз в resolve() на main; читать можно из любого потока.
+    static func shiftPairs(for lang: InputSource.Lang) -> Map {
+        lang == .ru ? ruShiftPairs : enShiftPairs
+    }
+
+    private static func shiftPairs(_ data: Data, kbdType: UInt32) -> Map {
+        var pairs: Map = [:]
+        for kc in 0..<128 {
+            guard let u = translateChar(data, keycode: UInt16(kc), modifiers: 0, kbdType: kbdType)?.first,
+                  let sh = translateChar(data, keycode: UInt16(kc), modifiers: 2, kbdType: kbdType)?.first,
+                  u != sh, !u.isLetter, !sh.isLetter, !u.isNumber, !sh.isNumber,
+                  !u.isWhitespace, !sh.isWhitespace else { continue }
+            if pairs[u] == nil { pairs[u] = sh }
+            if pairs[sh] == nil { pairs[sh] = u }
+        }
+        return pairs
     }
 
     // MARK: - Перевод по конкретной раскладке

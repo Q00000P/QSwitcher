@@ -16,6 +16,9 @@ final class Detector {
     static let shared = Detector()
 
     private(set) var enToRu: [Character: Character] = [:]
+    /// Карта по реальной раскладке без слияния с JSON — для свапа выделения.
+    private var swapEnToRu: [Character: Character] = [:]
+    private var swapRuToEn: [Character: Character] = [:]
     private(set) var ruToEn: [Character: Character] = [:]
 
     /// Плохие подстроки длиной 3-6, появление которых в слове сигнализирует
@@ -39,10 +42,17 @@ final class Detector {
             print("📐 Раскладка: динамическая (en→ru: \(dynamic.enToRu.count), ru→en: \(dynamic.ruToEn.count))")
             self.enToRu = Detector.mergeMap(primary: dynamic.enToRu, fallback: standardEnToRu)
             self.ruToEn = Detector.mergeMap(primary: dynamic.ruToEn, fallback: standardRuToEn)
+            // Свап выделения — только по реальной раскладке. В JSON зашита
+            // ПК-раскладка ('`' → 'ё', '/' → '.'), а на маке '`' → ']', 'ё' на '\\',
+            // '/' одинаков; слияние подменяло реальные пары «буквами из JSON».
+            self.swapEnToRu = dynamic.enToRu
+            self.swapRuToEn = dynamic.ruToEn
         } else {
             print("📐 Раскладка: используем JSON (динамическое определение не сработало)")
             self.enToRu = standardEnToRu
             self.ruToEn = standardRuToEn
+            self.swapEnToRu = standardEnToRu
+            self.swapRuToEn = standardRuToEn
         }
 
         // 2. Плохие n-граммы (натренированные триггеры)
@@ -58,6 +68,11 @@ final class Detector {
         loadShortWords()
 
         loaded = !enToRu.isEmpty
+
+        // 4. Сеть-детектор — грузим сразу, а не при первом слове: строки
+        // «Сеть/selftest» должны быть в логе при старте, а первое решение
+        // не должно платить за загрузку 8 МБ.
+        _ = LayoutNet.shared
     }
 
 
@@ -137,13 +152,22 @@ final class Detector {
     /// «Тупой» свап: каждый символ → его пара по физической клавише.
     /// Кириллица → латиница, латиница → кириллица. Для выделенного текста.
     /// Не пытается «нормализовать» смешанное — каждую букву меняет в свою сторону.
-    func hardSwap(_ s: String) -> String {
+    func hardSwap(_ s: String, currentLang: InputSource.Lang? = nil) -> String {
+        // Направление — по алфавиту текста. Знаки неоднозначны: '.' в русском
+        // тексте — это RU-клавиша '/', а в латинском — EN-клавиша 'ю'. Раньше
+        // любая точка считалась EN-клавишей, и «платформах.» → «gkfnajhvf[ю».
+        // Букв нет (выделены одни знаки) — направление по текущей раскладке.
+        let cyr = s.filter(isCyrillicLetter).count
+        let lat = s.filter(isLatinLetter).count
+        let textIsRu = (cyr == 0 && lat == 0) ? (currentLang == .ru) : cyr > lat
+        // Только реальная раскладка: буква/знак → что на той же клавише в другой
+        // ('[' → 'х', '\\' → 'ё', '"' → '@'); одинаков в обеих (пары нет) — та же
+        // клавиша с Shift, как правый Option по кейкоду: '/' ↔ '?'. Ничего — как есть.
+        let map = textIsRu ? swapRuToEn : swapEnToRu
+        let pairs = LayoutResolver.shiftPairs(for: textIsRu ? .ru : .en)
         return String(s.map { ch -> Character in
-            if isLatinLetter(ch), let m = enToRu[ch] { return m }
-            if isCyrillicLetter(ch), let m = ruToEn[ch] { return m }
-            // Не буква — может быть EN-пунктуация → RU-буква (`[` → `х`)
-            if let m = enToRu[ch], isCyrillicLetter(m) { return m }
-            return ch
+            if isLatinLetter(ch) || isCyrillicLetter(ch) { return map[ch] ?? ch }
+            return map[ch] ?? pairs[ch] ?? ch
         })
     }
 
