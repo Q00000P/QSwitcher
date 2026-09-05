@@ -105,6 +105,7 @@ internal static class Program
             if (removed > 0)
                 Log($"🧹 Снято {removed} взаимоисключающих правил (слово и его свап оба «переключать»)");
         }
+        var net = LayoutNet.Load(pair, Res.Open, Log);
         var detector = new Detector(pair, dict,
             learned,
             new DetectorConfig
@@ -112,7 +113,10 @@ internal static class Program
                 ForceWords = cfg.ForceWords,
                 StopWords = cfg.StopWords,
                 MinWordLength = cfg.MinWordLength,
-            }, Log);
+                // Настройки сети читаются на каждое решение — меняются в config.json на лету
+                Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen),
+                AppClassOf = cfg.AppClassOf,
+            }, Log, net);
 
         // Режим изоляции: QSWITCHER_PASSIVE=1 — хук ставится, но НИЧЕГО не делает.
         // Нужен чтобы понять, ломает ли чужие хоткеи сам факт установки хука
@@ -207,7 +211,7 @@ public static class AppVersion
 {
     public const string Version = "4.0";
     /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
-    public const string Build = "wave2";
+    public const string Build = "wave9";
 }
 
 /// <summary>
@@ -231,6 +235,46 @@ public sealed class AppConfig
 
     /// <summary>Горячие клавиши. Переназначаются через меню трея.</summary>
     public HotkeyMap Hotkeys { get; set; } = new();
+
+    // Сеть-детектор (qsnet.bin). Меняются на лету.
+    /// Включена ли сеть вообще.
+    public bool NnEnabled { get; set; } = true;
+    /// Уверенность (max(p, 1−p)), ниже которой сеть молчит и решают словари.
+    public double NnThreshold { get; set; } = 0.85;
+    /// "primary" — сеть решает до словарей; "arbiter" — только когда словари промолчали.
+    public string NnMode { get; set; } = "primary";
+    /// Слова короче — сети не показываем (одиночные буквы и пары — правила/щит).
+    public int NnMinLen { get; set; } = 3;
+    /// Класс приложения по подстроке имени процесса (без .exe, без учёта регистра).
+    /// Записи отсюда дополняют встроенную таблицу.
+    public Dictionary<string, List<string>> AppClasses { get; set; } = new();
+
+    private static readonly Dictionary<string, string[]> BuiltinAppClasses = new()
+    {
+        ["terminal"] = new[] { "windowsterminal", "wt", "cmd", "powershell", "pwsh", "conhost", "putty", "kitty", "mintty",
+                               "mobaxterm", "qterm", "alacritty", "wezterm", "termius", "tabby" },
+        ["code"]     = new[] { "code", "cursor", "devenv", "rider", "idea", "pycharm", "webstorm", "clion", "goland",
+                               "sublime", "notepad++", "zed" },
+        ["browser"]  = new[] { "chrome", "firefox", "msedge", "opera", "brave", "yandex", "vivaldi", "arc" },
+        ["chat"]     = new[] { "telegram", "slack", "discord", "whatsapp", "claude", "teams", "zoom", "skype", "viber",
+                               "signal", "outlook", "thunderbird", "max" },
+    };
+
+    /// <summary>Класс приложения для сети: сначала свои подстроки, потом встроенные.</summary>
+    public LayoutNet.AppClass AppClassOf(string? process)
+    {
+        if (string.IsNullOrEmpty(process)) return LayoutNet.AppClass.Other;
+        string id = process.ToLowerInvariant();
+        for (int i = 1; i < LayoutNet.AppNames.Length; i++)
+        {
+            string cls = LayoutNet.AppNames[i];
+            IEnumerable<string> subs = BuiltinAppClasses[cls];
+            if (AppClasses.TryGetValue(cls, out var user)) subs = user.Concat(subs);
+            foreach (var sub in subs)
+                if (id.Contains(sub.ToLowerInvariant())) return (LayoutNet.AppClass)i;
+        }
+        return LayoutNet.AppClass.Other;
+    }
 
     /// Процессы, где свитчер не работает. Сравнение по вхождению, без .exe.
     /// Терминалы — потому что свап портит команды, менеджеры паролей —
@@ -352,6 +396,11 @@ public sealed class AppConfig
         ForceWords.Clear(); ForceWords.UnionWith(fresh.ForceWords);
         StopWords.Clear(); StopWords.UnionWith(fresh.StopWords);
         ExcludedProcesses.Clear(); ExcludedProcesses.AddRange(fresh.ExcludedProcesses);
+        NnEnabled = fresh.NnEnabled;
+        NnThreshold = fresh.NnThreshold;
+        NnMode = fresh.NnMode;
+        NnMinLen = fresh.NnMinLen;
+        AppClasses = fresh.AppClasses;
         log("🔄 Конфиг перечитан (горячие клавиши и движок — после перезапуска)");
     }
 

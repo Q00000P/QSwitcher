@@ -47,6 +47,15 @@
          неё exe был бесполезен. Код при этом сначала ищет файл снаружи —
          так можно подменить словарь или звук, не пересобирая. -->
     <EmbeddedResource Include="Resources\**" />
+    <!-- Веса сети-детектора живут в nn/ (общие с маком, обучаются nn/train.py).
+         Встраиваем прямо оттуда — без копий и без «второй сборки», чтобы glob
+         их заметил. Нет весов — сеть выключена, сборка не ломается. -->
+    <EmbeddedResource Include="..\..\..\nn\qsnet.bin" Link="Resources\qsnet.bin"
+                      LogicalName="QSwitcher.App.Resources.qsnet.bin"
+                      Condition="Exists('..\..\..\nn\qsnet.bin')" />
+    <EmbeddedResource Include="..\..\..\nn\qsnet-selftest.json" Link="Resources\qsnet-selftest.json"
+                      LogicalName="QSwitcher.App.Resources.qsnet-selftest.json"
+                      Condition="Exists('..\..\..\nn\qsnet-selftest.json')" />
   </ItemGroup>
   <!-- Словари качаются и готовятся автоматически перед сборкой (разово).
        Если ru.txt/en.txt уже на месте — мгновенный no-op. -->

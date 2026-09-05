@@ -31,19 +31,26 @@ public sealed class Detector
     private readonly LearnedRules _learned;
     private readonly DetectorConfig _cfg;
     private readonly Action<string>? _log;
+    private readonly LayoutNet? _net;
 
     public Detector(LayoutPair pair, WordDictionary dict, LearnedRules learned,
-                    DetectorConfig cfg, Action<string>? log = null)
+                    DetectorConfig cfg, Action<string>? log = null, LayoutNet? net = null)
     {
         _pair = pair;
         _dict = dict;
         _learned = learned;
         _cfg = cfg;
         _log = log;
+        _net = net;
     }
 
-    /// <summary>Главная точка входа: вызывается на границе слова.</summary>
-    public Verdict Decide(string raw, Lang currentLang, Lang? context)
+    /// <summary>
+    /// Главная точка входа: вызывается на границе слова.
+    /// history — предыдущие слова как они на экране, БЛИЖАЙШЕЕ ПЕРВЫМ (до трёх);
+    /// app — имя процесса, где идёт ввод (для класса приложения сети).
+    /// </summary>
+    public Verdict Decide(string raw, Lang currentLang, Lang? context,
+                          IReadOnlyList<string>? history = null, string? app = null)
     {
         string lower = raw.ToLowerInvariant();
         int effectiveLen = raw.Count(c => char.IsLetter(c) || _pair.LayoutPunct.Contains(c));
@@ -78,10 +85,10 @@ public sealed class Detector
         if (effectiveLen < _cfg.MinWordLength)
             return new(false, null, "too-short");
 
-        var converted = AutoConvert(raw, context);
+        var (converted, reason) = AutoConvert(raw, context, history ?? Array.Empty<string>(), app);
         return converted is null
-            ? new(false, null, "no-rule")
-            : new(true, converted, "auto");
+            ? new(false, null, reason)
+            : new(true, converted, reason);
     }
 
     /// <summary>
@@ -107,17 +114,40 @@ public sealed class Detector
         return null;
     }
 
-    private string? AutoConvert(string word, Lang? context)
+    private (string? Result, string Reason) AutoConvert(string word, Lang? context,
+                                                       IReadOnlyList<string> history, string? app)
     {
         string lower = word.ToLowerInvariant();
-        if (lower.Length < 2) return null;
+        if (lower.Length < 2) return (null, "too-short");
 
         bool isLatin = lower.All(c => _pair.IsLatinLetter(c));
         bool isOther = lower.All(c => _pair.IsOtherLetter(c));
 
         // (1) Смешанные алфавиты → нормализация
         if (!isLatin && !isOther)
-            return NormalizeMixed(word, lower);
+            return (NormalizeMixed(word, lower), "mixed");
+
+        // (1а) Щит коротких слов: короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА,
+        // против контекста не свапаем. Почти любая пара букв — чьё-то короткое
+        // слово в другом языке ('ру' при ctx=ru свапалось в 'he', 'рф' → 'ha').
+        // Стоит ВЫШЕ сети намеренно: 'he' в корпусах частое, «ру» — нет, и
+        // сеть уверенно ошибётся ровно там, где мы уже обжигались.
+        // Направление 'yt'→'не' при ctx=ru не задето: цель свапа = контекст.
+        if (lower.Length <= 3 && context is not null
+            && context == (isLatin ? Lang.Latin : Lang.Other))
+        {
+            Log($"'{lower}' короткое, набрано в языке контекста ({context}) → keep");
+            return (null, "short-in-context");
+        }
+
+        // (1б) Сеть — основной режим: решает до словарей, если уверена.
+        // Не уверена — молчит, дальше словарные правила как раньше.
+        var nn = _cfg.Nn?.Invoke();
+        if (nn is { Mode: not "arbiter" })
+        {
+            var v = NetVerdict(word, lower, isLatin, history, app, nn.Value);
+            if (v.HasValue) return (v.Value.Result, v.Value.Reason);
+        }
 
         // (2) Валидное слово текущего языка — не трогаем.
         // Для 2–3 букв полный словарь бесполезен: в нём архаизмы и фамилии,
@@ -129,14 +159,14 @@ public sealed class Detector
             bool valid = shortWord && _dict.ShortLatin.Count > 0
                 ? _dict.ShortLatin.Contains(lower)
                 : _dict.Latin.Contains(lower);
-            if (valid) { Log($"'{lower}' валидное {_pair.LatinCode.ToUpper()}-слово → keep"); return null; }
+            if (valid) { Log($"'{lower}' валидное {_pair.LatinCode.ToUpper()}-слово → keep"); return (null, "valid"); }
         }
         if (isOther)
         {
             bool valid = shortWord && _dict.ShortOther.Count > 0
                 ? _dict.ShortOther.Contains(lower)
                 : _dict.Other.Contains(lower);
-            if (valid) { Log($"'{lower}' валидное {_pair.OtherCode.ToUpper()}-слово → keep"); return null; }
+            if (valid) { Log($"'{lower}' валидное {_pair.OtherCode.ToUpper()}-слово → keep"); return (null, "valid"); }
         }
 
         string candidate = _pair.Swap(word);
@@ -147,20 +177,10 @@ public sealed class Detector
         if (triggers.Contains(lower))
         {
             Log($"'{lower}' в триггерах → SWAP к '{candidate}'");
-            return candidate;
+            return (candidate, "trigger");
         }
 
-        // (4а) Короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА, против контекста
-        // не свапаем. Почти любая пара букв — чьё-то короткое слово в другом
-        // языке: на маке 'ру' при ctx=ru свапалось в 'he', 'рф' → 'ha'.
-        // Направление 'yt'→'не' при ctx=ru не задето: там цель свапа
-        // совпадает с контекстом.
-        if (lower.Length <= 3 && context is not null
-            && context == (isLatin ? Lang.Latin : Lang.Other))
-        {
-            Log($"'{lower}' короткое, набрано в языке контекста ({context}) → keep");
-            return null;
-        }
+        // (4а) щит коротких слов переехал выше сети — см. (1а)
 
         // (4) Свап — валидное слово другого языка.
         // Для 2 букв разрешаем свободно: коротких латинских слов мало и они в словаре;
@@ -171,18 +191,62 @@ public sealed class Detector
         if (isLatin && _dict.Other.Contains(candidateLower))
         {
             Log($"свап '{candidate}' есть в {_pair.OtherCode.ToUpper()} (len={lower.Length}) → SWAP");
-            return candidate;
+            return (candidate, "swap-in-dict");
         }
         if (isOther && _dict.Latin.Contains(candidateLower))
         {
             Log($"свап '{candidate}' есть в {_pair.LatinCode.ToUpper()} (len={lower.Length}) → SWAP");
-            return candidate;
+            return (candidate, "swap-in-dict");
         }
 
         // (5) Взвешенного score нет намеренно: на маке он делал ложные свапы
         // валидных слов, которых нет в словаре. Либо правило 4, либо ничего.
+
+        // (6) Режим «арбитр»: сеть спрашиваем только когда словари промолчали.
+        if (nn is { Mode: "arbiter" })
+        {
+            var v = NetVerdict(word, lower, isLatin, history, app, nn.Value);
+            if (v.HasValue) return (v.Value.Result, v.Value.Reason);
+        }
+
         Log($"'{lower}' (свап='{candidate}') не подошло ни одно правило → keep");
-        return null;
+        return (null, "no-rule");
+    }
+
+    /// <summary>
+    /// Вердикт сети: (свап, "nn-swap"), (null, "nn-keep") или null — не уверена /
+    /// выключена / слово не кодируется, тогда решают словари. В логе всегда P(ru),
+    /// контекст и класс приложения — решения остаются объяснимыми.
+    /// </summary>
+    private (string? Result, string Reason)? NetVerdict(string word, string lower, bool isLatin,
+                                                        IReadOnlyList<string> history, string? app,
+                                                        NnSettings nn)
+    {
+        if (_net is null || !_net.Loaded || !nn.Enabled) return null;
+        if (lower.Length < nn.MinLen) return null;
+        string? keys = _net.KeysOf(lower);
+        if (keys is null) return null;
+        var ctx = history.Take(3).Select(_net.CtxOf).ToList();
+        var appClass = _cfg.AppClassOf?.Invoke(app) ?? LayoutNet.AppClass.Other;
+        float p = _net.ProbabilityRu(keys, ctx, appClass, layoutRu: !isLatin);
+        bool intendedOther = p >= 0.5f;
+        float conf = MathF.Max(p, 1 - p);
+        string ctxStr = string.Join(" ", history.Take(3));
+        string appName = LayoutNet.AppNames[(int)appClass];
+        string tag = $"P(ru)={p:F3}";
+        if (conf < nn.Threshold)
+        {
+            Log($"сеть {tag} не уверена (порог {nn.Threshold}, ctx='{ctxStr}', {appName}) → словари");
+            return null;
+        }
+        if (intendedOther == !isLatin)
+        {
+            Log($"сеть {tag} (ctx='{ctxStr}', {appName}) → keep");
+            return (null, "nn-keep");
+        }
+        string candidate = _pair.Swap(word);
+        Log($"сеть {tag} (ctx='{ctxStr}', {appName}) → SWAP к '{candidate}'");
+        return (candidate, "nn-swap");
     }
 
     /// <summary>
@@ -223,10 +287,17 @@ public sealed class Detector
     private void Log(string msg) => _log?.Invoke($"  [det] {msg}");
 }
 
+/// <summary>Настройки сети на момент решения (читаются из конфига на лету).</summary>
+public readonly record struct NnSettings(bool Enabled, double Threshold, string Mode, int MinLen);
+
 /// <summary>Настройки детектора, читаются из конфига приложения.</summary>
 public sealed class DetectorConfig
 {
     public HashSet<string> ForceWords { get; init; } = new();
     public HashSet<string> StopWords { get; init; } = new();
     public int MinWordLength { get; init; } = 2;
+    /// <summary>Живые настройки сети (null — сеть не используется).</summary>
+    public Func<NnSettings>? Nn { get; init; }
+    /// <summary>Имя процесса → класс приложения для сети.</summary>
+    public Func<string?, LayoutNet.AppClass>? AppClassOf { get; init; }
 }

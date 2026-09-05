@@ -662,9 +662,17 @@ public sealed class KeyboardMonitor : IDisposable
 
         // Язык по содержимому — выбранной раскладке не доверяем, урок мака
         Lang current = text.Any(c => _pair.IsOtherLetter(c)) ? Lang.Other : Lang.Latin;
-        var context = _lastWordLang;
+        // Контекст — большинство по буквам трёх последних слов, как на маке.
+        // По одному последнему слову 'US' в русской фразе давал ctx=Latin, и щит
+        // коротких слов молча съедал 'rfr' (как).
+        var context = ComputeContext() ?? _lastWordLang;
 
-        var verdict = _detector.Decide(text, current, context);
+        // Сети — три последних слова как они на экране (ближайшее первым) и
+        // процесс, где идёт ввод. Историю ветка перевода строки уже сбросила,
+        // так что контекст не перетекает из прошлого сообщения.
+        var recent = new List<string>(3);
+        for (int i = _history.Count - 1; i >= 0 && recent.Count < 3; i--) recent.Add(_history[i].Text);
+        var verdict = _detector.Decide(text, current, context, recent, Foreground?.ProcessName);
         _log($"[word] собрано '{text}' ({wordCopy.Count} клавиш)");
         _log($"[boundary] '{text}' ({current}, ctx={context?.ToString() ?? "nil"}) → {(verdict.ShouldSwap ? "SWITCH" : "keep")} [{verdict.Reason}]");
         SecureLog?.Append(verdict.ShouldSwap && verdict.Replacement is not null
@@ -771,11 +779,11 @@ public sealed class KeyboardMonitor : IDisposable
             // Проверка выделения (UIA) идёт в рабочем потоке реплейсера, а свап
             // набранного возвращается сюда сообщением — хук не ждёт чужой процесс.
             case HotkeyAction.SwapWord:
-                _replacer.EnqueueSelectionOrElse(_pair.Swap, RequestManualSwap);
+                _replacer.EnqueueSelectionOrElse(SelectionSwapText, RequestManualSwap);
                 break;
 
             case HotkeyAction.SwapAndLearn:
-                _replacer.EnqueueSelectionOrElse(_pair.Swap, RequestManualLearnSwap, selected =>
+                _replacer.EnqueueSelectionOrElse(SelectionSwapText, RequestManualLearnSwap, selected =>
                 {
                     // Выделено одно слово — учим его (как Shift+тап по набранному)
                     string w = selected.Trim();
@@ -815,13 +823,55 @@ public sealed class KeyboardMonitor : IDisposable
     /// Операции над выделенным текстом — через буфер обмена.
     /// На Windows нет аналога Accessibility API для чтения выделения,
     /// поэтому единственный надёжный путь: Ctrl+C, обработать, Ctrl+V.
+    /// <summary>Последний свап выделения — для обратимости. Из одного знака не
+    /// узнать, EN-клавиша это '.' или RU-клавиша '/': '/' → '.' верно, но '.' → 'ю'
+    /// уже не назад. Выделено ровно то, что мы выдали — возвращаем исходник.</summary>
+    private (string From, string To)? _lastSelSwap;
+
+    private string SelectionSwapText(string text)
+    {
+        // Сравниваем по обрезанному: через Ctrl+C текст приходит с хвостом
+        // ('\r\n', пробел) в некоторых редакторах — хвост сохраняем, ядро меняем.
+        string core = text.Trim();
+        if (_lastSelSwap is { } last && core.Length > 0 && last.To.Trim() == core)
+        {
+            string back = text.Replace(core, last.From.Trim());
+            _lastSelSwap = (text, back);
+            _log($"[selection] обратно к исходнику: '{Vis(text)}' → '{Vis(back)}'");
+            return back;
+        }
+        string result = _pair.SwapSelection(text, KeyMap.QueryOtherLayoutActive());
+        _lastSelSwap = (text, result);
+        _log($"[selection] '{Vis(text)}' → '{Vis(result)}'");
+        return result;
+    }
+
+    private static string Vis(string s) => s.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
+
+    /// <summary>Язык контекста по трём последним словам: считаем буквы, нужно
+    /// хотя бы две; равенство — неизвестно (паритет с computeContext() мака).</summary>
+    private Lang? ComputeContext()
+    {
+        int oth = 0, lat = 0;
+        for (int i = _history.Count - 1, n = 0; i >= 0 && n < 3; i--, n++)
+            foreach (char c in _history[i].Text)
+            {
+                if (_pair.IsOtherLetter(c)) oth++;
+                else if (_pair.IsLatinLetter(c)) lat++;
+            }
+        if (oth + lat < 2) return null;
+        if (oth > lat) return Lang.Other;
+        if (lat > oth) return Lang.Latin;
+        return null;
+    }
+
     private void SelectionAction(SelectionOp op)
     {
         _replacer.EnqueueSelection(op, text =>
         {
             return op switch
             {
-                SelectionOp.Swap => _pair.Swap(text),
+                SelectionOp.Swap => SelectionSwapText(text),
                 SelectionOp.Case => Transliterator.CycleCase(text),
                 SelectionOp.Translit => Transliterator.ToLatin(text),
                 _ => text,
