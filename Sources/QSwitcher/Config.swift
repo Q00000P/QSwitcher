@@ -37,11 +37,25 @@ final class Config {
     /// Откат на случай регрессий, применяется после перезапуска.
     private(set) var engine: String = "v4"
 
+    // Семантика (nn/sem/qsvec.bin + profile.json). Меняются на лету.
+    /// Включён ли профиль чтений с семантикой.
+    private(set) var semEnabled: Bool = true
+    /// Отрыв лидера, ниже которого профиль не вмешивается.
+    private(set) var semMargin: Double = 0.10
+    /// Нулевой режим: коллизии, где оба чтения — слова корпуса, решаются базой без обучения.
+    private(set) var semZeroShot: Bool = true
+    /// Учить профиль на ОБЫЧНОМ ручном свапе/тоггле (по умолчанию нет: свап — просто свап).
+    private(set) var semLearnOnSwap: Bool = false
+    /// Учить профиль на принятом без исправления (после уверенного решения профиля).
+    private(set) var semLearnOnAccept: Bool = false
+
     // Сеть-детектор (nn/qsnet.bin). Меняются на лету через config.json.
     /// Включена ли сеть вообще.
     private(set) var nnEnabled: Bool = true
     /// Уверенность (max(p, 1−p)), ниже которой сеть молчит и решают словари.
     private(set) var nnThreshold: Double = 0.85
+    /// Порог для коротких слов (≤3 букв) — строже: ложный свап короткого дороже пропуска.
+    private(set) var nnThresholdShort: Double = 0.95
     /// "primary" — сеть решает до словарей; "arbiter" — только когда словари промолчали.
     private(set) var nnMode: String = "primary"
     /// Слова короче — сети не показываем (одиночные буквы и пары — правила/щит).
@@ -180,16 +194,24 @@ final class Config {
             enabled            = json["enabled"]            as? Bool ?? true
             soundEnabled       = json["soundEnabled"]       as? Bool ?? true
             excludedApps       = Set((json["excludedApps"]  as? [String]) ?? [])
-            stopWords          = Set(((json["stopWords"]   as? [String]) ?? []).map { $0.lowercased() })
-            forceWords         = Set(((json["forceWords"]  as? [String]) ?? []).map { $0.lowercased() })
+            // Как написано: строчное слово матчится без учёта регистра (сравниваем с
+            // lowercased), слово с заглавными — только точно ("РФ" ≠ "рф").
+            stopWords          = Set(((json["stopWords"]   as? [String]) ?? []).map { $0.trimmingCharacters(in: .whitespaces) })
+            forceWords         = Set(((json["forceWords"]  as? [String]) ?? []).map { $0.trimmingCharacters(in: .whitespaces) })
             minWordLength      = json["minWordLength"]      as? Int ?? 2
             maxConsonantRunEn  = json["maxConsonantRunEn"]  as? Int ?? 4
             maxConsonantRunRu  = json["maxConsonantRunRu"]  as? Int ?? 5
             switchLayoutAfter  = json["switchLayoutAfter"]  as? Int ?? 2
             replaceStartDelayMs = json["replaceStartDelayMs"] as? Int ?? 0
             engine              = json["engine"]              as? String ?? "v4"
+            semEnabled          = json["semEnabled"]          as? Bool ?? true
+            semMargin           = json["semMargin"]           as? Double ?? 0.10
+            semZeroShot         = json["semZeroShot"]         as? Bool ?? true
+            semLearnOnSwap      = json["semLearnOnSwap"]      as? Bool ?? false
+            semLearnOnAccept    = json["semLearnOnAccept"]    as? Bool ?? false
             nnEnabled           = json["nnEnabled"]           as? Bool ?? true
             nnThreshold         = json["nnThreshold"]         as? Double ?? 0.85
+            nnThresholdShort    = json["nnThresholdShort"]    as? Double ?? 0.95
             nnMode              = (json["nnMode"]             as? String ?? "primary").lowercased()
             nnMinLen            = json["nnMinLen"]            as? Int ?? 3
             appClasses          = (json["appClasses"]         as? [String: [String]]) ?? [:]

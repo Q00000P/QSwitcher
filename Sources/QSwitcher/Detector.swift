@@ -73,6 +73,9 @@ final class Detector {
         // «Сеть/selftest» должны быть в логе при старте, а первое решение
         // не должно платить за загрузку 8 МБ.
         _ = LayoutNet.shared
+        _ = SemVec.shared
+        _ = SemTopics.shared
+        _ = SemProfile.shared
     }
 
 
@@ -171,30 +174,60 @@ final class Detector {
         })
     }
 
+    /// Свап только букв: каждая буква → что на той же клавише в другой раскладке
+    /// (буква или знак: 'х' → '['), а знаки, цифры и пробелы остаются как есть.
+    /// Для формул и кода, набранных не в той раскладке.
+    func hardSwapLetters(_ s: String) -> String {
+        return String(s.map { ch -> Character in
+            if isLatinLetter(ch) { return swapEnToRu[ch] ?? ch }
+            if isCyrillicLetter(ch) { return swapRuToEn[ch] ?? ch }
+            return ch
+        })
+    }
+
     // MARK: - Главный детектор
 
     /// Решает: переключать или нет. Вызывается на границе слова.
     /// Возвращает true если надо вызвать swap() и заменить.
+    /// Чем решилось последнее слово: "config" / "learned" — мимо профиля по правилу
+    /// (на таком автопримеры не пишем), иначе пусто.
+    static var lastReason = ""
+
     static func shouldSwitch(word raw: String, currentLang: InputSource.Lang,
                              context: InputSource.Lang? = nil,
-                             history: [String] = [], app: String? = nil) -> Bool {
+                             history: [String] = [], app: String? = nil,
+                             topic: [String] = []) -> Bool {
         let cfg = Config.shared
         let lower = raw.lowercased()
         let layoutPunct: Set<Character> = [";", "[", "]", "'", "`", "\\", ",", "."]
         let effectiveChars = raw.filter { $0.isLetter || layoutPunct.contains($0) }
 
-        if cfg.forceWords.contains(lower) { return true }
-        if cfg.stopWords.contains(lower) { return false }
+        Detector.lastReason = ""
+        // Слово в конфиге с заглавными буквами — совпадение с учётом регистра
+        // ("РФ" стопит только РФ, строчное рф уходит дальше), строчное — как раньше.
+        func inList(_ list: Set<String>) -> Bool { list.contains(lower) || list.contains(raw) }
+        if inList(cfg.forceWords) { Detector.lastReason = "config"; print("  [det] '\(raw)' в forceWords конфига → SWITCH"); return true }
+        if inList(cfg.stopWords) { Detector.lastReason = "config"; print("  [det] '\(raw)' в stopWords конфига → keep"); return false }
 
         // Выученное на исправлениях пользователя. Важнее любых наших эвристик:
         // человек уже показал что он хочет для этого конкретного слова.
-        if LearnedRules.shared.shouldForce(lower) {
+        // Исключение — коллизия, у которой профиль знает ОБА чтения: правило без
+        // контекста для неё неверно по определению, решает контекст.
+        let collision = cfg.semEnabled && SemVec.shared.loaded
+            && ((LayoutNet.shared.keys(for: lower, ruToEn: shared.ruToEn).map { SemProfile.shared.readingCount(keys: $0) } ?? 0) >= 2
+                || (cfg.semZeroShot && SemProfile.shared.isBaseCollision(typed: lower, swapped: shared.swap(lower))))
+        if !collision, LearnedRules.shared.shouldForce(lower) {
+            Detector.lastReason = "learned"
             print("  [det] '\(lower)' — выучено: переключаем")
             return true
         }
-        if LearnedRules.shared.shouldStop(lower) {
+        if !collision, LearnedRules.shared.shouldStop(lower) {
+            Detector.lastReason = "learned"
             print("  [det] '\(lower)' — выучено: не трогаем")
             return false
+        }
+        if collision, LearnedRules.shared.shouldForce(lower) || LearnedRules.shared.shouldStop(lower) {
+            print("  [det] '\(lower)' — выученное правило есть, но это коллизия из профиля → решает контекст")
         }
 
         // Одиночная буква — обрабатывается отдельно через контекст
@@ -204,7 +237,7 @@ final class Detector {
 
         guard effectiveChars.count >= cfg.minWordLength else { return false }
 
-        return shared.autoConvert(raw, context: context, history: history, app: app) != nil
+        return shared.autoConvert(raw, context: context, history: history, app: app, topic: topic) != nil
     }
 
     /// Свап одиночной буквы-предлога с учётом контекста.
@@ -242,7 +275,7 @@ final class Detector {
     ///   5. Взвешенный score по плохим подстрокам → SWAP если перевешивает в 1.8 раз
     ///   6. Если контекст явно противоречит языку слова — SWAP
     func autoConvert(_ word: String, context: InputSource.Lang? = nil,
-                     history: [String] = [], app: String? = nil) -> String? {
+                     history: [String] = [], app: String? = nil, topic: [String] = []) -> String? {
         let dict = Dictionary.shared
         let lower = word.lowercased()
 
@@ -282,23 +315,58 @@ final class Detector {
 
         let len = lower.count
 
-        // (1а) Щит коротких слов: короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА,
+        // (0) Профиль чтений: клавиши, которые пользователь сам исправлял. Он знает
+        // про ЭТИ клавиши больше любого словаря: чтение выбирается по левому
+        // соседу, теме окна и регистру (семантические векторы), но только при
+        // уверенном отрыве — иначе молчит, и дальше обычный порядок.
+        let cfg = Config.shared
+        if cfg.semEnabled, SemVec.shared.loaded,
+           let keys = LayoutNet.shared.keys(for: lower, ruToEn: ruToEn) {
+            let sem = SemVec.shared
+            SemProfile.shared.clearExplain()
+            let leftVec = history.first.map { sem.centered($0) }
+            let d = SemProfile.shared.decide(keys: keys, typed: word, swapped: swap(word),
+                                             topic: sem.topic(recentFirst: topic),
+                                             left: leftVec, leftWord: history.first, margin: Float(cfg.semMargin))
+            if d == nil, SemProfile.shared.knows(keys: keys) || !SemProfile.shared.lastExplain.isEmpty {
+                // Клавиши профилю известны, но уверенности нет — так и говорим,
+                // иначе непонятно, почему «ничего не произошло».
+                print("  [det] профиль знает '\(keys)', но уверенности нет: \(SemProfile.shared.lastExplain) (сосед '\(history.first ?? "—")', порог \(cfg.semMargin)) → дальше")
+            }
+            if let d = d {
+                let candidate = swap(word)
+                let leftWord = history.first ?? "—"
+                if d.text == lower {
+                    Detector.lastReason = "profile"
+                    print("  [det] профиль \(d.explain) (сосед '\(leftWord)') → keep")
+                    return nil
+                }
+                if d.text == candidate.lowercased() {
+                    Detector.lastReason = "profile"
+                    print("  [det] профиль \(d.explain) (сосед '\(leftWord)') → SWAP к '\(candidate)'")
+                    return candidate
+                }
+                print("  [det] профиль \(d.explain) — чтение не совпало ни с '\(lower)', ни с '\(candidate)', пропускаю")
+            }
+        }
+
+        // (1а) Сеть — основной режим: решает до щита и словарей, если уверена.
+        // Для коротких слов (≤3) порог строже (nnThresholdShort): ложный свап
+        // короткого слова дороже пропуска. Не уверена — молчит.
+        if cfg.nnMode != "arbiter",
+           let verdict = netVerdict(word, lower: lower, isLatin: isLatin, history: history, app: app) {
+            return verdict
+        }
+
+        // (1б) Щит коротких слов: короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА,
         // против контекста не свапаем. Почти любая пара букв — чьё-то короткое
         // слово в другом языке ('ру' при ctx=ru свапалось в 'he', 'рф' → 'ha').
-        // Стоит ВЫШЕ сети намеренно: 'he' в корпусах частое, «ру» — нет, и
-        // сеть уверенно ошибётся ровно там, где мы уже обжигались.
+        // Стоит после сети: она, если уверена (строгий порог), знает про
+        // контекст больше, чем язык соседей; не уверена — щит страхует.
         // Направление 'yt'→'не' при ctx=ru не задето: цель свапа = контекст.
         if len <= 3, let ctx = context, ctx == (isLatin ? .en : .ru) {
             print("  [det] '\(lower)' короткое, набрано в языке контекста (\(ctx)) → keep")
             return nil
-        }
-
-        // (1б) Сеть — основной режим: решает до словарей, если уверена.
-        // Не уверена — молчит, и дальше работают словарные правила как раньше.
-        let cfg = Config.shared
-        if cfg.nnMode != "arbiter",
-           let verdict = netVerdict(word, lower: lower, isLatin: isLatin, history: history, app: app) {
-            return verdict
         }
 
         // (2) Слово целиком валидно в текущем языке — не трогаем.
@@ -408,8 +476,9 @@ final class Detector {
         let conf = max(p, 1 - p)
         let ctxStr = history.prefix(3).joined(separator: " ")
         let tag = String(format: "P(ru)=%.3f", p)
-        guard conf >= Float(cfg.nnThreshold) else {
-            print("  [det] сеть \(tag) не уверена (порог \(cfg.nnThreshold), ctx='\(ctxStr)', \(appClass.name)) → словари")
+        let threshold = lower.count <= 3 ? cfg.nnThresholdShort : cfg.nnThreshold
+        guard conf >= Float(threshold) else {
+            print("  [det] сеть \(tag) не уверена (порог \(threshold), ctx='\(ctxStr)', \(appClass.name)) → словари")
             return nil
         }
         if intendedRu == !isLatin {

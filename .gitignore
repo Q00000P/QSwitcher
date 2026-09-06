@@ -23,5 +23,8 @@ nn/data/
 # Копии весов в ресурсах — делаются скриптами сборки из nn/qsnet.bin
 Sources/QSwitcher/Resources/qsnet.bin
 Sources/QSwitcher/Resources/qsnet-selftest.json
-
-windows/publish/
+Sources/QSwitcher/Resources/qsnet-replay.json
+Sources/QSwitcher/Resources/qsvec.bin
+Sources/QSwitcher/Resources/qsvec-topics.json
+nn/sem/data/
+nn/sem/profile.json

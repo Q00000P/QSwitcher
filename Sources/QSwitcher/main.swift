@@ -31,6 +31,37 @@ func setupFileLogging() {
     print("\n===== \(AppVersion.fullString) запущен \(df.string(from: Date())) =====")
 }
 
+// === Обучение из файла: QSwitcher --train файл ===
+// Тот же код, что окно «Обучить профиль на тексте…», с отчётом в stdout.
+if let i = CommandLine.arguments.firstIndex(of: "--train"), i + 1 < CommandLine.arguments.count {
+    setvbuf(stdout, nil, _IOLBF, 0)
+    let path = CommandLine.arguments[i + 1]
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { print("не читается: \(path)"); exit(2) }
+    _ = Dictionary.shared
+    _ = Detector.shared
+    SemProfile.shared.rebuildIfNeeded()
+    let rep = SemProfile.shared.train(text: text, source: "файл")
+    print("обучение: \(rep.text)")
+    print("профиль: \(SemProfile.shared.path.path)")
+    exit(0)
+}
+
+// === Режим прогона: QSwitcher --test файл ===
+// Строка = фраза, целевое слово последнее или в *звёздочках*, ожидание после «=>».
+if let i = CommandLine.arguments.firstIndex(of: "--test"), i + 1 < CommandLine.arguments.count {
+    setvbuf(stdout, nil, _IOLBF, 0)
+    let path = CommandLine.arguments[i + 1]
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+        print("не читается: \(path)"); exit(2)
+    }
+    _ = Dictionary.shared
+    _ = Detector.shared
+    SemProfile.shared.rebuildIfNeeded()
+    let rep = TestRunner.run(text, verbose: false)
+    if rep.total > 0 { print("\nИтого: \(rep.ok)/\(rep.total) верно") }
+    exit(0)
+}
+
 setupFileLogging()
 
 // Перенос настроек со старого имени (AutoSwitcher) — один раз при первом запуске

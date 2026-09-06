@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 # от реальной версии, и то же самое попадало в отчёты о падениях.
 APP_VERSION="4.0"
 # Метка волны разработки — видна в логе запуска и в «О программе».
-APP_WAVE="wave13"
+APP_WAVE="wave37"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then
@@ -54,9 +54,18 @@ echo "🔢 Билд #$BUILD_NUM ($BUILD_DATE)"
 if [ -f "nn/qsnet.bin" ]; then
     cp nn/qsnet.bin Sources/QSwitcher/Resources/qsnet.bin
     [ -f "nn/qsnet-selftest.json" ] && cp nn/qsnet-selftest.json Sources/QSwitcher/Resources/qsnet-selftest.json
+    [ -f "nn/qsnet-replay.json" ] && cp nn/qsnet-replay.json Sources/QSwitcher/Resources/qsnet-replay.json
     echo "🧠 Веса сети: nn/qsnet.bin ($(du -h nn/qsnet.bin | cut -f1))"
 else
     echo "⚠️  nn/qsnet.bin нет — сеть будет выключена (python3 nn/train.py)"
+fi
+# Семантические векторы: nn/sem/qsvec.bin (python3 nn/sem/train_vectors.py)
+if [ -f "nn/sem/qsvec.bin" ]; then
+    cp nn/sem/qsvec.bin Sources/QSwitcher/Resources/qsvec.bin
+    [ -f "nn/sem/qsvec-topics.json" ] && cp nn/sem/qsvec-topics.json Sources/QSwitcher/Resources/qsvec-topics.json
+    echo "🧭 Векторы: nn/sem/qsvec.bin ($(du -h nn/sem/qsvec.bin | cut -f1))"
+else
+    echo "⚠️  nn/sem/qsvec.bin нет — семантика будет выключена"
 fi
 
 # Если словарей нет — скачиваем

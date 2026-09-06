@@ -18,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var logSubmenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Профиль старого формата — пересборка из журнала, когда все синглтоны уже живы
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { SemProfile.shared.rebuildIfNeeded() }
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         let trusted = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
 
@@ -206,6 +208,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let resetLearn = NSMenuItem(title: "Сбросить выученное…", action: #selector(resetLearned), keyEquivalent: "")
         resetLearn.target = self
         menu.addItem(resetLearn)
+
+        let finetune = NSMenuItem(title: "Дообучить сеть на моих исправлениях…",
+                                  action: #selector(finetuneNet), keyEquivalent: "")
+        finetune.target = self
+        menu.addItem(finetune)
+
+        let resetNet = NSMenuItem(title: "Сбросить сеть к базовой…", action: #selector(resetNet), keyEquivalent: "")
+        resetNet.target = self
+        menu.addItem(resetNet)
+
+        let trainProfile = NSMenuItem(title: "Обучить профиль на тексте…", action: #selector(trainProfile), keyEquivalent: "")
+        trainProfile.target = self
+        menu.addItem(trainProfile)
+
+        let examples = NSMenuItem(title: "Профиль: примеры…", action: #selector(editProfileExamples), keyEquivalent: "")
+        examples.target = self
+        menu.addItem(examples)
+
+        let topics = NSMenuItem(title: "Семантика: темы…", action: #selector(showTopics), keyEquivalent: "")
+        topics.target = self
+        menu.addItem(topics)
+
+        let runTests = NSMenuItem(title: "Профиль: прогон…", action: #selector(runProfileTests), keyEquivalent: "")
+        runTests.target = self
+        menu.addItem(runTests)
 
         updateItem = NSMenuItem(title: "Проверить обновления…",
                                 action: #selector(checkUpdates), keyEquivalent: "")
@@ -639,6 +666,188 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: - Сеть-детектор
+
+    private var finetuneRunning = false
+
+    @objc private func finetuneNet() {
+        let net = LayoutNet.shared
+        guard net.loaded else {
+            info("Сеть не загружена", "Нет qsnet.bin — дообучать нечего.")
+            return
+        }
+        guard !finetuneRunning else { return }
+        let examples = Corrections.shared.examples()
+        guard !examples.isEmpty else {
+            info("Нет исправлений", "Сеть учится на явных правках: Shift + правый Option на слове\n"
+                 + "(«впредь переключать» / «больше не переключать»). Пока таких нет.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Дообучить сеть?"
+        alert.informativeText = "Личных примеров: \(examples.count) (выученные правила + исправления с контекстом).\n"
+            + "К ним подмешиваются общие примеры, чтобы сеть не забыла базу. Займёт секунды."
+            + (net.isUser ? "\nСейчас уже стоят дообученные веса — они будут доучены дальше." : "")
+        alert.addButton(withTitle: "Дообучить")
+        alert.addButton(withTitle: "Отмена")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        finetuneRunning = true
+        let replay = net.loadReplay()
+        print("[nn] дообучение: \(examples.count) личных + \(replay.count) общих…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try net.finetune(personal: examples, replay: replay) }
+            DispatchQueue.main.async {
+                self.finetuneRunning = false
+                switch result {
+                case .success(let r):
+                    net.reload()
+                    print("[nn] дообучено: \(r.text)")
+                    self.info("Сеть дообучена", r.text + "\n\nВеса: \(LayoutNet.userWeightsURL.path)\n"
+                              + "Откат — «Сбросить сеть к базовой».")
+                case .failure(let e):
+                    print("[nn] дообучение не удалось: \(e)")
+                    self.info("Дообучение не удалось", "\(e.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// Окно с многострочным полем; возвращает текст или nil.
+    private func textDialog(title: String, message: String, initial: String, button: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 300))
+        let tv = NSTextView(frame: scroll.bounds)
+        tv.isRichText = false
+        tv.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.autoresizingMask = [.width]
+        tv.string = initial
+        scroll.documentView = tv
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Отмена")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = tv
+        return alert.runModal() == .alertFirstButtonReturn ? tv.string : nil
+    }
+
+    @objc private func runProfileTests() {
+        let saved = (try? String(contentsOf: TestRunner.phrasesURL, encoding: .utf8)) ?? ""
+        let initial = saved.isEmpty
+            ? "# фраза => ожидание; цель — последнее слово или в *звёздочках*; без => просто показать\nшлюз РФ => HA\nживу в HA => РФ\nмой *HA* сервер наружу => HA\n"
+            : saved
+        guard let text = textDialog(title: "Профиль: прогон",
+                                    message: "Гонит фразы через тот же детектор, что живой ввод. Строка: «фраза => ожидание». "
+                                      + "Список сохраняется между запусками.",
+                                    initial: initial, button: "Прогнать") else { return }
+        try? text.write(to: TestRunner.phrasesURL, atomically: true, encoding: .utf8)
+        let rep = TestRunner.run(text, verbose: true)
+        _ = textDialog(title: rep.total > 0 ? "Прогон: \(rep.ok)/\(rep.total) верно" : "Прогон",
+                       message: "Под каждой фразой — объяснение профиля: баллы чтений и что решило.",
+                       initial: rep.text, button: "Закрыть")
+    }
+
+    @objc private func showTopics() {
+        let t = SemTopics.shared
+        guard t.loaded else { info("Темы не загружены", "Нет qsvec-topics.json (python3 nn/sem/topics.py)."); return }
+        guard let text = textDialog(title: "Семантика: темы (\(t.count))",
+                       message: "Темы вынуты из векторов кластеризацией. Первое слово после номера — имя (без пробелов), "
+                         + "его можно переписать; список слов справа у кластерных тем — справочный.\n"
+                         + "Своя тема: новая строка с новым номером, имя и слова — центр считается по ним:\n"
+                         + "\(t.count)  умный-дом home assistant умный дом датчики сенсоры интеграция шлюз\n"
+                         + "«Сохранить» кладёт копию в App Support (важнее встроенной) и пересобирает профиль.",
+                       initial: t.listing(), button: "Сохранить") else { return }
+        do {
+            let (renamed, added) = try t.applyListing(text)
+            print("🧭 Темы: переименовано \(renamed), добавлено \(added) → \(SemTopics.userURL.path)")
+            var msg = "Переименовано: \(renamed), добавлено своих: \(added). Всего тем: \(t.count)."
+            if added > 0 {
+                let rep = SemProfile.shared.rebuild(fromJournal: SemProfile.shared.journalText())
+                msg += "\nПрофиль пересобран из журнала: \(rep.text)."
+            }
+            info("Темы сохранены", msg)
+        } catch {
+            info("Не сохранилось", "\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func editProfileExamples() {
+        let p = SemProfile.shared
+        guard let text = textDialog(
+            title: "Профиль: примеры",
+            message: "Всё, на чём учился профиль: ручные свапы, принятое при наборе, обучение текстом.\n"
+                + "Правь, удаляй строки, меняй веса [n] — «Пересобрать» очистит профиль и прогонит всё заново. "
+                + "Текст после # — пометки, на обучение не влияют.",
+            initial: p.journalText(), button: "Пересобрать") else { return }
+        let rep = p.rebuild(fromJournal: text)
+        print("[sem] профиль пересобран из журнала: \(rep.text)")
+        info("Профиль пересобран", rep.text)
+    }
+
+    @objc private func trainProfile() {
+        guard SemVec.shared.loaded else {
+            info("Семантика выключена", "Нет qsvec.bin — профилю не на чем считать темы.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Обучить профиль на тексте"
+        alert.informativeText = "Строка = пример. Целевое слово — последнее в строке или в *звёздочках*. Вес — [n] в конце.\n"
+            + "Описание темы словами (без примеров): #тема HA: home assistant умный дом датчики шлюз\n"
+            + "Например:\nживу в РФ [10]\nмой *HA* сервер наружу\nпингую HA"
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 460, height: 220))
+        let tv = NSTextView(frame: scroll.bounds)
+        tv.isRichText = false
+        tv.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.autoresizingMask = [.width]
+        scroll.documentView = tv
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: "Обучить")
+        alert.addButton(withTitle: "Отмена")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = tv
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let rep = SemProfile.shared.train(text: tv.string)
+        print("[sem] обучение текстом: \(rep.text)")
+        info(rep.lines > 0 ? "Профиль обучен" : "Нечему учиться",
+             rep.lines > 0 ? rep.text + "\n\nПрофиль: \(SemProfile.shared.path.path)"
+                           : "Ни одна строка не дала примера: нужно целевое слово из букв (2+), в конце строки или в *звёздочках*.")
+    }
+
+    @objc private func resetNet() {
+        let net = LayoutNet.shared
+        let alert = NSAlert()
+        alert.messageText = "Сбросить сеть к базовой?"
+        alert.informativeText = net.isUser
+            ? "Пользовательские веса будут удалены, вернутся встроенные. Исправления (файл nn-corrections.jsonl) остаются — можно дообучить заново."
+            : "Сейчас и так встроенные веса. Пользовательского файла нет."
+        alert.addButton(withTitle: "Отмена")
+        alert.addButton(withTitle: "Сбросить")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            net.resetToBase()
+            print("[nn] сброс к базовым весам: \(net.source)")
+        }
+    }
+
+    private func info(_ title: String, _ text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+
     // MARK: - Обновления
 
     private var updateItem: NSMenuItem!
@@ -832,6 +1041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Если уже свапнул — тоггл туда-обратно.
 
         \(b(.swapSelection)) — переключить ВЫДЕЛЕННЫЙ мышкой текст
+        \(b(.swapSelectionLetters)) — то же, но только буквы: знаки и цифры не трогаются (формулы, код)
             Работает с любым текстом, без проверки словарей.
 
         \(b(.swapAndLearn)) — переключить И ЗАПОМНИТЬ

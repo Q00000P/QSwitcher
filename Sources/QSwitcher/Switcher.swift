@@ -170,6 +170,8 @@ final class Switcher {
     private var shiftDuringHold = false
 
     private var pendingExplicitLearn = false
+    /// Хоткей «свап и жёсткое правило»: кроме профиля пишется правило без контекста.
+    private var pendingHardRule = false
 
     private var consecutiveConversions = 0
     private var lastConversionTarget: InputSource.Lang?
@@ -193,6 +195,31 @@ final class Switcher {
 
     /// История последних N набранных слов для определения контекста (RU vs EN).
     private var wordHistory: [String] = []
+    /// Параллельно wordHistory: вхождение пришпилено — root-решение человека
+    /// (ручной свап, тоггл) или структурный keep (формула/список). Ретроцепочка и
+    /// любая автоматика такое вхождение не трогают. На следующие вводы того же
+    /// слова не распространяется — это не правило.
+    private var wordPinned: [Bool] = []
+    /// Символ, которым закончилось предыдущее слово (для структурного правила).
+    private var lastTrigger: String = ""
+    /// После навигации стрелками до первого пробела: не видим, что вокруг курсора.
+    private var editingBlind = false
+    /// Тема окна: последние принятые слова по приложению (для семантики).
+    /// Не синкается, живёт в памяти; ~40 слов хватает на «о чём разговор».
+    private var topicWords: [String: [String]] = [:]
+
+    private func noteTopic(_ word: String, app: String?) {
+        let key = app ?? "?"
+        var arr = topicWords[key] ?? []
+        arr.append(word)
+        if arr.count > 40 { arr.removeFirst(arr.count - 40) }
+        topicWords[key] = arr
+    }
+
+    /// Слова темы для приложения, ближайшее первым.
+    private func topicRecentFirst(app: String?) -> [String] {
+        Array((topicWords[app ?? "?"] ?? []).reversed())
+    }
     private let historyCapacity = 5
 
     private(set) var lastUserAppBundleId: String?
@@ -249,7 +276,9 @@ final class Switcher {
         lastUserAppBundleId = app.bundleIdentifier
         word.removeAll()
         droppedPrefix = ""
+        commitPendingCorrection()
         wordHistory.removeAll()
+        wordPinned.removeAll()
         lastSwitch = nil
         lastCompletedWord = nil
     }
@@ -568,8 +597,20 @@ final class Switcher {
                 // Сети — три последних слова как они на экране (ближайшее первым)
                 // и приложение, где идёт ввод.
                 let recentWords = Array(wordHistory.suffix(3).reversed())
-                let willSwitch = Detector.shouldSwitch(word: text, currentLang: cur, context: context,
-                                                       history: recentWords, app: focusApp ?? lastUserAppBundleId)
+                let blind = editingBlind
+                if chars.contains(where: { $0.isWhitespace || $0.isNewline }) { editingBlind = false }
+                if blind {
+                    print("  [det] '\(text)' после навигации курсором — не видим окружения → keep")
+                }
+                let structural = !blind && isStructural(text: text, prefix: droppedPrefix, trigger: chars)
+                if structural {
+                    print("  [det] '\(text)' в формуле/списке (префикс '\(droppedPrefix)', граница '\(chars)') → keep")
+                }
+                let appId = focusApp ?? lastUserAppBundleId
+                let willSwitch = !structural && !blind
+                    && Detector.shouldSwitch(word: text, currentLang: cur, context: context,
+                                             history: recentWords, app: appId,
+                                             topic: topicRecentFirst(app: appId))
                 let appMark = (focusApp != nil && focusApp != frontApp)
                     ? "\(frontApp)/фокус:\(focusApp!)" : frontApp
                 print("[\(Switcher.ts())] [boundary] '\(text)' (\(cur), ctx=\(context.map { String(describing: $0) } ?? "nil"), app=\(appMark)) → \(willSwitch ? "SWITCH" : "keep")")
@@ -581,7 +622,9 @@ final class Switcher {
                     droppedPrefix = ""
                     // В истории сохраняем уже свапнутую версию
                     let swapped = Detector.shared.swap(text)
+                    commitPendingCorrection()
                     appendToHistory(swapped)
+                    lastTrigger = chars
 
                     // v4 — «tap как замок»: собираем и отправляем замену ПРЯМО
                     // ЗДЕСЬ, не выходя из callback'а. Пока он не вернулся,
@@ -608,7 +651,23 @@ final class Switcher {
                 // Не свапаем — значит раскладка верная, серия конвертаций прервана
                 consecutiveConversions = 0
                 lastConversionTarget = nil
-                appendToHistory(text)
+                appendToHistory(text, pinned: structural)
+                lastTrigger = chars
+                // Обучение на ПРИНЯТОМ: если клавиши уже известны профилю (это
+                // коллизия, которую человек правил) и слово прошло без исправления —
+                // это пример в пользу того чтения, как набрано. Но не сразу: пример
+                // фиксируется на СЛЕДУЮЩЕЙ границе, если слово не тронули; ручной
+                // свап его отменяет. Иначе автопример записывается за секунду до
+                // того, как человек это же слово исправит.
+                commitPendingCorrection()
+                commitPendingAccept()
+                // Автопример — только когда профиль сам был уверен и человек не
+                // возразил: это подтверждение решения. Если профиль молчал, а слово
+                // оставили щит или словари, учиться не на чем — иначе система
+                // закрепляет собственное молчание как истину.
+                if Config.shared.semLearnOnAccept, Detector.lastReason == "profile" {
+                    pendingAccept = (text, recentWords, appId, topicRecentFirst(app: appId).filter { $0.lowercased() != text.lowercased() })
+                }
                 lastCompletedWord = LastCompletedWord(
                     chars: text,
                     triggerKeyCode: keyCode,
@@ -633,6 +692,10 @@ final class Switcher {
             droppedPrefix = ""
             lastSwitch = nil
             lastCompletedWord = nil
+            // Курсор ушёл стрелкой — возможно, внутрь слова. Что вокруг, мы не видим,
+            // поэтому до первого пробела автоматика молчит: «хотке» + ← + «й» иначе
+            // даёт «хоткеq» (одиночная буква решается как отдельное слово).
+            editingBlind = true
             return Unmanaged.passUnretained(event)
         }
 
@@ -679,11 +742,34 @@ final class Switcher {
     }
 
     /// Добавить слово в историю и обрезать до capacity.
-    private func appendToHistory(_ word: String) {
+    private func appendToHistory(_ word: String, pinned: Bool = false) {
         wordHistory.append(word)
+        wordPinned.append(pinned)
+        noteTopic(word, app: lastUserAppBundleId)
         if wordHistory.count > historyCapacity {
             wordHistory.removeFirst()
+            wordPinned.removeFirst()
         }
+    }
+
+    private func isPinned(_ idx: Int) -> Bool {
+        idx >= 0 && idx < wordPinned.count && wordPinned[idx]
+    }
+
+    /// Токен ≤2 букв внутри формулы/кода/нумерации (A=B-C, a), x2, C:) — не проза,
+    /// в обе стороны не трогаем. Смотрим на префикс, символ-границу и на то, чем
+    /// закончилось предыдущее слово.
+    private static let structureChars: Set<Character> = Set("=+-*/\\()[]{}<>|&^%$#@~:;_")
+    private func isStructural(text: String, prefix: String, trigger: String) -> Bool {
+        guard text.filter({ $0.isLetter }).count <= 2 else { return false }
+        func isStruct(_ s: String) -> Bool {
+            guard let c = s.first else { return false }
+            return Switcher.structureChars.contains(c) || c.isNumber
+        }
+        if !prefix.isEmpty { return true }          // 'x2', '3a'
+        if isStruct(trigger) { return true }        // 'A=', 'a)', 'C:'
+        if isStruct(lastTrigger) { return true }    // '=B', '-C'
+        return false
     }
 
     /// Привести историю в соответствие с тем что РЕАЛЬНО на экране после ручного свапа.
@@ -695,7 +781,9 @@ final class Switcher {
     ///
     /// text — то что теперь на экране (может быть несколько слов, например при свапе
     /// выделенной фразы). Заменяем хвост истории на слова из него.
-    private func syncHistoryTail(with text: String) {
+    /// Все вызовы — после ручных действий, поэтому слова пришпиливаются:
+    /// это root-решение человека для данного вхождения.
+    private func syncHistoryTail(with text: String, pinned: Bool = true) {
         let words = text
             .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
             .map(String.init)
@@ -706,9 +794,10 @@ final class Switcher {
         let replaceCount = min(words.count, wordHistory.count)
         if replaceCount > 0 {
             wordHistory.removeLast(replaceCount)
+            wordPinned.removeLast(min(replaceCount, wordPinned.count))
         }
         for w in words.suffix(historyCapacity) {
-            appendToHistory(w)
+            appendToHistory(w, pinned: pinned)
         }
     }
 
@@ -997,6 +1086,55 @@ final class Switcher {
     /// Свитчер поставлен/снят с паузы хоткеем — UI перерисовать.
     var onPauseToggled: (() -> Void)?
 
+    /// Отложенное исправление (тоггл): фиксируется на следующей границе, новый тоггл перезаписывает.
+    private var pendingCorrection: (word: String, intendedRu: Bool, onScreen: String,
+                                    history: [String], topic: [String], app: String?, source: String)?
+
+    private func commitPendingCorrection() {
+        guard let c = pendingCorrection else { return }
+        pendingCorrection = nil
+        Corrections.shared.record(word: c.word, intendedRu: c.intendedRu, onScreen: c.onScreen,
+                                  history: c.history, topic: c.topic, app: c.app, source: c.source)
+    }
+
+    /// Отложенный автопример: слово, его соседи, приложение, тема (без самого слова).
+    private var pendingAccept: (word: String, history: [String], app: String?, topic: [String])?
+
+    /// Ручное действие над последним словом — автопример отменяется.
+    private func cancelPendingAccept() { pendingAccept = nil }
+
+    /// Слово пережило следующую границу без исправления — теперь это пример.
+    private func commitPendingAccept() {
+        guard let p = pendingAccept else { return }
+        pendingAccept = nil
+        noteAccepted(word: p.word, history: p.history, topic: p.topic)
+    }
+
+    /// Слово прошло без исправления — пример для профиля, если эти клавиши он уже знает.
+    private func noteAccepted(word: String, history: [String], topic: [String]) {
+        guard Config.shared.semEnabled, SemVec.shared.loaded else { return }
+        let cleaned = word.filter { $0.isLetter }
+        guard cleaned.count >= 2,
+              let keys = LayoutNet.shared.keys(for: cleaned.lowercased(), ruToEn: Detector.shared.ruToEn),
+              SemProfile.shared.knows(keys: keys) else { return }
+        let sem = SemVec.shared
+        SemProfile.shared.observe(keys: keys, text: cleaned,
+                                  topic: sem.topic(recentFirst: topic),
+                                  left: history.first.map { sem.centered($0) })
+        SemProfile.shared.journalLive(target: cleaned, left: history.first, topicRecentFirst: topic, source: "авто")
+        SemProfile.shared.save()
+    }
+
+    /// Три предыдущих слова (ближайшее первым) без самого исправляемого слова —
+    /// контекст для записи исправления.
+    private func recentHistory(excluding: [String]) -> [String] {
+        var hist = Array(wordHistory.suffix(4))
+        if let lastWord = hist.last, excluding.contains(where: { $0.lowercased() == lastWord.lowercased() }) {
+            hist.removeLast()
+        }
+        return Array(hist.suffix(3).reversed())
+    }
+
     /// Раскладка в момент ручного действия: свап выделения без букв (одни знаки)
     /// направление берёт отсюда. Снимаем на main до ухода в фон — TIS из фона нельзя.
     private var manualLang: InputSource.Lang = .en
@@ -1006,6 +1144,9 @@ final class Switcher {
     /// уже не назад. Если выделено ровно то, что мы только что выдали, возвращаем
     /// исходник (как правый Option через lastSwitch). Живёт в emitQueue.
     private var lastSelSwap: (from: String, to: String)?
+    /// Режим «только буквы»: знаки не трогаем — формула, набранная не в той
+    /// раскладке, после свапа остаётся формулой ('ф=ы-а' → 'a=s-f').
+    private var selectionLettersOnly = false
 
     private func selectionSwapText(_ text: String) -> String {
         // Сравниваем по обрезанному: клипбордный fallback может отдать текст с
@@ -1019,19 +1160,24 @@ final class Switcher {
             print("[manual-sel] обратно к исходнику: '\(text)' → '\(back)'")
             return back
         }
-        let result = Detector.shared.hardSwap(text, currentLang: manualLang)
+        let result = selectionLettersOnly
+            ? Detector.shared.hardSwapLetters(text)
+            : Detector.shared.hardSwap(text, currentLang: manualLang)
         lastSelSwap = (text, result)
-        print("[manual-sel] '\(text)' → '\(result)'")
+        print("[manual-sel\(selectionLettersOnly ? "/буквы" : "")] '\(text)' → '\(result)'")
         return result
     }
 
     /// Выполнить действие горячей клавиши (на main).
     private func dispatch(_ action: HotkeyAction) {
         manualLang = InputSource.currentLanguage()
+        cancelPendingAccept()   // человек вмешался — автопример по последнему слову не пишем
         switch action {
         case .swapWord:      handleBufferSwap(explicitLearn: false)
         case .swapAndLearn:  handleBufferSwap(explicitLearn: true)
-        case .swapSelection: handleSelectionSwap()
+        case .swapAndRule:   pendingHardRule = true; handleBufferSwap(explicitLearn: true)
+        case .swapSelection: selectionLettersOnly = false; handleSelectionSwap()
+        case .swapSelectionLetters: selectionLettersOnly = true; handleSelectionSwap()
         case .changeCase:    toggleSelectionCase()
         case .translit:      transliterateSelection()
         case .togglePause:
@@ -1071,7 +1217,7 @@ final class Switcher {
     /// независимо от длины слова.
     private func handleBufferSwap(explicitLearn: Bool = false) {
         pendingExplicitLearn = explicitLearn
-        defer { pendingExplicitLearn = false }
+        defer { pendingExplicitLearn = false; pendingHardRule = false }
         // Текущий незавершённый набор. Критерий — меняет ли его КЕЙКОДНЫЙ свап:
         // '3,3' (numpad-точка в RU) → '3.3' меняет — свапаем БУФЕР; чистое '3'
         // свап не меняет — это ХВОСТ: при свапе завершённого слова его нужно
@@ -1158,9 +1304,19 @@ final class Switcher {
         print("[manual-completed] '\(original)' → '\(translated)'")
         // Обучение — ТОЛЬКО по явной команде Shift + правый Option.
         // Обычный свап это разовое действие, а не заявка на вечное правило.
-        if pendingExplicitLearn {
-            // Учим само слово, без цифро-пунктуационного префикса
-            LearnedRules.shared.learnForce(last.chars)
+        // Явная команда учит ПРОФИЛЬ с контекстом; жёсткое правило — только если
+        // отдельным хоткеем «свап и жёсткое правило». Обычный свап учит только при
+        // semLearnOnSwap: по умолчанию он просто свапает и ничего не запоминает.
+        if pendingHardRule {
+            LearnedRules.shared.learnForce(last.chars)   // само слово, без цифро-пунктуационного префикса
+        }
+        if pendingExplicitLearn || Config.shared.semLearnOnSwap {
+            Corrections.shared.record(word: last.chars, intendedRu: Switcher.langOf(translated) == .ru,
+                                      onScreen: translated,
+                                      history: recentHistory(excluding: [original, translated]),
+                                      topic: topicRecentFirst(app: lastUserAppBundleId),
+                                      app: lastUserAppBundleId,
+                                      source: pendingExplicitLearn ? "хоткей" : "свап")
         }
     }
 
@@ -1212,6 +1368,8 @@ final class Switcher {
         var i = wordHistory.count - 2
         while i >= 0 {
             let prev = wordHistory[i]
+            // Root-решение человека или структура — не трогаем
+            guard !isPinned(i) else { break }
             // Только одиночные буквы
             guard prev.count == 1 else { break }
             let prevLow = prev.lowercased()
@@ -1435,6 +1593,15 @@ final class Switcher {
         let target: InputSource.Lang = Switcher.langOf(translated)
             ?? ((cur == .ru) ? .en : .ru)
         print("[manual] '\(original)' → '\(translated)'  (\(cur) → \(target))")
+        // Явная команда учит профиль с контекстом; обычный свап — только при semLearnOnSwap
+        if pendingExplicitLearn || Config.shared.semLearnOnSwap {
+            Corrections.shared.record(word: wordText, intendedRu: target == .ru,
+                                      onScreen: translated,
+                                      history: recentHistory(excluding: [original, translated]),
+                                      topic: topicRecentFirst(app: lastUserAppBundleId),
+                                      app: lastUserAppBundleId,
+                                      source: pendingExplicitLearn ? "хоткей" : "свап")
+        }
 
         emitBatch(erase: original.count, text: translated, switchTo: target)
 
@@ -1480,8 +1647,21 @@ final class Switcher {
         // варианта. Раньше каждое нажатие переписывало правило в противоположную
         // сторону, и в логе получалась чехарда «больше не переключаем» /
         // «впредь переключаем» подряд. Правило меняется только по явной команде.
-        if pendingExplicitLearn && last.state == .original {
+        if pendingHardRule && last.state == .original {
             LearnedRules.shared.learnStop(last.originalChars)
+        }
+        // Для профиля: что в итоге останется на экране — то и имелось в виду.
+        // Не сразу: тоггл туда-сюда в спорном месте дал бы пример на каждый щелчок,
+        // и оба чтения тянулись бы к одной точке. Пишем только конечное состояние —
+        // на следующей границе; новый щелчок перезаписывает отложенное.
+        // Учит явная команда всегда; обычный тоггл — только при semLearnOnSwap.
+        if pendingExplicitLearn || Config.shared.semLearnOnSwap {
+            pendingCorrection = (word: last.originalChars, intendedRu: Switcher.langOf(targetText) == .ru,
+                                 onScreen: targetText,
+                                 history: recentHistory(excluding: [last.originalChars, last.convertedChars]),
+                                 topic: topicRecentFirst(app: lastUserAppBundleId),
+                                 app: lastUserAppBundleId,
+                                 source: pendingExplicitLearn ? "хоткей" : "свап")
         }
 
         // История должна отражать то что теперь на экране

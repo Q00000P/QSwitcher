@@ -6,6 +6,8 @@ enum HotkeyAction: String, CaseIterable {
     case swapWord        // свап набранного / тоггл
     case swapAndLearn    // свап + правило
     case swapSelection   // свап выделенного
+    case swapSelectionLetters // свап выделенного — только буквы, знаки не трогаем (формулы)
+    case swapAndRule     // свап и ЖЁСТКОЕ правило (без контекста); по умолчанию не назначен
     case universal       // выделение если есть, иначе набранное
     case changeCase      // регистр выделенного
     case translit        // транслит выделенного
@@ -15,8 +17,10 @@ enum HotkeyAction: String, CaseIterable {
     var title: String {
         switch self {
         case .swapWord:      return "Свап слова / тоггл"
-        case .swapAndLearn:  return "Свап и запомнить"
+        case .swapAndLearn:  return "Свап и обучить профиль"
         case .swapSelection: return "Свап выделенного"
+        case .swapSelectionLetters: return "Свап выделенного — только буквы"
+        case .swapAndRule: return "Свап и жёсткое правило"
         case .universal:     return "Универсально (выделение → слово)"
         case .changeCase:    return "Регистр выделенного"
         case .translit:      return "Транслит выделенного"
@@ -150,6 +154,8 @@ final class HotkeyMap {
         .swapWord:      HotkeyBinding(keyCode: 61, isTap: true),
         .swapAndLearn:  HotkeyBinding(keyCode: 61, isTap: true, shift: true),
         .swapSelection: HotkeyBinding(keyCode: 58, isTap: true),
+        .swapSelectionLetters: HotkeyBinding(keyCode: 58, isTap: true, shift: true),
+        .swapAndRule: HotkeyBinding(),   // не назначен — назначается в настройках хоткеев
         .universal:     HotkeyBinding(keyCode: 49, shift: true, command: true),
         .changeCase:    HotkeyBinding(keyCode: 32, shift: true, control: true),
         .translit:      HotkeyBinding(keyCode: 17, shift: true, control: true),
