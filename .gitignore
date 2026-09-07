@@ -28,3 +28,5 @@ Sources/QSwitcher/Resources/qsvec.bin
 Sources/QSwitcher/Resources/qsvec-topics.json
 nn/sem/data/
 nn/sem/profile.json
+
+nn/llm/models/

@@ -38,14 +38,43 @@ def log(*a):
     print(*a, flush=True)
 
 
+def load_abbrev(path):
+    """abbrev.txt: «рф = россия страна государство» → [(сокращение, [слова])].
+    Часть БАЗЫ: у аббревиатур в текстах нет собственного смысла (в перечислениях
+    «РФ» стоит рядом с «ДНР» и «ПМР», а не со «страной»), поэтому смысл задаётся
+    явно и доучивается в векторы, чтобы это знала сборка, а не каждый пользователь."""
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().lower()
+            words = [w for w in v.lower().split() if w]
+            if k and words:
+                out.append((k, words))
+    return out
+
+
 class Corpus:
-    def __init__(self, path):
+    """Корпус плюс строки словаря аббревиатур: каждая пара повторяется repeat раз
+    как «сокращение слова…», чтобы вектор сокращения притянулся к смыслу."""
+
+    def __init__(self, path, abbrev=(), repeat=200):
         self.path = path
+        self.abbrev = list(abbrev)
+        self.repeat = repeat
 
     def __iter__(self):
         with open(self.path, encoding="utf-8") as f:
             for line in f:
                 yield line.split()
+        for _ in range(self.repeat):
+            for k, words in self.abbrev:
+                yield [k] + words
 
 
 def quantize(mat):
@@ -94,12 +123,17 @@ def main():
     ap.add_argument("--vocab", type=int, default=150_000, help="слов в экспорте (по частоте)")
     ap.add_argument("--buckets", type=int, default=200_000, help="корзин n-грамм (размер файла!)")
     ap.add_argument("--min-count", type=int, default=5)
+    ap.add_argument("--abbrev", default=os.path.join(HERE, "abbrev.txt"),
+                    help="словарь аббревиатур: «рф = россия страна государство»")
+    ap.add_argument("--abbrev-repeat", type=int, default=200, help="сколько раз повторить каждую запись")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     a = ap.parse_args()
 
     from gensim.models import FastText
     t0 = time.time()
-    corpus = Corpus(a.corpus)
+    abbrev = load_abbrev(a.abbrev)
+    corpus = Corpus(a.corpus, abbrev, a.abbrev_repeat)
+    log(f"словарь аббревиатур: {len(abbrev)} записей ×{a.abbrev_repeat}")
     log(f"обучение: dim={a.dim}, epochs={a.epochs}, buckets={a.buckets}, workers={a.workers}")
     model = FastText(vector_size=a.dim, window=5, min_count=a.min_count, sg=1, negative=10,
                      min_n=3, max_n=5, bucket=a.buckets, workers=a.workers, epochs=a.epochs)

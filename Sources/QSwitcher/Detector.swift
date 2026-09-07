@@ -196,7 +196,7 @@ final class Detector {
     static func shouldSwitch(word raw: String, currentLang: InputSource.Lang,
                              context: InputSource.Lang? = nil,
                              history: [String] = [], app: String? = nil,
-                             topic: [String] = []) -> Bool {
+                             topic: [String] = [], field: String = "") -> Bool {
         let cfg = Config.shared
         let lower = raw.lowercased()
         let layoutPunct: Set<Character> = [";", "[", "]", "'", "`", "\\", ",", "."]
@@ -230,6 +230,22 @@ final class Detector {
             print("  [det] '\(lower)' — выученное правило есть, но это коллизия из профиля → решает контекст")
         }
 
+        // Место ввода с жёстким ожиданием английского: терминал, редактор кода,
+        // адресная строка, пароль, поле команд. Кириллица здесь — почти наверняка
+        // забытая раскладка; редкие исключения закрывает root-отмена.
+        if cfg.expectsEnglish(app: app, field: field) {
+            let cyr = lower.contains { shared.isCyrillicLetter($0) }
+            let where_ = field.isEmpty ? cfg.appClass(for: app).name : field
+            if cyr {
+                Detector.lastReason = "place"
+                print("  [det] '\(raw)' кириллица в \(where_) → SWITCH (тут ждём английский)")
+                return true
+            }
+            Detector.lastReason = "place"
+            print("  [det] '\(raw)' латиница в \(where_) → keep")
+            return false
+        }
+
         // Одиночная буква — обрабатывается отдельно через контекст
         if effectiveChars.count == 1 {
             return shared.singleCharSwap(raw, context: context) != nil
@@ -237,7 +253,22 @@ final class Detector {
 
         guard effectiveChars.count >= cfg.minWordLength else { return false }
 
-        return shared.autoConvert(raw, context: context, history: history, app: app, topic: topic) != nil
+        if let r = shared.autoConvert(raw, context: context, history: history, app: app, topic: topic) {
+            _ = r
+            return true
+        }
+        // Первое слово в чате без контекста: скорее русское. Латиница, чей свап —
+        // нормальное русское слово («yt» → «не», «lf» → «да»), переключается.
+        if cfg.expectRussianInChat, history.isEmpty, cfg.appClass(for: app) == .chat,
+           lower.allSatisfy({ shared.isLatinLetter($0) }) {
+            let cand = shared.swap(lower)
+            if Dictionary.shared.ru.contains(cand) || Detector.commonShortRu.contains(cand) {
+                Detector.lastReason = "place"
+                print("  [det] '\(raw)' первое слово в чате, свап '\(cand)' — русское слово → SWITCH")
+                return true
+            }
+        }
+        return false
     }
 
     /// Свап одиночной буквы-предлога с учётом контекста.
@@ -325,9 +356,16 @@ final class Detector {
             let sem = SemVec.shared
             SemProfile.shared.clearExplain()
             let leftVec = history.first.map { sem.centered($0) }
+            // Те же клавиши уже стоят в этом предложении? Тогда их чтение — занято.
+            var used: Set<String> = []
+            for w in history where !w.isEmpty {
+                let lw = w.lowercased()
+                if LayoutNet.shared.keys(for: lw, ruToEn: ruToEn) == keys { used.insert(lw) }
+            }
             let d = SemProfile.shared.decide(keys: keys, typed: word, swapped: swap(word),
                                              topic: sem.topic(recentFirst: topic),
-                                             left: leftVec, leftWord: history.first, margin: Float(cfg.semMargin))
+                                             left: leftVec, leftWord: history.first,
+                                             usedInSentence: used, margin: Float(cfg.semMargin))
             if d == nil, SemProfile.shared.knows(keys: keys) || !SemProfile.shared.lastExplain.isEmpty {
                 // Клавиши профилю известны, но уверенности нет — так и говорим,
                 // иначе непонятно, почему «ничего не произошло».

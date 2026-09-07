@@ -31,6 +31,21 @@ enum TestRunner {
                 line = String(line[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
             }
             var words = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            // Место ввода в тесте: «@terminal ls -la» / «@chat привет» / «@address ...»
+            var app = "test", field = ""
+            if let first = words.first, first.hasPrefix("@") {
+                let tag = String(first.dropFirst()).lowercased()
+                switch tag {
+                case "terminal": app = "com.apple.terminal"
+                case "code": app = "com.microsoft.vscode"
+                case "chat": app = "ru.keepcoder.telegram"
+                case "browser": app = "com.apple.safari"
+                case "address": app = "com.apple.safari"; field = "address"
+                case "password": field = "password"
+                default: break
+                }
+                words.removeFirst()
+            }
             guard !words.isEmpty else { continue }
             var ti = words.count - 1
             for (k, w) in words.enumerated() where w.count > 2 && w.hasPrefix("*") && w.hasSuffix("*") {
@@ -50,9 +65,11 @@ enum TestRunner {
             let cur: InputSource.Lang = isRu ? .ru : .en
             print("--- \(line)")
             SemProfile.shared.clearExplain()
+            // История — всё предложение до цели (ближайшее первым): нужно и для соседа,
+            // и чтобы увидеть те же клавиши, уже занятые в этом предложении.
             let willSwitch = Detector.shouldSwitch(word: word, currentLang: cur, context: ctx,
-                                                   history: Array(before.suffix(3).reversed()),
-                                                   app: "test", topic: before.reversed())
+                                                   history: before.reversed(),
+                                                   app: app, topic: before.reversed(), field: field)
             let result = willSwitch ? Detector.shared.swap(word) : word
             var verdict = "\(line)    = \(result)"
             if let e = expect {

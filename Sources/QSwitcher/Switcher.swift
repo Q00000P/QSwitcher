@@ -596,7 +596,9 @@ final class Switcher {
                 let frontApp = lastUserAppBundleId ?? "?"
                 // Сети — три последних слова как они на экране (ближайшее первым)
                 // и приложение, где идёт ввод.
-                let recentWords = Array(wordHistory.suffix(3).reversed())
+                // Ближайшие 3 слова — сосед и контекст; дальше по истории детектор
+                // ищет те же клавиши, уже занятые в этом предложении.
+                let recentWords = Array(wordHistory.suffix(8).reversed())
                 let blind = editingBlind
                 if chars.contains(where: { $0.isWhitespace || $0.isNewline }) { editingBlind = false }
                 if blind {
@@ -610,7 +612,8 @@ final class Switcher {
                 let willSwitch = !structural && !blind
                     && Detector.shouldSwitch(word: text, currentLang: cur, context: context,
                                              history: recentWords, app: appId,
-                                             topic: topicRecentFirst(app: appId))
+                                             topic: topicRecentFirst(app: appId),
+                                             field: AXSelection.focusedFieldKindCached())
                 let appMark = (focusApp != nil && focusApp != frontApp)
                     ? "\(frontApp)/фокус:\(focusApp!)" : frontApp
                 print("[\(Switcher.ts())] [boundary] '\(text)' (\(cur), ctx=\(context.map { String(describing: $0) } ?? "nil"), app=\(appMark)) → \(willSwitch ? "SWITCH" : "keep")")

@@ -63,6 +63,15 @@ enum AXSelection {
     /// только закэшированное значение, а обновляется оно в фоне.
     private static let focusLock = NSLock()
     private static var cachedFocusApp: String?
+    /// Тип поля под курсором: "address" (адресная строка), "password", "search", "" (обычное).
+    private static var cachedFieldKind = ""
+
+    /// Мгновенно: тип поля, где стоит курсор (обновляется вместе с приложением).
+    static func focusedFieldKindCached() -> String {
+        _ = focusedAppBundleIDCached()
+        focusLock.lock(); defer { focusLock.unlock() }
+        return cachedFieldKind
+    }
     private static var focusRefreshedAt = Date.distantPast
     private static var focusRefreshInFlight = false
     private static let focusQueue = DispatchQueue(label: "local.QSwitcher.focusprobe", qos: .utility)
@@ -84,8 +93,31 @@ enum AXSelection {
     }
 
     /// Собственно запрос. Только из фоновой очереди.
+    /// Адресная строка, пароль, поиск — по роли/описанию AX-элемента. Здесь 99%
+    /// английский: домены, команды, пароли; кириллица тут — редкость, и её
+    /// закрывает root-отмена (свапнул вручную — вхождение больше не трогаем).
+    private static func fieldKind(of element: AXUIElement) -> String {
+        func attr(_ name: String) -> String {
+            var v: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, name as CFString, &v) == .success else { return "" }
+            return (v as? String) ?? ""
+        }
+        let role = attr(kAXRoleAttribute), sub = attr(kAXSubroleAttribute)
+        let desc = attr(kAXRoleDescriptionAttribute).lowercased()
+        let ident = attr("AXIdentifier").lowercased()
+        let title = attr(kAXTitleAttribute).lowercased() + " " + attr(kAXDescriptionAttribute).lowercased()
+        if role == "AXTextField" && sub == "AXSecureTextField" { return "password" }
+        let hay = desc + " " + ident + " " + title
+        if hay.contains("address") || hay.contains("адрес") || hay.contains("url") || hay.contains("location") || hay.contains("omnibox") {
+            return "address"
+        }
+        if sub == "AXSearchField" || hay.contains("search") || hay.contains("поиск") { return "search" }
+        return ""
+    }
+
     private static func refreshFocusedApp() {
         var result: String? = nil
+        var kind = ""
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, 0.1)
         var focused: CFTypeRef?
@@ -97,9 +129,11 @@ enum AXSelection {
             if AXUIElementGetPid(element, &pid) == .success {
                 result = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
             }
+            kind = fieldKind(of: element)
         }
         focusLock.lock()
         cachedFocusApp = result
+        cachedFieldKind = kind
         focusRefreshedAt = Date()
         focusRefreshInFlight = false
         focusLock.unlock()

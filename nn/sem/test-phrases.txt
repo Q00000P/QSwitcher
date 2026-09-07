@@ -18,3 +18,14 @@
 Шлюз HA => HA
 датчики HA => HA
 сервер HA => HA
+# место ввода
+@terminal ды => ls
+@terminal зштп => ping
+@terminal ls => ls
+@address пщщпдуюсщь => google.com
+@address google.com => google.com
+@chat yt => не
+@chat lf => да
+@chat ghbdtn => привет
+@chat hello => hello
+@chat rfr дела => как

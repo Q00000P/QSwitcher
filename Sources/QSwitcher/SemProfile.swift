@@ -45,6 +45,10 @@ final class SemProfile {
     static let maxExamples = 300
     static let wTopics: Float = 0.8
     static let seedWeight = 3
+    /// Штраф чтению, которое в этом же предложении уже занято теми же клавишами:
+    /// «мой сервер HA наружу идёт через IP РФ» — одно и то же сокращение дважды в
+    /// разных смыслах встречается куда чаще, чем дважды в одном.
+    static let usedPenalty: Float = 0.35
 
     private(set) var readings: [String: [String: Reading]] = [:]
     private let lock = NSLock()
@@ -216,7 +220,19 @@ final class SemProfile {
         guard sem.loaded else { return nil }
         var out: [String: Reading] = [:]
         for w in [typed.lowercased(), swapped.lowercased()] where w.count >= 2 && sem.inVocab(w) {
-            let v = sem.centered(w)
+            // Вектор сокращения сам по себе беден («рф» лежит в географии), поэтому
+            // усиливаем его ближайшими словами корпуса: «россия», «страна»,
+            // «государство» находятся сами, без ручных описаний тем.
+            var v = sem.centered(w)
+            let neighbours = SemProfile.neighbourCache(w, sem: sem)
+            if !neighbours.isEmpty {
+                var acc = v
+                for (nw, sim) in neighbours {
+                    let nv = sem.centered(nw)
+                    for j in 0..<acc.count { acc[j] += sim * nv[j] }
+                }
+                if let u = SemProfile.unit(acc) { v = u }
+            }
             var r = Reading()
             let bg = sem.background(v)
             r.examples = [Example(topic: v, left: v, weight: 1, caseKind: "lower", time: 0, bgTopic: bg, bgLeft: bg)]
@@ -227,14 +243,29 @@ final class SemProfile {
         return out.count == 2 ? out : nil
     }
 
+    /// Кэш соседей: поиск по 30k слов дорогой, а слов-чтений у человека немного.
+    private static var neighbours: [String: [(String, Float)]] = [:]
+    private static let neighbourLock = NSLock()
+    static func neighbourCache(_ word: String, sem: SemVec) -> [(String, Float)] {
+        neighbourLock.lock(); defer { neighbourLock.unlock() }
+        if let c = neighbours[word] { return c }
+        let n = sem.nearest(to: sem.centered(word))
+        neighbours[word] = n
+        if !n.isEmpty {
+            print("[sem] '\(word)' ≈ " + n.map { "\($0.0) \(String(format: "%.2f", $0.1))" }.joined(separator: ", "))
+        }
+        return n
+    }
+
     /// Оба чтения — слова корпуса (для обхода выученных правил без контекста).
     func isBaseCollision(typed: String, swapped: String) -> Bool {
         zeroShotReadings(typed: typed, swapped: swapped) != nil
     }
 
     /// Что выбрать для клавиш keys, набранных как typed. nil — уверенности нет / профиль молчит.
+    /// usedInSentence — чтения этих клавиш, уже стоящие в текущем предложении.
     func decide(keys: String, typed: String, swapped: String = "", topic: [Float], left: [Float]?, leftWord: String? = nil,
-                margin: Float) -> Decision? {
+                usedInSentence: Set<String> = [], margin: Float) -> Decision? {
         lock.lock(); var m = readings[keys]; lock.unlock()
         var zeroShot = false
         if m == nil || m!.isEmpty, !swapped.isEmpty, Config.shared.semZeroShot {
@@ -293,8 +324,13 @@ final class SemProfile {
             best = max(best, th)
             let cf = caseFit(r, tc)
             s += SemProfile.wCase * cf
+            var usedNote = ""
+            if usedInSentence.contains(text) {
+                s -= SemProfile.usedPenalty
+                usedNote = "; уже в предложении −\(String(format: "%.2f", SemProfile.usedPenalty))"
+            }
             scored.append((s, text, best,
-                           "\(text) \(String(format: "%+.2f", s)) (кач. \(String(format: "%.2f", q)); темы \(String(format: "%.2f", th)) [\(SemTopics.shared.explain(r.topics))]; центр: сосед \(String(format: "%.2f", cenL)), тема \(String(format: "%.2f", cenT)); ближ.: сосед \(String(format: "%.2f", top[0].1)), тема \(String(format: "%.2f", top[0].2)); регистр \(String(format: "%+.1f", cf)); прим. \(sims.count))"))
+                           "\(text) \(String(format: "%+.2f", s)) (кач. \(String(format: "%.2f", q)); темы \(String(format: "%.2f", th)) [\(SemTopics.shared.explain(r.topics))]; центр: сосед \(String(format: "%.2f", cenL)), тема \(String(format: "%.2f", cenT)); ближ.: сосед \(String(format: "%.2f", top[0].1)), тема \(String(format: "%.2f", top[0].2)); регистр \(String(format: "%+.1f", cf))\(usedNote); прим. \(sims.count))"))
         }
         guard !scored.isEmpty else { return nil }
         scored.sort { $0.s > $1.s }

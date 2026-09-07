@@ -161,6 +161,27 @@ final class SemVec {
         return acc / Float(bgRows.count)
     }
 
+    /// Ближайшие слова корпуса к вектору (по очищенному пространству, среди частотных).
+    /// Нужно, чтобы сокращение получило смысл своих спутников: «РФ» → «россия»,
+    /// «страна», «государство» — без ручных описаний.
+    func nearest(to unitVec: [Float], count: Int = 8, scan: Int = 30_000, minSim: Float = 0.35) -> [(String, Float)] {
+        guard loaded, unitVec.count == dim else { return [] }
+        var best: [(String, Float)] = []
+        for i in 0..<min(vocab, scan) {
+            let w = wordList[i]
+            if w.count < 3 || SemVec.stop.contains(w) { continue }
+            let sim = SemVec.cos(unitVec, centered(w))
+            if sim < minSim { continue }
+            best.append((w, sim))
+            if best.count > count * 4 {
+                best.sort { $0.1 > $1.1 }
+                best.removeLast(best.count - count)
+            }
+        }
+        best.sort { $0.1 > $1.1 }
+        return Array(best.prefix(count))
+    }
+
     /// Слово есть в словаре корпуса (не собрано из кусочков).
     func inVocab(_ word: String) -> Bool { loaded && index[word.lowercased()] != nil }
 

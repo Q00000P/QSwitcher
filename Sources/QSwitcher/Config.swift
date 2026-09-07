@@ -37,6 +37,18 @@ final class Config {
     /// Откат на случай регрессий, применяется после перезапуска.
     private(set) var engine: String = "v4"
 
+    // Ожидание языка по месту ввода. Терминал, редактор кода, адресная строка,
+    // пароль, поле команд — 99% английский: кириллицу свапаем сразу. Чат —
+    // мягкое ожидание русского для первого слова, когда контекста ещё нет.
+    /// Классы приложений с жёстким ожиданием английского.
+    private(set) var expectEnglishApps: Set<String> = ["terminal", "code"]
+    /// Типы полей с жёстким ожиданием английского (address, password, search).
+    private(set) var expectEnglishFields: Set<String> = ["address", "password"]
+    /// Bundle id (подстроки) полей команд: Spotlight, Raycast, Alfred.
+    private(set) var expectEnglishBundles: [String] = ["com.apple.spotlight", "com.raycast", "com.runningwithcrayons.alfred"]
+    /// В чате первое слово без контекста — скорее русское.
+    private(set) var expectRussianInChat: Bool = true
+
     // Семантика (nn/sem/qsvec.bin + profile.json). Меняются на лету.
     /// Включён ли профиль чтений с семантикой.
     private(set) var semEnabled: Bool = true
@@ -70,6 +82,14 @@ final class Config {
         "chat":     ["telegram", "slack", "discord", "whatsapp", "claude", "mobilesms", "messages", "mail", "zoom",
                      "skype", "teams", "viber", "signal", "max"],
     ]
+
+    /// Жёсткое ожидание английского здесь? (класс приложения, тип поля, bundle)
+    func expectsEnglish(app: String?, field: String) -> Bool {
+        if expectEnglishFields.contains(field) { return true }
+        if expectEnglishApps.contains(appClass(for: app).name) { return true }
+        if let id = app?.lowercased(), expectEnglishBundles.contains(where: { id.contains($0) }) { return true }
+        return false
+    }
 
     /// Класс приложения для сети: сначала пользовательские подстроки, потом встроенные.
     func appClass(for bundleId: String?) -> LayoutNet.AppClass {
@@ -204,6 +224,10 @@ final class Config {
             switchLayoutAfter  = json["switchLayoutAfter"]  as? Int ?? 2
             replaceStartDelayMs = json["replaceStartDelayMs"] as? Int ?? 0
             engine              = json["engine"]              as? String ?? "v4"
+            expectEnglishApps   = Set((json["expectEnglishApps"] as? [String]) ?? ["terminal", "code"])
+            expectEnglishFields = Set((json["expectEnglishFields"] as? [String]) ?? ["address", "password"])
+            expectEnglishBundles = (json["expectEnglishBundles"] as? [String]) ?? ["com.apple.spotlight", "com.raycast", "com.runningwithcrayons.alfred"]
+            expectRussianInChat = json["expectRussianInChat"] as? Bool ?? true
             semEnabled          = json["semEnabled"]          as? Bool ?? true
             semMargin           = json["semMargin"]           as? Double ?? 0.10
             semZeroShot         = json["semZeroShot"]         as? Bool ?? true
