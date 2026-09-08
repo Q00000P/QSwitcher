@@ -40,7 +40,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--train"), i + 1 < CommandLine.
     _ = Dictionary.shared
     _ = Detector.shared
     _ = NgramLM.shared
+    if CommandLine.arguments.contains("--arbiter") {
+        Arbiter.shared.syncMode = true
+        if let info = Arbiter.shared.info() { print("🤖 Арбитр: \(info)") }
+        else { print("🤖 Арбитр: сокет \(Arbiter.shared.socketPath) не отвечает — запусти nn/llm/arbiter.py и включи arbiterEnabled") }
+    }
     SemProfile.shared.rebuildIfNeeded()
+    print("🧭 Профиль: \(SemProfile.shared.readingCount) чтений")
     let rep = SemProfile.shared.train(text: text, source: "файл")
     print("обучение: \(rep.text)")
     print("профиль: \(SemProfile.shared.path.path)")
@@ -58,7 +64,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--test"), i + 1 < CommandLine.a
     _ = Dictionary.shared
     _ = Detector.shared
     _ = NgramLM.shared
+    if CommandLine.arguments.contains("--arbiter") {
+        Arbiter.shared.syncMode = true
+        if let info = Arbiter.shared.info() { print("🤖 Арбитр: \(info)") }
+        else { print("🤖 Арбитр: сокет \(Arbiter.shared.socketPath) не отвечает — запусти nn/llm/arbiter.py и включи arbiterEnabled") }
+    }
     SemProfile.shared.rebuildIfNeeded()
+    print("🧭 Профиль: \(SemProfile.shared.readingCount) чтений")
     let rep = TestRunner.run(text, verbose: false)
     if rep.total > 0 { print("\nИтого: \(rep.ok)/\(rep.total) верно") }
     exit(0)

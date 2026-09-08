@@ -195,6 +195,10 @@ final class Detector {
     /// Клавиши → чтение, которое профиль уже разрешил в текущем предложении.
     /// Сбрасывается на границе предложения (Switcher) и в начале прогона.
     static var resolvedInSentence: [String: String] = [:]
+    /// Профиль сказал «не уверен» — вопрос для LLM-арбитра (модуль «Full»).
+    /// Switcher забирает его после решения и спрашивает асинхронно.
+    static var pendingArbiter: Arbiter.Query?
+    static func takePendingArbiter() -> Arbiter.Query? { defer { pendingArbiter = nil }; return pendingArbiter }
 
     static func shouldSwitch(word raw: String, currentLang: InputSource.Lang,
                              context: InputSource.Lang? = nil,
@@ -371,6 +375,26 @@ final class Detector {
                 // Клавиши профилю известны, но уверенности нет — так и говорим,
                 // иначе непонятно, почему «ничего не произошло».
                 print("  [det] профиль знает '\(keys)', но уверенности нет: \(SemProfile.shared.lastExplain) (сосед '\(history.first ?? "—")', порог \(cfg.semMargin)) → дальше")
+                // Это ровно тот случай для LLM-арбитра. Живой ввод — асинхронно
+                // (Switcher), прогон — синхронно здесь же.
+                let q = Arbiter.Query(typed: word, swapped: swap(word),
+                                      left: Array(history.prefix(3)), topic: Array(topic.prefix(40)),
+                                      app: cfg.appClass(for: app).name)
+                if Arbiter.shared.syncMode, Arbiter.shared.available {
+                    if let a = Arbiter.shared.ask(q, timeoutMs: 5000) {
+                        let verdict = a.reading.map { "'\($0)'" } ?? "молчит"
+                        print("  [det] арбитр → \(verdict) p=\(String(format: "%.2f", a.p)) \(a.ms) мс (\(a.raw))")
+                        if let r = a.reading, a.p >= cfg.arbiterThreshold {
+                            Detector.lastReason = "arbiter"
+                            if r.lowercased() == swap(word).lowercased() { return swap(word) }
+                            if r.lowercased() == lower { return nil }
+                        }
+                    } else {
+                        print("  [det] арбитр не ответил")
+                    }
+                } else if cfg.arbiterEnabled {
+                    Detector.pendingArbiter = q
+                }
             }
             if let d = d {
                 let candidate = swap(word)

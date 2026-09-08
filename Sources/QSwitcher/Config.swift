@@ -53,6 +53,12 @@ final class Config {
     /// Включён ли профиль чтений с семантикой.
     /// N-граммы языка (nn/ngram/qsngram.bin): сигнал по соседу для коротких слов
     /// и первого слова без контекста. Меняются на лету.
+    // LLM-арбитр (модуль «Full», nn/llm/arbiter.py). Спрашивается только при
+    // «не уверен» профиля; сокета нет — модуль просто отсутствует.
+    private(set) var arbiterEnabled: Bool = false
+    private(set) var arbiterSocket: String = ""          // пусто = App Support/QSwitcher/arbiter.sock
+    private(set) var arbiterTimeoutMs: Int = 400          // живой ввод: дольше — ответ уже никому не нужен
+    private(set) var arbiterThreshold: Double = 0.99      // p ниже — молчим
     private(set) var ngramEnabled: Bool = true
     /// Минимальный разрыв −logP между чтениями, чтобы решать (иначе молчим).
     private(set) var ngramMargin: Double = 0.6
@@ -194,6 +200,11 @@ final class Config {
         }
     }
 
+    func setArbiterEnabled(_ flag: Bool) {
+        arbiterEnabled = flag
+        patchOnDisk { $0["arbiterEnabled"] = flag }
+    }
+
     func addStopWord(_ word: String) {
         let w = word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !w.isEmpty else { return }
@@ -248,6 +259,10 @@ final class Config {
             expectEnglishFields = Set((json["expectEnglishFields"] as? [String]) ?? ["address", "password"])
             expectEnglishBundles = (json["expectEnglishBundles"] as? [String]) ?? ["com.apple.spotlight", "com.raycast", "com.runningwithcrayons.alfred"]
             expectRussianInChat = json["expectRussianInChat"] as? Bool ?? true
+            arbiterEnabled      = json["arbiterEnabled"]      as? Bool ?? false
+            arbiterSocket       = json["arbiterSocket"]       as? String ?? ""
+            arbiterTimeoutMs    = json["arbiterTimeoutMs"]    as? Int ?? 400
+            arbiterThreshold    = json["arbiterThreshold"]    as? Double ?? 0.99
             ngramEnabled        = json["ngramEnabled"]        as? Bool ?? true
             ngramMargin         = json["ngramMargin"]         as? Double ?? 0.6
             semEnabled          = json["semEnabled"]          as? Bool ?? true

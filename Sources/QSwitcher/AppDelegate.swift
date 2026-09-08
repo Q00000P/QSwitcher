@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var forceWordsMenuItem: NSMenuItem!
     private var excludedAppsMenuItem: NSMenuItem!
     private var englishItem: NSMenuItem!
+    private var arbiterItem: NSMenuItem!
     private var englishAppsMenuItem: NSMenuItem!
     private var infoItem: NSMenuItem!
     private var logSubmenuItem: NSMenuItem!
@@ -244,6 +245,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         topics.target = self
         menu.addItem(topics)
 
+        arbiterItem = NSMenuItem(title: "Арбитр (LLM)", action: #selector(toggleArbiter), keyEquivalent: "")
+        arbiterItem.target = self
+        menu.addItem(arbiterItem)
+
         let runTests = NSMenuItem(title: "Профиль: прогон…", action: #selector(runProfileTests), keyEquivalent: "")
         runTests.target = self
         menu.addItem(runTests)
@@ -298,6 +303,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             excludeItem.title = "Исключить текущее приложение"
             excludeItem.isEnabled = false
+        }
+
+        // Арбитр: состояние и модель (info — быстрый запрос по сокету; сокета нет — «не запущен»)
+        arbiterItem.state = cfg.arbiterEnabled ? .on : .off
+        if cfg.arbiterEnabled {
+            arbiterItem.title = "Арбитр (LLM): " + (Arbiter.shared.info() ?? "процесс не запущен")
+        } else {
+            arbiterItem.title = "Арбитр (LLM): выключен"
         }
 
         // Английский ввод: текущее приложение
@@ -409,6 +422,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleExcludeCurrentApp() {
         guard let bid = switcher?.lastUserAppBundleId else { return }
         Config.shared.toggleExcludedApp(bid)
+        refreshDynamicMenuItems()
+    }
+
+    @objc private func toggleArbiter() {
+        Config.shared.setArbiterEnabled(!Config.shared.arbiterEnabled)
         refreshDynamicMenuItems()
     }
 

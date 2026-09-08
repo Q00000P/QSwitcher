@@ -84,7 +84,17 @@ final class SemProfile {
 
     func load() {
         guard let data = try? Data(contentsOf: path),
-              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            // profile.json нет или битый, а журнал есть — профиль надо собрать заново.
+            // Раньше здесь был молчаливый выход: удалил файл — и профиль пуст навсегда,
+            // при этом в логе ни строчки, почему всё вдруг «разучилось».
+            if let j = try? String(contentsOf: journalPath, encoding: .utf8),
+               j.contains(where: { !$0.isWhitespace }) {
+                needsRebuild = true
+                print("🧭 Профиль: файла нет, пересоберу из журнала после старта")
+            }
+            return
+        }
         guard (d["format"] as? Int ?? 1) >= 2 else {
             // Старый формат (центроиды): пересобрать из журнала, но НЕ здесь — load()
             // идёт из инициализации синглтонов, а пересборка лезет в Detector, который
@@ -402,6 +412,12 @@ final class SemProfile {
             // «#тема HA: home assistant умный дом датчики шлюз [3]» — готовое облако чтения без примеров
             if let m = raw.range(of: #"^\s*#тема\s+(\S+)\s*:\s*(.+)$"#, options: .regularExpression) {
                 var body = String(raw[m]).replacingOccurrences(of: #"^\s*#тема\s+"#, with: "", options: .regularExpression)
+                // В журнале у строки в хвосте «  # файл 08.09 02:25» — это пометка
+                // источника, а не слова темы. Иначе при пересборке в облако чтения
+                // попадают «файл» и дата.
+                if let c = body.range(of: #"\s+#\s*(файл|свап|правка|текст)\b.*$"#, options: .regularExpression) {
+                    body = String(body[..<c.lowerBound])
+                }
                 var weight = SemProfile.seedWeight
                 if let wm = body.range(of: #"\[\s*(\d+)\s*\]\s*$"#, options: .regularExpression) {
                     weight = Int(body[wm].filter { $0.isNumber }) ?? weight

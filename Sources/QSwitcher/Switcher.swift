@@ -682,6 +682,12 @@ final class Switcher {
                 )
                 word.removeAll()
                 droppedPrefix = ""
+                // Профиль не уверен, модуль «Full» подключён — спрашиваем арбитра
+                // в фоне. Хук уже отдал слово как есть; ответ через десятки мс
+                // применится ретро-заменой, если человек не набрал дальше.
+                if let q = Detector.takePendingArbiter(), Arbiter.shared.available {
+                    askArbiter(q, typed: text)
+                }
             }
             lastSwitch = nil
             return Unmanaged.passUnretained(event)
@@ -1327,6 +1333,41 @@ final class Switcher {
                                       topic: topicRecentFirst(app: lastUserAppBundleId),
                                       app: lastUserAppBundleId,
                                       source: pendingExplicitLearn ? "хоткей" : "свап")
+        }
+    }
+
+    /// Ответ LLM-арбитра: слово уже на экране с границей после него. Меняем,
+    /// только если человек с тех пор ничего не набрал — иначе поздно, и мы
+    /// честно пишем это в лог, а не портим текст.
+    private func askArbiter(_ q: Arbiter.Query, typed: String) {
+        let t0 = Date()
+        Arbiter.shared.askAsync(q) { [weak self] answer in
+            guard let self = self else { return }
+            let wait = Int(Date().timeIntervalSince(t0) * 1000)
+            guard let a = answer else { print("[arbiter] '\(typed)' — нет ответа за \(wait) мс"); return }
+            let verdict = a.reading.map { "'\($0)'" } ?? "молчит"
+            print("[arbiter] '\(typed)' → \(verdict) p=\(String(format: "%.2f", a.p)) \(a.ms) мс (всего \(wait)) [\(a.raw)]")
+            guard let r = a.reading, a.p >= Config.shared.arbiterThreshold,
+                  r.lowercased() != typed.lowercased() else { return }
+            DispatchQueue.main.async {
+                guard let last = self.lastCompletedWord, last.chars == typed, self.word.isEmpty else {
+                    print("[arbiter] опоздал — дальше уже набрано, '\(typed)' не трогаем")
+                    return
+                }
+                let original = last.prefix + last.chars
+                let translated = last.prefix + r
+                let triggerCount = (last.triggerKeyCode != 0) ? 1 : 0
+                self.emitBatch(erase: original.count + triggerCount, text: translated,
+                               triggerKey: triggerCount > 0 ? last.triggerKeyCode : 0,
+                               tail: "", switchTo: nil)
+                self.syncHistoryTail(with: translated, pinned: false)
+                self.lastSwitch = LastSwitch(originalChars: original, convertedChars: translated,
+                                             triggerKeyCode: last.triggerKeyCode, state: .converted,
+                                             wasAutomatic: true)
+                self.lastCompletedWord = nil
+                self.playSound(.convertOnly)
+                print("[arbiter] '\(original)' → '\(translated)'")
+            }
         }
     }
 
