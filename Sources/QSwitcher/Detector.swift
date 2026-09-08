@@ -192,6 +192,9 @@ final class Detector {
     /// Чем решилось последнее слово: "config" / "learned" — мимо профиля по правилу
     /// (на таком автопримеры не пишем), иначе пусто.
     static var lastReason = ""
+    /// Клавиши → чтение, которое профиль уже разрешил в текущем предложении.
+    /// Сбрасывается на границе предложения (Switcher) и в начале прогона.
+    static var resolvedInSentence: [String: String] = [:]
 
     static func shouldSwitch(word raw: String, currentLang: InputSource.Lang,
                              context: InputSource.Lang? = nil,
@@ -356,12 +359,10 @@ final class Detector {
             let sem = SemVec.shared
             SemProfile.shared.clearExplain()
             let leftVec = history.first.map { sem.centered($0) }
-            // Те же клавиши уже стоят в этом предложении? Тогда их чтение — занято.
-            var used: Set<String> = []
-            for w in history where !w.isEmpty {
-                let lw = w.lowercased()
-                if LayoutNet.shared.keys(for: lw, ruToEn: ruToEn) == keys { used.insert(lw) }
-            }
+            // Правила «второе вхождение тех же клавиш читается иначе» больше нет:
+            // в живом тексте «РФ» повторяется десять раз подряд, и правило
+            // честно чередовало РФ/HA по списку без точек.
+            let used: Set<String> = []
             let d = SemProfile.shared.decide(keys: keys, typed: word, swapped: swap(word),
                                              topic: sem.topic(recentFirst: topic),
                                              left: leftVec, leftWord: history.first,
@@ -385,6 +386,35 @@ final class Detector {
                     return candidate
                 }
                 print("  [det] профиль \(d.explain) — чтение не совпало ни с '\(lower)', ни с '\(candidate)', пропускаю")
+            }
+        }
+
+        // (0.9) N-граммы языка: «xnj» в английском корпусе нет, «что» — одно из
+        // самых частых русских слов → свап первого слова без всякого контекста;
+        // «ns» после «что» → пара «что ты» есть, «ns» нет → свап. Закрывает то,
+        // где семантика слепа (двухбуквенные, первое слово), и стоит до щита —
+        // иначе первая ошибка («Xnj» = латиница) отравляет контекст следующему.
+        // Капс-аббревиатуры (РФ, HA, US, ТД) — не для n-грамм: в корпусе их нет,
+        // а решение по ним — профиль и правила.
+        let isCapsAbbrev = word.count <= 4 && word == word.uppercased() && word != word.lowercased()
+        if cfg.ngramEnabled, NgramLM.shared.loaded, lower.count >= 2, !isCapsAbbrev,
+           lower.allSatisfy({ $0.isLetter }) {
+            let candidate = swap(word)
+            let left = history.first(where: { !$0.isEmpty })
+            if let (win, explain) = NgramLM.shared.decide(typed: lower, swapped: candidate.lowercased(),
+                                                          left: left, margin: Float(cfg.ngramMargin)) {
+                Detector.lastReason = "ngram"
+                if win == lower {
+                    print("  [det] n-грамм \(explain) (сосед '\(left ?? "—")') → keep")
+                    return nil
+                }
+                print("  [det] n-грамм \(explain) (сосед '\(left ?? "—")') → SWAP к '\(candidate)'")
+                return candidate
+            } else if cfg.nnMode != "arbiter" {
+                // Молчим — но объяснение полезно в прогоне.
+                let (a, _) = NgramLM.shared.cost(lower, left: left)
+                let (b, _) = NgramLM.shared.cost(candidate.lowercased(), left: left)
+                print("  [det] n-грамм '\(lower)' \(String(format: "%.1f", a)) vs '\(candidate.lowercased())' \(String(format: "%.1f", b)) — разрыв мал → дальше")
             }
         }
 

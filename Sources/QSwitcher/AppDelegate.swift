@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var stopWordsMenuItem: NSMenuItem!
     private var forceWordsMenuItem: NSMenuItem!
     private var excludedAppsMenuItem: NSMenuItem!
+    private var englishItem: NSMenuItem!
+    private var englishAppsMenuItem: NSMenuItem!
     private var infoItem: NSMenuItem!
     private var logSubmenuItem: NSMenuItem!
 
@@ -164,6 +166,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         excludedAppsMenuItem.submenu = NSMenu()
         menu.addItem(excludedAppsMenuItem)
 
+        // Приложения, где ждём английский: кириллица свапается сразу, латиница не
+        // трогается. Терминалы и редакторы кода сюда попадают классом, остальное —
+        // этим списком (ИИ-окна, мессенджеры, что угодно).
+        englishItem = NSMenuItem(title: "Английский ввод: текущее приложение",
+                                 action: #selector(toggleEnglishCurrentApp), keyEquivalent: "")
+        englishItem.target = self
+        menu.addItem(englishItem)
+
+        englishAppsMenuItem = NSMenuItem(title: "Приложения с английским вводом", action: nil, keyEquivalent: "")
+        englishAppsMenuItem.submenu = NSMenu()
+        menu.addItem(englishAppsMenuItem)
+
         menu.addItem(NSMenuItem.separator())
 
         stopWordsMenuItem = NSMenuItem(title: "Стоп-слова (никогда не переключать)", action: nil, keyEquivalent: "")
@@ -286,6 +300,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             excludeItem.isEnabled = false
         }
 
+        // Английский ввод: текущее приложение
+        if let id = bid {
+            let on = cfg.expectEnglishBundles.contains(id.lowercased())
+            englishItem.title = on ? "Английский ввод — убрать: \(id)" : "Английский ввод: \(id)"
+            englishItem.isEnabled = true
+        } else {
+            englishItem.title = "Английский ввод: текущее приложение"
+            englishItem.isEnabled = false
+        }
+        let englishMenu = englishAppsMenuItem.submenu!
+        englishMenu.removeAllItems()
+        let classes = cfg.expectEnglishApps.sorted().joined(separator: ", ")
+        let note = NSMenuItem(title: "По классу: \(classes) (config.json → expectEnglishApps)", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        englishMenu.addItem(note)
+        if cfg.expectEnglishBundles.isEmpty {
+            let empty = NSMenuItem(title: "(список пуст)", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            englishMenu.addItem(empty)
+        } else {
+            for app in cfg.expectEnglishBundles.sorted() {
+                let item = NSMenuItem(title: "\(app)    ✕", action: #selector(removeEnglishApp(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = app
+                item.toolTip = "Клик — убрать из списка"
+                englishMenu.addItem(item)
+            }
+        }
+        englishAppsMenuItem.title = "Приложения с английским вводом (\(cfg.expectEnglishBundles.count))"
+
         // Подменю исключённых приложений
         let excludedMenu = excludedAppsMenuItem.submenu!
         excludedMenu.removeAllItems()
@@ -365,6 +409,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleExcludeCurrentApp() {
         guard let bid = switcher?.lastUserAppBundleId else { return }
         Config.shared.toggleExcludedApp(bid)
+        refreshDynamicMenuItems()
+    }
+
+    @objc private func toggleEnglishCurrentApp() {
+        guard let bid = switcher?.lastUserAppBundleId else { return }
+        Config.shared.toggleExpectEnglishApp(bid)
+        refreshDynamicMenuItems()
+    }
+
+    @objc private func removeEnglishApp(_ sender: NSMenuItem) {
+        guard let bid = sender.representedObject as? String else { return }
+        Config.shared.toggleExpectEnglishApp(bid)
         refreshDynamicMenuItems()
     }
 

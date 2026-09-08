@@ -96,7 +96,7 @@ enum AXSelection {
     /// Адресная строка, пароль, поиск — по роли/описанию AX-элемента. Здесь 99%
     /// английский: домены, команды, пароли; кириллица тут — редкость, и её
     /// закрывает root-отмена (свапнул вручную — вхождение больше не трогаем).
-    private static func fieldKind(of element: AXUIElement) -> String {
+    private static func fieldKind(of element: AXUIElement, app: String?) -> String {
         func attr(_ name: String) -> String {
             var v: CFTypeRef?
             guard AXUIElementCopyAttributeValue(element, name as CFString, &v) == .success else { return "" }
@@ -112,6 +112,25 @@ enum AXSelection {
             return "address"
         }
         if sub == "AXSearchField" || hay.contains("search") || hay.contains("поиск") { return "search" }
+        // Описания AX локализованы и у каждого движка свои (Chrome, Firefox, Edge,
+        // Opera, Comet), поэтому главный признак — структурный: поле ввода, у
+        // которого среди предков есть панель инструментов и НЕТ области
+        // веб-страницы, — это адресная строка браузера. Работает на любом языке
+        // системы и на любом движке; поля на самой странице сюда не попадают.
+        let fieldish = role == "AXTextField" || role == "AXComboBox" || role == "AXTextArea"
+        guard fieldish, Config.shared.appClass(for: app).name == "browser" else { return "" }
+        var node = element
+        for _ in 0..<8 {
+            var parent: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(node, kAXParentAttribute as CFString, &parent) == .success,
+                  let p = parent else { return "" }
+            node = p as! AXUIElement
+            var rv: CFTypeRef?
+            let r = AXUIElementCopyAttributeValue(node, kAXRoleAttribute as CFString, &rv) == .success
+                ? (rv as? String) ?? "" : ""
+            if r == "AXWebArea" || r == "AXScrollArea" { return "" }   // поле на странице
+            if r == "AXToolbar" { return "address" }
+        }
         return ""
     }
 
@@ -129,7 +148,7 @@ enum AXSelection {
             if AXUIElementGetPid(element, &pid) == .success {
                 result = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
             }
-            kind = fieldKind(of: element)
+            kind = fieldKind(of: element, app: result)
         }
         focusLock.lock()
         cachedFocusApp = result

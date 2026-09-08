@@ -30,6 +30,7 @@ enum TestRunner {
                 expect = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
                 line = String(line[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
             }
+            Detector.resolvedInSentence.removeAll()
             var words = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
             // Место ввода в тесте: «@terminal ls -la» / «@chat привет» / «@address ...»
             var app = "test", field = ""

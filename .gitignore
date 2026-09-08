@@ -30,3 +30,5 @@ nn/sem/data/
 nn/sem/profile.json
 
 nn/llm/models/
+Sources/QSwitcher/Resources/qsngram.bin
+nn/ngram/qsngram.bin

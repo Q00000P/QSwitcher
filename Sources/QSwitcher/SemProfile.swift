@@ -23,6 +23,8 @@ final class SemProfile {
 
     struct Reading {
         var examples: [Example] = []
+        /// Чтение задано строкой «#тема» — человек сказал прямо, качеством не гасим.
+        var seeded = false
         var topics: [Float]? = nil      // гистограмма тем (масса = вес примеров)
         var cases: [String: Int] = [:]
         var count = 0
@@ -48,7 +50,7 @@ final class SemProfile {
     /// Штраф чтению, которое в этом же предложении уже занято теми же клавишами:
     /// «мой сервер HA наружу идёт через IP РФ» — одно и то же сокращение дважды в
     /// разных смыслах встречается куда чаще, чем дважды в одном.
-    static let usedPenalty: Float = 0.35
+    static let usedPenalty: Float = 0   // правило снято (wave44), параметр оставлен для совместимости
 
     private(set) var readings: [String: [String: Reading]] = [:]
     private let lock = NSLock()
@@ -95,7 +97,8 @@ final class SemProfile {
         for (keys, rs) in (d["readings"] as? [String: [String: [String: Any]]]) ?? [:] {
             var m: [String: Reading] = [:]
             for (text, r) in rs {
-                var rd = Reading(topics: (r["tp"] as? [NSNumber])?.map { $0.floatValue },
+                var rd = Reading(seeded: (r["sd"] as? Bool) ?? false,
+                                 topics: (r["tp"] as? [NSNumber])?.map { $0.floatValue },
                                  cases: (r["case"] as? [String: Int]) ?? [:],
                                  count: r["count"] as? Int ?? 0, updated: r["updated"] as? Int ?? 0)
                 for e in (r["ex"] as? [[Any]]) ?? [] where e.count >= 5 {
@@ -122,7 +125,7 @@ final class SemProfile {
             var mm: [String: Any] = [:]
             for (text, r) in m {
                 let ex: [[Any]] = r.examples.map { [rd($0.topic), $0.left.map(rd) ?? NSNull(), $0.weight, $0.caseKind, $0.time] }
-                mm[text] = ["ex": ex, "tp": r.topics.map(rd) ?? NSNull(), "case": r.cases,
+                mm[text] = ["ex": ex, "sd": r.seeded, "tp": r.topics.map(rd) ?? NSNull(), "case": r.cases,
                             "count": r.count, "updated": r.updated] as [String: Any]
             }
             rs[keys] = mm
@@ -161,7 +164,7 @@ final class SemProfile {
     }
 
     /// Пользователь выбрал чтение text для клавиш keys в этом контексте.
-    func observe(keys: String, text: String, topic: [Float], left: [Float]?, weight: Int = 1) {
+    func observe(keys: String, text: String, topic: [Float], left: [Float]?, weight: Int = 1, seeded: Bool = false) {
         guard SemVec.shared.loaded else { return }
         let t = SemProfile.unit(topic), l = SemProfile.unit(left)
         guard t != nil || l != nil else { return }
@@ -170,6 +173,7 @@ final class SemProfile {
         var m = readings[keys] ?? [:]
         let key = text.lowercased()
         var r = m[key] ?? Reading()
+        if seeded { r.seeded = true }
         let w = max(1, weight)
         let c = SemProfile.caseOf(text)
         r.examples.append(Example(topic: t ?? [Float](repeating: 0, count: SemVec.shared.dim), left: l,
@@ -313,7 +317,10 @@ final class SemProfile {
             // Качество чтения — острота его тем. У обломка («ha» = «ха-ха», «jin») темы
             // плоские, и все его сходства — шум; гасим их. У слова и у чтения с «#тема»
             // гистограмма острая — полный вес. Пол 0.15, чтобы совсем не обнулять.
-            let q = max(0.15, min(1, SemTopics.sharpness(r.topics) * 3))
+            // Качество — защита от обломочных токенов («ha» = «ха-ха», «jin»). Но если
+            // чтение задано строкой «#тема», человек сказал прямо, что это за слово, —
+            // гасить его собственным же описанием нельзя.
+            let q = r.seeded ? 1 : max(0.15, min(1, SemTopics.sharpness(r.topics) * 3))
             var s = (knn + cen) / 2 * q
             var best = max(top.map { max($0.1, $0.2) }.max() ?? 0, max(cenL, cenT)) * q
             // Темы: обобщение по осмысленным осям — «шлюхи» к «людям/стране», «шлюз» к «сети»
@@ -406,7 +413,7 @@ final class SemProfile {
                 let words = parts[1].split(whereSeparator: { !$0.isLetter }).map(String.init).filter { !$0.isEmpty }
                 guard let keys = LayoutNet.shared.keys(for: reading.lowercased(), ruToEn: Detector.shared.ruToEn),
                       keys.count >= 2, !words.isEmpty else { continue }
-                observe(keys: keys, text: reading, topic: sem.topic(recentFirst: words.reversed()), left: nil, weight: weight)
+                observe(keys: keys, text: reading, topic: sem.topic(recentFirst: words.reversed()), left: nil, weight: weight, seeded: true)
                 if journal { journalAppendRaw(raw.trimmingCharacters(in: .whitespaces), source: source) }
                 rep.lines += 1; rep.examples += weight; rep.touched.insert(keys)
                 continue

@@ -279,6 +279,7 @@ final class Switcher {
         commitPendingCorrection()
         wordHistory.removeAll()
         wordPinned.removeAll()
+        Detector.resolvedInSentence.removeAll()
         lastSwitch = nil
         lastCompletedWord = nil
     }
@@ -577,6 +578,7 @@ final class Switcher {
             (isPunctuation(chars) && !isLayoutPunct && !isShiftedDigitInNumericRun)
 
         if isWordEnd {
+            if keyCode == 36 || keyCode == 76 { Detector.resolvedInSentence.removeAll() }   // Enter — конец предложения
             if !word.isEmpty {
                 let text = word.map { $0.chars }.joined()
                 let cur = InputSource.currentLanguage()
@@ -746,6 +748,11 @@ final class Switcher {
 
     /// Добавить слово в историю и обрезать до capacity.
     private func appendToHistory(_ word: String, pinned: Bool = false) {
+        // Конец предложения — разрешённые коллизии больше не действуют:
+        // «сервер HA. IP РФ» — разные предложения, второе решается заново.
+        if let last = word.last, last == "." || last == "!" || last == "?" || last == "\n" {
+            Detector.resolvedInSentence.removeAll()
+        }
         wordHistory.append(word)
         wordPinned.append(pinned)
         noteTopic(word, app: lastUserAppBundleId)

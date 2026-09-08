@@ -51,6 +51,11 @@ final class Config {
 
     // Семантика (nn/sem/qsvec.bin + profile.json). Меняются на лету.
     /// Включён ли профиль чтений с семантикой.
+    /// N-граммы языка (nn/ngram/qsngram.bin): сигнал по соседу для коротких слов
+    /// и первого слова без контекста. Меняются на лету.
+    private(set) var ngramEnabled: Bool = true
+    /// Минимальный разрыв −logP между чтениями, чтобы решать (иначе молчим).
+    private(set) var ngramMargin: Double = 0.6
     private(set) var semEnabled: Bool = true
     /// Отрыв лидера, ниже которого профиль не вмешивается.
     private(set) var semMargin: Double = 0.10
@@ -78,7 +83,9 @@ final class Config {
     private static let builtinAppClasses: [String: [String]] = [
         "terminal": ["com.apple.terminal", "iterm", "qterm", "alacritty", "kitty", "hyper", "warp", "ghostty", "wezterm"],
         "code":     ["vscode", "xcode", "jetbrains", "sublime", "cursor", "todesktop", "zed", "nova", "bbedit", "textmate"],
-        "browser":  ["safari", "chrome", "firefox", "arc", "brave", "edge", "opera", "yandex", "vivaldi", "orion"],
+        "browser":  ["safari", "chrome", "chromium", "firefox", "arc", "brave", "edge", "microsoft-edge",
+                     "opera", "yandex", "vivaldi", "orion", "comet", "perplexity", "zen", "floorp",
+                     "librewolf", "waterfox", "duckduckgo", "thorium", "sidekick", "min"],
         "chat":     ["telegram", "slack", "discord", "whatsapp", "claude", "mobilesms", "messages", "mail", "zoom",
                      "skype", "teams", "viber", "signal", "max"],
     ]
@@ -174,6 +181,19 @@ final class Config {
         }
     }
 
+    /// Приложение с ожиданием английского (меню «Английский ввод: …»). Точный bundle id.
+    func toggleExpectEnglishApp(_ bundleId: String) {
+        let id = bundleId.lowercased()
+        if let i = expectEnglishBundles.firstIndex(of: id) {
+            expectEnglishBundles.remove(at: i)
+        } else {
+            expectEnglishBundles.append(id)
+        }
+        patchOnDisk { json in
+            json["expectEnglishBundles"] = self.expectEnglishBundles
+        }
+    }
+
     func addStopWord(_ word: String) {
         let w = word.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !w.isEmpty else { return }
@@ -228,6 +248,8 @@ final class Config {
             expectEnglishFields = Set((json["expectEnglishFields"] as? [String]) ?? ["address", "password"])
             expectEnglishBundles = (json["expectEnglishBundles"] as? [String]) ?? ["com.apple.spotlight", "com.raycast", "com.runningwithcrayons.alfred"]
             expectRussianInChat = json["expectRussianInChat"] as? Bool ?? true
+            ngramEnabled        = json["ngramEnabled"]        as? Bool ?? true
+            ngramMargin         = json["ngramMargin"]         as? Double ?? 0.6
             semEnabled          = json["semEnabled"]          as? Bool ?? true
             semMargin           = json["semMargin"]           as? Double ?? 0.10
             semZeroShot         = json["semZeroShot"]         as? Bool ?? true

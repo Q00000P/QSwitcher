@@ -39,6 +39,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--train"), i + 1 < CommandLine.
     guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { print("не читается: \(path)"); exit(2) }
     _ = Dictionary.shared
     _ = Detector.shared
+    _ = NgramLM.shared
     SemProfile.shared.rebuildIfNeeded()
     let rep = SemProfile.shared.train(text: text, source: "файл")
     print("обучение: \(rep.text)")
@@ -56,6 +57,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--test"), i + 1 < CommandLine.a
     }
     _ = Dictionary.shared
     _ = Detector.shared
+    _ = NgramLM.shared
     SemProfile.shared.rebuildIfNeeded()
     let rep = TestRunner.run(text, verbose: false)
     if rep.total > 0 { print("\nИтого: \(rep.ok)/\(rep.total) верно") }

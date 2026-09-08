@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 # от реальной версии, и то же самое попадало в отчёты о падениях.
 APP_VERSION="4.0"
 # Метка волны разработки — видна в логе запуска и в «О программе».
-APP_WAVE="wave40"
+APP_WAVE="wave44"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then
@@ -66,6 +66,14 @@ if [ -f "nn/sem/qsvec.bin" ]; then
     echo "🧭 Векторы: nn/sem/qsvec.bin ($(du -h nn/sem/qsvec.bin | cut -f1))"
 else
     echo "⚠️  nn/sem/qsvec.bin нет — семантика будет выключена"
+fi
+
+# N-граммы языка: nn/ngram/qsngram.bin (python3 nn/ngram/build.py)
+if [ -f "nn/ngram/qsngram.bin" ]; then
+    cp nn/ngram/qsngram.bin Sources/QSwitcher/Resources/qsngram.bin
+    echo "🔡 N-граммы: nn/ngram/qsngram.bin ($(du -h nn/ngram/qsngram.bin | cut -f1))"
+else
+    echo "⚠️  nn/ngram/qsngram.bin нет — n-граммы будут выключены (python3 nn/ngram/build.py)"
 fi
 
 # Если словарей нет — скачиваем
