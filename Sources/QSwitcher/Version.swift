@@ -6,7 +6,7 @@ enum AppVersion {
     static let build = BuildInfo.number
     static let buildDate = BuildInfo.date
     /// Метка волны разработки (задаётся в make-app.sh).
-    static let wave = "wave48"
+    static let wave = "wave49"
 
     static var fullString: String {
         return "QSwitcher \(version) (\(wave), билд \(build))"
@@ -15,6 +15,6 @@ enum AppVersion {
 
 /// Автогенерируется make-app.sh — не редактировать руками.
 enum BuildInfo {
-    static let number = "94"
-    static let date = "2026-09-10 04:10"
+    static let number = "95"
+    static let date = "2026-09-10 04:36"
 }

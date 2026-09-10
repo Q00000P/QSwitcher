@@ -61,10 +61,10 @@ final class Config {
     private(set) var arbiterThreshold: Double = 0.99      // p ниже — молчим
     /// Во сколько раз строже порог, когда пары «сосед → слово» нет ни у одного
     /// чтения (первое слово, редкий сосед): решать по одной частоте нельзя.
-    private(set) var ngramNoContextFactor: Double = 4.0
+    private(set) var ngramNoContextFactor: Double = 6.0
     private(set) var ngramEnabled: Bool = true
     /// Минимальный разрыв −logP между чтениями, чтобы решать (иначе молчим).
-    private(set) var ngramMargin: Double = 0.9
+    private(set) var ngramMargin: Double = 1.3
     private(set) var semEnabled: Bool = true
     /// Отрыв лидера, ниже которого профиль не вмешивается.
     private(set) var semMargin: Double = 0.10
@@ -265,10 +265,10 @@ final class Config {
             arbiterEnabled      = json["arbiterEnabled"]      as? Bool ?? false
             arbiterSocket       = json["arbiterSocket"]       as? String ?? ""
             arbiterTimeoutMs    = json["arbiterTimeoutMs"]    as? Int ?? 400
-            arbiterThreshold    = json["arbiterThreshold"]    as? Double ?? 0.99
-            ngramNoContextFactor = json["ngramNoContextFactor"] as? Double ?? 4.0
+            arbiterThreshold    = json["arbiterThreshold"]    as? Double ?? 1.39
+            ngramNoContextFactor = json["ngramNoContextFactor"] as? Double ?? 6.0
             ngramEnabled        = json["ngramEnabled"]        as? Bool ?? true
-            ngramMargin         = json["ngramMargin"]         as? Double ?? 0.9
+            ngramMargin         = json["ngramMargin"]         as? Double ?? 1.3
             semEnabled          = json["semEnabled"]          as? Bool ?? true
             semMargin           = json["semMargin"]           as? Double ?? 0.10
             semZeroShot         = json["semZeroShot"]         as? Bool ?? true
@@ -276,7 +276,7 @@ final class Config {
             semLearnOnAccept    = json["semLearnOnAccept"]    as? Bool ?? false
             nnEnabled           = json["nnEnabled"]           as? Bool ?? true
             nnThreshold         = json["nnThreshold"]         as? Double ?? 0.85
-            nnThresholdShort    = json["nnThresholdShort"]    as? Double ?? 0.95
+            nnThresholdShort    = json["nnThresholdShort"]    as? Double ?? 1.35
             nnMode              = (json["nnMode"]             as? String ?? "primary").lowercased()
             nnMinLen            = json["nnMinLen"]            as? Int ?? 3
             appClasses          = (json["appClasses"]         as? [String: [String]]) ?? [:]

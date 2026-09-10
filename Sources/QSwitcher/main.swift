@@ -47,9 +47,24 @@ if let i = CommandLine.arguments.firstIndex(of: "--train"), i + 1 < CommandLine.
     }
     SemProfile.shared.rebuildIfNeeded()
     print("🧭 Профиль: \(SemProfile.shared.readingCount) чтений")
-    let rep = SemProfile.shared.train(text: text, source: "файл")
-    print("обучение: \(rep.text)")
+    // --tag имя: группа в журнале, откатывается целиком через --forget-tag имя
+    var source = "файл"
+    if let t = CommandLine.arguments.firstIndex(of: "--tag"), t + 1 < CommandLine.arguments.count {
+        source = "файл:" + CommandLine.arguments[t + 1]
+    }
+    let rep = SemProfile.shared.train(text: text, source: source)
+    print("обучение: \(rep.text)" + (source == "файл" ? "" : "  [группа \(source.dropFirst(5))]"))
     print("профиль: \(SemProfile.shared.path.path)")
+    exit(0)
+}
+
+// === Откат группы обучения: QSwitcher --forget-tag имя ===
+if let i = CommandLine.arguments.firstIndex(of: "--forget-tag"), i + 1 < CommandLine.arguments.count {
+    setvbuf(stdout, nil, _IOLBF, 0)
+    _ = Dictionary.shared
+    _ = Detector.shared
+    let r = SemProfile.shared.forget(tag: CommandLine.arguments[i + 1])
+    print("удалено строк: \(r.removed), осталось: \(r.left); профиль: \(SemProfile.shared.readingCount) чтений")
     exit(0)
 }
 

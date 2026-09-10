@@ -475,6 +475,22 @@ final class SemProfile {
         }
     }
 
+    /// Удалить из журнала все строки группы (источник «файл:метка») и пересобрать
+    /// профиль. Эксперимент с обучением откатывается одним действием, а не грепом
+    /// по датам.
+    func forget(tag: String) -> (removed: Int, left: Int) {
+        guard let text = try? String(contentsOf: journalPath, encoding: .utf8) else { return (0, 0) }
+        let marker = "# файл:\(tag) "
+        var kept: [String] = []; var removed = 0
+        for line in text.components(separatedBy: "\n") {
+            if line.contains(marker) { removed += 1 } else { kept.append(line) }
+        }
+        try? kept.joined(separator: "\n").write(to: journalPath, atomically: true, encoding: .utf8)
+        needsRebuild = true
+        rebuildIfNeeded()
+        return (removed, kept.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count)
+    }
+
     /// Пример из живого ввода — в журнал (тема: до 10 ближних слов, дальние первыми).
     func journalLive(target: String, left: String?, topicRecentFirst: [String], source: String) {
         var words = Array(topicRecentFirst.prefix(10).reversed())
