@@ -20,6 +20,25 @@ enum TestRunner {
     }
 
     /// verbose — добавлять объяснение детектора (последнюю строку профиля) к каждой фразе.
+    /// Глушим stdout на время «тихих» решений по контекстным словам.
+    @discardableResult
+    static func silence(_ on: Bool) -> Bool {
+        struct S { static var saved: Int32 = -1; static var on = false }
+        let was = S.on
+        if on && !S.on {
+            fflush(stdout)
+            S.saved = dup(STDOUT_FILENO)
+            let devnull = open("/dev/null", O_WRONLY)
+            dup2(devnull, STDOUT_FILENO); close(devnull)
+            S.on = true
+        } else if !on && S.on {
+            fflush(stdout)
+            dup2(S.saved, STDOUT_FILENO); close(S.saved)
+            S.on = false
+        }
+        return was
+    }
+
     static func run(_ text: String, verbose: Bool = true) -> Report {
         var rep = Report()
         for raw in text.components(separatedBy: .newlines) {
@@ -53,7 +72,20 @@ enum TestRunner {
                 words[k] = String(w.dropFirst().dropLast()); ti = k
             }
             let word = words[ti]
-            let before = Array(words[..<ti])
+            // Как при живом наборе: слова ДО цели уже прошли через детектор и стоят
+            // на экране в решённом виде. Иначе «Xnj *ns* знаешь» видит соседом
+            // сырое 'Xnj', хотя живьём к моменту 'ns' на экране уже 'Что' и пара
+            // «что ты» есть. Решаем предыдущие слова по очереди, тихо.
+            var before: [String] = []
+            for w in words[..<ti] {
+                let prevIsRu = w.contains { ("а"..."я").contains($0) || ("А"..."Я").contains($0) || $0 == "ё" || $0 == "Ё" }
+                let saved = TestRunner.silence(true)
+                let sw = Detector.shouldSwitch(word: w, currentLang: prevIsRu ? .ru : .en, context: nil,
+                                               history: before.reversed(), app: app,
+                                               topic: before.reversed(), field: field)
+                TestRunner.silence(saved)
+                before.append(sw ? Detector.shared.swap(w) : w)
+            }
             var cyr = 0, lat = 0
             for w in before.suffix(3) {
                 for ch in w {

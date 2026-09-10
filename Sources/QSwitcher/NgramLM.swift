@@ -17,7 +17,11 @@ final class NgramLM {
     /// Слова нет в корпусе — хуже ЛЮБОГО настоящего слова (шкала до 25.5). С потолком 12
     /// «kubectl» (19) проигрывал несуществующему «лгиусед» — и так свапалось всё редкое.
     static let unseen: Float = 30.0
-    static let switchCost: Float = 0.7 // сосед другого алфавита
+    /// Сосед другого алфавита. ДОЛЖЕН быть меньше порога решения: иначе штраф
+    /// один, без единого свидетельства из корпуса,решает исход («сосед русский —
+    /// значит и слово русское»), и на симметричном наборе это ровно половина
+    /// ошибок. Он только склоняет чашу, когда всё остальное поровну.
+    static let switchCost: Float = 0.35
 
     private init() { load() }
 
@@ -115,7 +119,11 @@ final class NgramLM {
 
     /// −logP чтения с учётом левого соседа: пара, иначе униграмма + откат,
     /// плюс смена языка, если сосед другого алфавита. Меньше — лучше.
+    /// Свидетельство: нашлась ли пара «сосед → слово» в корпусе.
+    private(set) var lastHadBigram = false
+
     func cost(_ word: String, left: String?) -> (Float, String) {
+        lastHadBigram = false
         let lang = NgramLM.lang(of: word)
         guard !lang.isEmpty else { return (NgramLM.unseen, "нет алфавита") }
         guard let u = uni(lang, word) else { return (NgramLM.unseen, "\(lang): слова нет") }
@@ -126,7 +134,7 @@ final class NgramLM {
             c = u + NgramLM.backoff + NgramLM.switchCost
             why = String(format: "откат %.1f, смена языка +%.1f", u + NgramLM.backoff, NgramLM.switchCost)
         } else if let b = bi(lang, l, word) {
-            c = b; why = String(format: "пара %.1f", b)
+            c = b; why = String(format: "пара %.1f", b); lastHadBigram = true
         } else {
             c = u + NgramLM.backoff; why = String(format: "откат %.1f", c)
         }
@@ -144,12 +152,18 @@ final class NgramLM {
     /// термин («сломали», «kubectl») не должны превращаться в мусор только потому,
     /// что модель их не видела. «Не видели оба» — молчим.
     func decide(typed: String, swapped: String, left: String?, margin: Float) -> (String, String)? {
-        let (a, wa) = cost(typed, left: left)
-        let (b, wb) = cost(swapped, left: left)
-        let explain = String(format: "'%@' %.2f (%@) vs '%@' %.2f (%@)", typed, a, wa, swapped, b, wb)
+        let (a, wa) = cost(typed, left: left); let ea = lastHadBigram
+        let (b, wb) = cost(swapped, left: left); let eb = lastHadBigram
+        // Ни у одного чтения пары в корпусе нет — свидетельств о КОНТЕКСТЕ нет,
+        // сравниваются голые частоты слов. Тогда побеждает просто более частое,
+        // и на симметричном наборе половина строк обречена. В таком случае
+        // требуем куда больший разрыв: «часто» само по себе не довод.
+        let m = (ea || eb) ? margin : margin * Float(Config.shared.ngramNoContextFactor)
+        let note = (ea || eb) ? "" : ", без пары"
+        let explain = String(format: "'%@' %.2f (%@) vs '%@' %.2f (%@)%@", typed, a, wa, swapped, b, wb, note)
         let ka = known(typed), kb = known(swapped)
-        if kb && b + margin < a { return (swapped, explain) }
-        if ka && a + margin < b { return (typed, explain) }
+        if kb && b + m < a { return (swapped, explain) }
+        if ka && a + m < b { return (typed, explain) }
         return nil
     }
 }

@@ -38,7 +38,7 @@ class LM:
     def bi(self, lang, p, w): return self.get(self.d[lang][1], self.bm, p + "\x1f" + w)
 
     # Штрафы: не видели пару — откат на униграмму с надбавкой; не видели слово — потолок.
-    BACKOFF, UNSEEN, SWITCH = 1.2, 12.0, 0.7
+    BACKOFF, UNSEEN, SWITCH = 1.2, 30.0, 0.35
 
     def cost(self, word, left=None, right=None):
         lang = lang_of(word)
