@@ -40,6 +40,7 @@ enum TestRunner {
     }
 
     static func run(_ text: String, verbose: Bool = true) -> Report {
+        if Config.shared.coreV5 { return runV5(text, verbose: verbose) }
         var rep = Report()
         for raw in text.components(separatedBy: .newlines) {
             var line = raw.trimmingCharacters(in: .whitespaces)
@@ -115,6 +116,86 @@ enum TestRunner {
             rep.lines.append(verdict)
             if verbose, !SemProfile.shared.lastExplain.isEmpty {
                 rep.lines.append("      " + SemProfile.shared.lastExplain)
+            }
+        }
+        return rep
+    }
+
+    /// Место ввода в тесте: «@terminal ls -la» / «@chat привет» / «@address ...».
+    /// Ожидание языка для первого слова — как у ядра на таком месте без личной статистики.
+    static func place(_ tag: String) -> (app: String, field: String, priorRu: Double)? {
+        switch tag {
+        case "terminal": return ("com.apple.terminal", "", 0.15)
+        case "code": return ("com.microsoft.vscode", "", 0.2)
+        case "chat": return ("ru.keepcoder.telegram", "", 0.8)
+        case "browser": return ("com.apple.safari", "", 0.6)
+        case "address": return ("com.apple.safari", "address", 0.05)
+        case "password": return ("test", "password", 0.02)
+        default: return nil
+        }
+    }
+
+    /// Ядро 5: все слова фразы идут по очереди через тот же Detector.decide, что живой
+    /// ввод, со своим экземпляром ядра (живой контекст не трогается) — и слова ПОСЛЕ
+    /// цели тоже: короткое неуверенное слово решается задним числом по правому соседу.
+    static func runV5(_ text: String, verbose: Bool) -> Report {
+        var rep = Report()
+        let core = Core5(useConfig: true)
+        for raw in text.components(separatedBy: .newlines) {
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            var expect: String? = nil
+            if let r = line.range(of: "=>") {
+                expect = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                line = String(line[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+            }
+            Detector.resolvedInSentence.removeAll()
+            var words = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            var app = "test", field = "", prior = 0.5
+            if let first = words.first, first.hasPrefix("@") {
+                if let pl = place(String(first.dropFirst()).lowercased()) {
+                    app = pl.app; field = pl.field; prior = pl.priorRu
+                }
+                words.removeFirst()
+            }
+            guard !words.isEmpty else { continue }
+            var ti = words.count - 1
+            for (k, w) in words.enumerated() where w.count > 2 && w.hasPrefix("*") && w.hasSuffix("*") {
+                words[k] = String(w.dropFirst().dropLast()); ti = k
+            }
+            print("--- \(line)")
+            SemProfile.shared.clearExplain()
+            core.reset(priorRu: prior)
+            var shown: [String] = []
+            var targetExplain = "", retroNote = ""
+            for (k, w) in words.enumerated() {
+                let saved = TestRunner.silence(k != ti)      // в выводе — только цель
+                let hist = Array(shown.reversed())            // ближайшее первым
+                let isRu = w.contains { ("а"..."я").contains($0) || ("А"..."Я").contains($0) || $0 == "ё" || $0 == "Ё" }
+                let v = Detector.decide(word: w, currentLang: isRu ? .ru : .en, context: nil,
+                                        history: hist, app: app, topic: hist, field: field,
+                                        sepIsSpace: true, core: core)
+                TestRunner.silence(saved)
+                if let to = v.retroPrev, !shown.isEmpty {
+                    if k - 1 == ti { retroNote = " (задним числом по '\(w)': '\(shown[shown.count - 1])' → '\(to)')" }
+                    shown[shown.count - 1] = to
+                }
+                shown.append(v.shown)
+                if k == ti { targetExplain = v.explain.isEmpty ? SemProfile.shared.lastExplain : v.explain }
+            }
+            let result = shown[ti]
+            var verdict = "\(line)    = \(result)"
+            if let e = expect {
+                rep.total += 1
+                let hit = result.lowercased() == e.lowercased()
+                if hit { rep.ok += 1 }
+                verdict += hit ? "   ✅" : "   ❌ ждали \(e)"
+            }
+            print("    = \(result)" + retroNote
+                  + (expect.map { result.lowercased() == $0.lowercased() ? "   ✅" : "   ❌ ждали \($0)" } ?? ""))
+            rep.lines.append(verdict + retroNote)
+            if verbose, !targetExplain.isEmpty {
+                rep.lines.append("      " + targetExplain)
             }
         }
         return rep

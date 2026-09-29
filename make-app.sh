@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 # от реальной версии, и то же самое попадало в отчёты о падениях.
 APP_VERSION="4.0"
 # Метка волны разработки — видна в логе запуска и в «О программе».
-APP_WAVE="wave49"
+APP_WAVE="wave50"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then
@@ -76,32 +76,72 @@ else
     echo "⚠️  nn/ngram/qsngram.bin нет — n-граммы будут выключены (python3 nn/ngram/build.py)"
 fi
 
+# Ядро 5: символьная модель языка nn/lm/qschar.bin (python3 nn/lm/charlm.py train)
+# и эталон самопроверки порта nn/lm/core5-selftest.json (python3 nn/lm/make_selftest.py)
+if [ -f "nn/lm/qschar.bin" ]; then
+    cp nn/lm/qschar.bin Sources/QSwitcher/Resources/qschar.bin
+    [ -f "nn/lm/core5-selftest.json" ] && cp nn/lm/core5-selftest.json Sources/QSwitcher/Resources/core5-selftest.json
+    echo "🔤 Символьная модель: nn/lm/qschar.bin ($(du -h nn/lm/qschar.bin | cut -f1))"
+else
+    echo "⚠️  nn/lm/qschar.bin нет — ядро 5 будет без символьной модели (python3 nn/lm/charlm.py train)"
+fi
+
 # Если словарей нет — скачиваем
 if [ ! -f "Sources/QSwitcher/Resources/ru.txt" ] || [ ! -f "Sources/QSwitcher/Resources/en.txt" ]; then
     echo "📚 Словарей нет, скачиваю..."
     ./fetch-dicts.sh
 fi
 
-# Универсальный бинарь: arm64 (Apple Silicon) + x86_64 (Intel)
-# Собираем для обеих архитектур и склеиваем lipo'ом.
-echo "🔨 Сборка для arm64..."
-swift build -c release --arch arm64
+# Универсальный бинарь: arm64 (Apple Silicon) + x86_64 (Intel).
+# Каждую архитектуру собираем отдельно и СРАЗУ забираем результат. Новый SwiftPM
+# (swiftbuild, Xcode 27 / macOS 27) кладёт обе в один .build/out/Products/Release —
+# вторая сборка затирает первую, а старые .build/<arch>-apple-macosx/release больше
+# не обновляются: оттуда в .app попадал бинарь от 10 сентября, свежий код молча
+# не доезжал. Где лежит результат, спрашиваем у самого SwiftPM (--show-bin-path)
+# и проверяем архитектуру lipo.
+BIN_DIR=""
+build_arch() {
+    local arch=$1 dir
+    echo "🔨 Сборка для $arch..."
+    swift build -c release --arch "$arch" || return 1
+    dir=$(swift build -c release --arch "$arch" --show-bin-path) || return 1
+    # Version.swift переписан в начале скрипта — бинарь обязан быть новее .build_number,
+    # иначе это не результат этой сборки
+    if [ ! "$dir/QSwitcher" -nt "$BUILD_FILE" ]; then
+        echo "⚠️  $dir/QSwitcher не пересобран (старше начала сборки)"
+        return 1
+    fi
+    cp "$dir/QSwitcher" ".build/QSwitcher-$arch" || return 1
+    if [ "$(lipo -archs ".build/QSwitcher-$arch" 2>/dev/null)" != "$arch" ]; then
+        echo "⚠️  $dir/QSwitcher — не $arch ($(lipo -archs ".build/QSwitcher-$arch" 2>/dev/null))"
+        return 1
+    fi
+    [ -z "$BIN_DIR" ] && BIN_DIR="$dir"
+    return 0
+}
+rm -f .build/QSwitcher-arm64 .build/QSwitcher-x86_64 .build/QSwitcher-universal
+ARM_OK=0; X86_OK=0
+build_arch arm64 && ARM_OK=1
+build_arch x86_64 && X86_OK=1
 
-echo "🔨 Сборка для x86_64..."
-swift build -c release --arch x86_64
-
-ARM_BIN=".build/arm64-apple-macosx/release/QSwitcher"
-X86_BIN=".build/x86_64-apple-macosx/release/QSwitcher"
-
-if [ ! -f "$ARM_BIN" ] || [ ! -f "$X86_BIN" ]; then
-    echo "⚠️ Один из бинарей не собрался, fallback на single-arch"
-    swift build -c release
-    UNIVERSAL_BIN=".build/release/QSwitcher"
-else
+if [ "$ARM_OK" = 1 ] && [ "$X86_OK" = 1 ]; then
     echo "🔗 Склеиваю универсальный бинарь..."
-    lipo -create -output .build/QSwitcher-universal "$ARM_BIN" "$X86_BIN"
+    lipo -create -output .build/QSwitcher-universal .build/QSwitcher-arm64 .build/QSwitcher-x86_64
     UNIVERSAL_BIN=".build/QSwitcher-universal"
     echo "   Архитектуры: $(lipo -archs $UNIVERSAL_BIN)"
+elif [ "$ARM_OK" = 1 ]; then
+    echo "⚠️  x86_64 не собрался — только arm64"
+    UNIVERSAL_BIN=".build/QSwitcher-arm64"
+else
+    echo "⚠️  Сборка по архитектурам не удалась, fallback на single-arch"
+    swift build -c release
+    BIN_DIR=$(swift build -c release --show-bin-path)
+    UNIVERSAL_BIN="$BIN_DIR/QSwitcher"
+fi
+# Страховка от устаревшего бинаря (fallback-ветка): он обязан быть новее начала сборки
+if [ ! "$UNIVERSAL_BIN" -nt "$BUILD_FILE" ]; then
+    echo "❌ $UNIVERSAL_BIN старше начала сборки — это не свежий бинарь. Останавливаюсь."
+    exit 1
 fi
 
 APP="QSwitcher.app"
@@ -111,14 +151,11 @@ mkdir -p "$APP/Contents/Resources"
 
 cp "$UNIVERSAL_BIN" "$APP/Contents/MacOS/QSwitcher"
 
-# Ресурсы из bundle (если SwiftPM сделал)
-for arch in arm64 x86_64; do
-    BUNDLE_RES=$(find .build/${arch}-apple-macosx/release -name "QSwitcher_QSwitcher.bundle" -type d 2>/dev/null | head -1)
-    if [ -n "$BUNDLE_RES" ]; then
-        cp -R "$BUNDLE_RES" "$APP/Contents/Resources/" 2>/dev/null || true
-        break
-    fi
-done
+# Ресурсы из bundle (если SwiftPM сделал) — рядом с бинарём этой сборки
+BUNDLE_RES=$(find "${BIN_DIR:-.build/release}" -maxdepth 1 -name "QSwitcher_QSwitcher.bundle" -type d 2>/dev/null | head -1)
+if [ -n "$BUNDLE_RES" ]; then
+    cp -R "$BUNDLE_RES" "$APP/Contents/Resources/" 2>/dev/null || true
+fi
 
 # Прямое копирование данных (надёжнее всего)
 cp Sources/QSwitcher/Resources/*.txt  "$APP/Contents/Resources/" 2>/dev/null || true

@@ -33,6 +33,24 @@ public sealed class KeyboardMonitor : IDisposable
     /// Слежение за фокусом по событиям; ставится в потоке хука.
     public ForegroundTracker? Foreground { get; init; }
 
+    /// Ожидание языка по приложению (ядро 5): что остаётся на экране в каком процессе.
+    public AppLangStats? AppStats { get; init; }
+
+    /// Ядро 5: между предыдущим словом и текущим на экране ровно один пробел, ничего
+    /// не стёрто и не вставлено — предыдущее можно исправить задним числом.
+    private bool _retroSafe;
+    /// Ядро 5: начать ввод заново (клик, другое окно, навигация) — на следующей границе.
+    private bool _coreNeedsReset = true;
+    private DateTime _lastBoundaryAt = DateTime.MinValue;
+    private int _lastFocusGen = -1;
+
+    /// Начало нового ввода: курсор поставлен заново — что слева, неизвестно.
+    private void BeginFreshInput()
+    {
+        _retroSafe = false;
+        _coreNeedsReset = true;
+    }
+
     /// Кольцевой журнал ввода (для починки по журналу).
     public KeyJournal Journal { get; } = new();
 
@@ -487,6 +505,7 @@ public sealed class KeyboardMonitor : IDisposable
         {
             if (_word.Count > 0) _word.Clear();
             _droppedPrefix = "";
+            BeginFreshInput();
             InvalidateHistory("клик мышью");
             Journal.Add(KeyJournal.Kind.Reset);
             return false;
@@ -508,6 +527,18 @@ public sealed class KeyboardMonitor : IDisposable
             Dispatch(combo.Value);
             return false;
         }
+        // Ctrl/Alt + клавиша (Ctrl+V, Ctrl+Z, Ctrl+Backspace, Alt+Tab…) — не набор:
+        // раньше буква сочетания попадала в слово, и на границе решалось про мусор
+        // вроде 'приветм'. Что теперь слева от курсора, неизвестно — начинаем заново.
+        if (Hotkeys?.ModifierHeldPhysically() == true)
+        {
+            _word.Clear();
+            _droppedPrefix = "";
+            BeginFreshInput();
+            InvalidateHistory("сочетание с Ctrl/Alt");
+            Journal.Add(KeyJournal.Kind.Reset, vk);
+            return false;
+        }
 
         // Навигация и редактирование сбрасывают слово
         switch (vk)
@@ -518,6 +549,7 @@ public sealed class KeyboardMonitor : IDisposable
             case 0x1B:                          // Esc
                 _word.Clear();
                 _droppedPrefix = "";
+                BeginFreshInput();
                 InvalidateHistory("навигация");
                 Journal.Add(KeyJournal.Kind.Reset, vk);
                 return false;
@@ -525,6 +557,12 @@ public sealed class KeyboardMonitor : IDisposable
                 if (_word.Count > 0) _word.RemoveAt(_word.Count - 1);
                 else if (_droppedPrefix.Length > 0)
                     _droppedPrefix = _droppedPrefix[..^1];
+                else
+                {
+                    // Стирают уже решённое (пробел, предыдущее слово): левый сосед ядра не тот
+                    _retroSafe = false;
+                    _detector.Core?.ForgetPrev();
+                }
                 Journal.Add(KeyJournal.Kind.Backspace, vk);
                 return false;
         }
@@ -634,12 +672,19 @@ public sealed class KeyboardMonitor : IDisposable
     /// в v4 она уходит в батче замены вместе с текстом.
     private bool OnWordBoundary(Keystroke trigger)
     {
-        if (_word.Count == 0) { Journal.Add(KeyJournal.Kind.Boundary, trigger.VirtualKey, text: trigger.Chars); return false; }
-        if (Paused) { _word.Clear(); _droppedPrefix = ""; return false; }
+        if (_word.Count == 0)
+        {
+            // Граница без слова (второй пробел, знак): соседство слов нарушено
+            _retroSafe = false;
+            Journal.Add(KeyJournal.Kind.Boundary, trigger.VirtualKey, text: trigger.Chars);
+            return false;
+        }
+        if (Paused) { _word.Clear(); _droppedPrefix = ""; _retroSafe = false; return false; }
         if (Exclusions.IsExcluded())
         {
             _word.Clear();
             _droppedPrefix = "";
+            _retroSafe = false;
             return false;
         }
 
@@ -672,17 +717,85 @@ public sealed class KeyboardMonitor : IDisposable
         // так что контекст не перетекает из прошлого сообщения.
         var recent = new List<string>(3);
         for (int i = _history.Count - 1; i >= 0 && recent.Count < 3; i--) recent.Add(_history[i].Text);
-        var verdict = _detector.Decide(text, current, context, recent, Foreground?.ProcessName);
+
+        // Ядро 5: начало ввода (клик, другое окно, навигация, долгая пауза) — левого
+        // соседа нет, ожидание языка по приложению.
+        bool v5 = _detector.CoreV5;
+        string? process = Foreground?.ProcessName;
+        bool sepIsSpace = false;
+        if (v5 && _detector.Core is { } core)
+        {
+            var now = DateTime.UtcNow;
+            int gen = Foreground?.Generation ?? 0;
+            if (_coreNeedsReset || gen != _lastFocusGen || now - _lastBoundaryAt > TimeSpan.FromSeconds(90))
+            {
+                double pr = AppStats?.PriorRu(process) ?? 0.5;
+                core.Reset(pr);
+                _coreNeedsReset = false;
+                _lastFocusGen = gen;
+                _log($"  [det] ядро5: начало ввода, ожидание P(ru)={pr.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)} ({process ?? "?"})");
+            }
+            _lastBoundaryAt = now;
+            // Предыдущее слово — вплотную через один пробел и ничего не вставлено
+            sepIsSpace = _retroSafe && _lastCompletedPrefix.Length == 0
+                         && _history.Count > 0 && _history[^1].Trigger == " ";
+        }
+        var verdict = _detector.Decide(text, current, context, recent, process, sepIsSpace);
+        // Задним числом — только если предыдущее слово на экране именно то
+        (string From, string To)? retro5 = null;
+        if (verdict.RetroTo is { } rTo && verdict.RetroFrom is { } rFrom)
+        {
+            if (sepIsSpace && _history.Count > 0 && _history[^1].Text == rFrom) retro5 = (rFrom, rTo);
+            else _log($"  [det] ядро5: предыдущее '{rFrom}' → '{rTo}' — на экране не то, задним числом не правлю");
+        }
         _log($"[word] собрано '{text}' ({wordCopy.Count} клавиш)");
         _log($"[boundary] '{text}' ({current}, ctx={context?.ToString() ?? "nil"}) → {(verdict.ShouldSwap ? "SWITCH" : "keep")} [{verdict.Reason}]");
         SecureLog?.Append(verdict.ShouldSwap && verdict.Replacement is not null
             ? $"{text} → {verdict.Replacement}"
             : text);
 
+        // Какой язык остаётся на экране в этом приложении — ожидание для первых слов
+        if (v5 && AppStats is not null)
+        {
+            AppStats.Note(process, Core5.LangOf(verdict.ShouldSwap && verdict.Replacement is not null ? verdict.Replacement : text));
+            if (retro5 is { } rs)
+            {
+                AppStats.Note(process, Core5.LangOf(rs.From), -1);
+                AppStats.Note(process, Core5.LangOf(rs.To));
+            }
+        }
+
         // Enter/Tab — конец строки/поля: то, что было слева, уже не «рядом
         // с курсором» (в чате сообщение ушло). Ретро и ручной свап через
         // перевод строки склеивали текст в мусор ('м↵…').
         bool lineBreak = trigger.Chars is "\r" or "\t";
+        // Следующее слово встанет вплотную, если граница — пробел
+        _retroSafe = trigger.Chars == " ";
+
+        // Ядро 5 исправило предыдущее слово, а текущее верное: один батч
+        // «стереть текущее, пробел и предыдущее — напечатать исправленное + текущее».
+        if (retro5 is { } rk && !(verdict.ShouldSwap && verdict.Replacement is not null))
+        {
+            var prevH = _history[^1];
+            _history[^1] = (rk.To, prevH.Trigger, LangOf(rk.To), prevH.At, null);
+            _lastWordLang = current;
+            _lastSwitch = new LastSwitch(rk.From + prevH.Trigger + text, rk.To + prevH.Trigger + text, trigger.Chars);
+            PushHistory(text, trigger.Chars, wordCopy);
+            _consecutive = 0;
+            _lastTarget = null;
+            int trigErase = EngineV4 ? 0 : trigger.Chars.Length;
+            var kjob = new ReplaceJob(
+                EraseCount: wordCopy.Count + prevH.Trigger.Length + rk.From.Length + trigErase,
+                Text: rk.To + prevH.Trigger + text,
+                TriggerChar: trigger.Chars,
+                SwitchLayout: false);
+            _log($"[retro] цепочка: {rk.From}→{rk.To}");
+            Journal.Add(KeyJournal.Kind.Replaced, text: kjob.Text);
+            bool kOk = _replacer.Submit(kjob);
+            Sounds.Play(SoundKind.ConvertOnly);
+            if (lineBreak) InvalidateHistory("перевод строки");
+            return EngineV4 && kOk;
+        }
 
         if (verdict.ShouldSwap && verdict.Replacement is not null)
         {
@@ -692,13 +805,26 @@ public sealed class KeyboardMonitor : IDisposable
             // Ретроконверсия: одиночные буквы перед словом почти наверняка
             // набраны в той же неверной раскладке ('z ,skf' → 'я была').
             // Сами по себе они неоднозначны, но раз следующее слово уверенно
-            // свапнулось — сомнений больше нет.
-            var retro = RetroChain(_lastWordLang!.Value);
+            // свапнулось — сомнений больше нет. Ядро 5 решает это само
+            // (отложенное короткое слово) — старая цепочка только для прежнего каскада.
+            var retro = v5 ? new List<(string Text, string Trigger, Lang Lang)>() : RetroChain(_lastWordLang!.Value);
+            if (retro5 is { } rsw)
+            {
+                // Предыдущее слово тоже меняется: цепочка из него одного. В истории —
+                // сразу исправленное (оно остаётся на месте, перед текущим).
+                var prevH = _history[^1];
+                _history[^1] = (rsw.To, prevH.Trigger, LangOf(rsw.To), prevH.At, null);
+                retro.Add((rsw.From, prevH.Trigger, prevH.Lang));
+                _lastSwitch = new LastSwitch(rsw.From + prevH.Trigger + text,
+                                             rsw.To + prevH.Trigger + verdict.Replacement, trigger.Chars);
+            }
 
             PushHistory(verdict.Replacement, trigger.Chars);
             var target = _lastWordLang!.Value;
             if (_lastTarget == target) _consecutive++;
             else { _lastTarget = target; _consecutive = 1; }
+            // «yt [jxe» → «не хочу»: два слова подряд в одну сторону — смена языка подтверждена
+            if (retro5 is { } rc && LangOf(rc.To) == target) _consecutive++;
 
             bool switchLayout = SwitchLayoutAfter > 0 && _consecutive >= SwitchLayoutAfter;
             if (!switchLayout)
@@ -714,8 +840,11 @@ public sealed class KeyboardMonitor : IDisposable
             {
                 // Стираем цепочку вместе с их разделителями и печатаем заново
                 int extra = retro.Sum(r => r.Text.Length + r.Trigger.Length);
-                string rebuilt = string.Concat(retro.Select(r => _pair.Swap(r.Text) + r.Trigger));
-                _log($"[retro] пересобираю {retro.Count} одиночных: '{rebuilt.Trim()}'");
+                string rebuilt = retro5 is { } r5
+                    ? r5.To + retro[0].Trigger
+                    : string.Concat(retro.Select(r => _pair.Swap(r.Text) + r.Trigger));
+                if (retro5 is { } r5l) _log($"[retro] цепочка: {r5l.From}→{r5l.To}");
+                else _log($"[retro] пересобираю {retro.Count} одиночных: '{rebuilt.Trim()}'");
                 job = new ReplaceJob(
                     EraseCount: extra + wordCopy.Count + triggerErase,
                     Text: rebuilt + verdict.Replacement,
@@ -773,6 +902,8 @@ public sealed class KeyboardMonitor : IDisposable
 
     private void DispatchNow(HotkeyAction action)
     {
+        // Ручное действие меняет текст — задним числом ядро больше не правит
+        _retroSafe = false;
         switch (action)
         {
             // По-Punto: есть выделение — свапается оно, нет — набранное/последнее.
@@ -929,6 +1060,7 @@ public sealed class KeyboardMonitor : IDisposable
                 LearnForceConsistent(bufText, _pair.Swap(bufText)); // учим слово (с буквами), не префикс
             _lastSwitch = new LastSwitch(full, swappedFull, "");
             _lastWordLang = LangOf(swappedFull);
+            NoteManualCore(null, swappedFull);
             _replacer.Submit(new ReplaceJob(
                 EraseCount: full.Length,
                 Text: swappedFull,
@@ -952,6 +1084,7 @@ public sealed class KeyboardMonitor : IDisposable
             if (learn) ApplyLearn(to);
 
             _lastWordLang = LangOf(to);
+            NoteManualCore(from, to);
             _replacer.Submit(new ReplaceJob(
                 EraseCount: from.Length + last.TriggerChar.Length + tail.Length,
                 Text: to,
@@ -994,6 +1127,7 @@ public sealed class KeyboardMonitor : IDisposable
 
         _lastSwitch = new LastSwitch(fullText, swapped, triggerChar);
         _lastWordLang = LangOf(swapped);
+        NoteManualCore(fullText, swapped);
         _replacer.Submit(new ReplaceJob(
             EraseCount: fullText.Length + triggerChar.Length + tail.Length,
             Text: swapped,
@@ -1002,12 +1136,26 @@ public sealed class KeyboardMonitor : IDisposable
         Sounds.Play(SoundKind.ConvertAndSwitch);
     }
 
+    /// Человек поменял текст руками: ядру — новый левый сосед (решение окончательно),
+    /// ожиданию приложения — поправка языка. from=null — слово ещё не учитывалось.
+    private void NoteManualCore(string? from, string to)
+    {
+        _retroSafe = false;
+        if (!_detector.CoreV5) return;
+        var words = to.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length > 0) _detector.Core?.NoteManual(words[^1]);
+        string? process = Foreground?.ProcessName;
+        if (from is not null) AppStats?.Note(process, Core5.LangOf(from), -1);
+        AppStats?.Note(process, Core5.LangOf(to));
+    }
+
     /// Добавить слово в историю (для ретроконверсии и ручного свапа).
     private void PushHistory(string text, string trigger, IReadOnlyList<Keystroke>? keys = null)
     {
         _history.Add((text, trigger, LangOf(text), DateTime.UtcNow, keys));
         if (_history.Count > 12) _history.RemoveAt(0);
     }
+
 
     /// Экран изменился не нами — всё, что помним про позицию, недействительно.
     private void InvalidateHistory(string why)

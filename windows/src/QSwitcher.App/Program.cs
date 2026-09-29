@@ -106,6 +106,46 @@ internal static class Program
                 Log($"🧹 Снято {removed} взаимоисключающих правил (слово и его свап оба «переключать»)");
         }
         var net = LayoutNet.Load(pair, Res.Open, Log);
+
+        // Ядро 5: частоты слов (qsngram.bin) + символьная модель (qschar.bin). Нет
+        // частот — работает прежний каскад (сеть, словари), как до ядра 5.
+        var ngram = NgramLM.Load(Res.Open, Log);
+        var charLm = CharLM.Load(Res.Open, Log);
+        var core = new Core5(ngram, charLm)
+        {
+            // Параметры из config.json — на каждое решение, меняются на лету
+            LiveParams = () => new Core5.Params
+            {
+                Theta = cfg.CoreTheta,
+                Pi = Math.Clamp(cfg.CorePi, 0.001, 0.5),
+                BK = cfg.CoreLayoutBias,
+                DeferShort = cfg.CoreDeferShort,
+            },
+        };
+        var appStats = new AppLangStats(Path.Combine(DataDir, "app-lang.json"), app =>
+        {
+            var cls = cfg.AppClassOf(app);
+            return AppLangStats.ClassPrior(LayoutNet.AppNames[(int)cls]);
+        });
+        bool coreOn() => !string.Equals(cfg.Core, "legacy", StringComparison.OrdinalIgnoreCase);
+        Log(ngram.Loaded
+            ? $"Ядро: {(coreOn() ? "v5 — одна формула (частоты слов, символьная модель, опечатки, сосед, приложение)" : "legacy — прежний каскад (config: Core)")}"
+            : "Ядро: legacy — нет qsngram.bin, ядру 5 не на чем решать");
+        // Самопроверка порта в фоне: решения совпадают с эталоном на Python
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                using var st = Res.Open("core5-selftest.json");
+                if (st is null || !ngram.Loaded) return;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var (n, bad) = Core5.Selftest(st, ngram, charLm, Log);
+                Log($"🧪 Ядро 5 / самопроверка: {n - bad}/{n} совпало с эталоном ({sw.ElapsedMilliseconds} мс)"
+                    + (bad == 0 ? "" : " — ⚠️ порт расходится с nn/lm/model.py"));
+            }
+            catch (Exception ex) { Log($"⚠️ Ядро 5 / самопроверка: {ex.Message}"); }
+        });
+
         var detector = new Detector(pair, dict,
             learned,
             new DetectorConfig
@@ -116,7 +156,8 @@ internal static class Program
                 // Настройки сети читаются на каждое решение — меняются в config.json на лету
                 Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen),
                 AppClassOf = cfg.AppClassOf,
-            }, Log, net);
+                CoreV5 = coreOn,
+            }, Log, net, core);
 
         // Режим изоляции: QSWITCHER_PASSIVE=1 — хук ставится, но НИЧЕГО не делает.
         // Нужен чтобы понять, ломает ли чужие хоткеи сам факт установки хука
@@ -147,6 +188,7 @@ internal static class Program
         {
             EngineV4 = engineV4,
             Foreground = foreground,
+            AppStats = appStats,
             Passive = passive,
             Trace = trace,
             Hotkeys = hotkeys,
@@ -170,6 +212,7 @@ internal static class Program
         monitor.Start();
         Application.Run();
         learned.Flush();
+        appStats.SaveNow();
     }
 }
 
@@ -211,7 +254,7 @@ public static class AppVersion
 {
     public const string Version = "4.0";
     /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
-    public const string Build = "wave9";
+    public const string Build = "wave10";
 }
 
 /// <summary>
@@ -232,6 +275,19 @@ public sealed class AppConfig
     /// "legacy" — прежняя схема (очередь → пауза → батч → гейт). Откат на
     /// случай регрессий; применяется после перезапуска.
     public string Engine { get; set; } = "v4";
+
+    // Ядро решения. "v5" — одна формула (Core5.cs, эталон nn/lm/model.py): частоты
+    // слов + символьная модель + опечатки + сосед + ожидание приложения; "legacy" —
+    // прежний каскад (сеть, словари, щит). Меняется на лету.
+    public string Core { get; set; } = "v5";
+    /// Порог свапа ядра 5 (перевес другого прочтения, наты).
+    public double CoreTheta { get; set; } = 2.0;
+    /// Вероятность смены языка между соседними словами.
+    public double CorePi { get; set; } = 0.04;
+    /// Надбавка «язык не совпадает с раскладкой».
+    public double CoreLayoutBias { get; set; } = 1.0;
+    /// Короткое неуверенное слово ждёт правого соседа и исправляется задним числом.
+    public bool CoreDeferShort { get; set; } = true;
 
     /// <summary>Горячие клавиши. Переназначаются через меню трея.</summary>
     public HotkeyMap Hotkeys { get; set; } = new();
@@ -401,6 +457,11 @@ public sealed class AppConfig
         NnMode = fresh.NnMode;
         NnMinLen = fresh.NnMinLen;
         AppClasses = fresh.AppClasses;
+        Core = fresh.Core;
+        CoreTheta = fresh.CoreTheta;
+        CorePi = fresh.CorePi;
+        CoreLayoutBias = fresh.CoreLayoutBias;
+        CoreDeferShort = fresh.CoreDeferShort;
         log("🔄 Конфиг перечитан (горячие клавиши и движок — после перезапуска)");
     }
 
@@ -655,6 +716,7 @@ public sealed class TrayUi : IDisposable
         aboutItem.Click += (_, _) => MessageBox.Show(
             $"QSwitcher для Windows {AppVersion.Version} ({AppVersion.Build})" + Environment.NewLine + Environment.NewLine +
             $"Движок: {(string.Equals(cfg.Engine, "legacy", StringComparison.OrdinalIgnoreCase) ? "legacy" : "v4 (хук как замок)")}" + Environment.NewLine +
+            $"Ядро: {(string.Equals(cfg.Core, "legacy", StringComparison.OrdinalIgnoreCase) ? "legacy (каскад)" : "v5 (одна формула)")}" + Environment.NewLine +
             $"Конфиг: {cfg.PathOnDisk}" + Environment.NewLine +
             "Автопереключение раскладки RU↔EN, самообучение, защищённый лог.",
             "QSwitcher");

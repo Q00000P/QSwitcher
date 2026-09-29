@@ -49,6 +49,20 @@ final class Config {
     /// В чате первое слово без контекста — скорее русское.
     private(set) var expectRussianInChat: Bool = true
 
+    // Ядро решения. "v5" — одна формула (Core5.swift, эталон nn/lm/model.py): частоты
+    // слов + символьная модель + опечатки + сосед + ожидание приложения; "legacy" —
+    // прежний каскад (сеть, n-граммы, щит, словари). Меняется на лету.
+    private(set) var core: String = "v5"
+    /// Порог свапа ядра 5 (перевес другого прочтения, наты).
+    private(set) var coreTheta: Double = 2.0
+    /// Вероятность смены языка между соседними словами.
+    private(set) var corePi: Double = 0.04
+    /// Надбавка «язык не совпадает с раскладкой».
+    private(set) var coreLayoutBias: Double = 1.0
+    /// Короткое неуверенное слово ждёт правого соседа и исправляется задним числом.
+    private(set) var coreDeferShort: Bool = true
+    var coreV5: Bool { core.lowercased() != "legacy" }
+
     // Семантика (nn/sem/qsvec.bin + profile.json). Меняются на лету.
     /// Включён ли профиль чтений с семантикой.
     /// N-граммы языка (nn/ngram/qsngram.bin): сигнал по соседу для коротких слов
@@ -262,6 +276,11 @@ final class Config {
             expectEnglishFields = Set((json["expectEnglishFields"] as? [String]) ?? ["address", "password"])
             expectEnglishBundles = (json["expectEnglishBundles"] as? [String]) ?? ["com.apple.spotlight", "com.raycast", "com.runningwithcrayons.alfred"]
             expectRussianInChat = json["expectRussianInChat"] as? Bool ?? true
+            core                = (json["core"]                as? String ?? "v5").lowercased()
+            coreTheta           = json["coreTheta"]           as? Double ?? 2.0
+            corePi              = json["corePi"]              as? Double ?? 0.04
+            coreLayoutBias      = json["coreLayoutBias"]      as? Double ?? 1.0
+            coreDeferShort      = json["coreDeferShort"]      as? Bool ?? true
             arbiterEnabled      = json["arbiterEnabled"]      as? Bool ?? false
             arbiterSocket       = json["arbiterSocket"]       as? String ?? ""
             arbiterTimeoutMs    = json["arbiterTimeoutMs"]    as? Int ?? 400

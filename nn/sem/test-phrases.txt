@@ -28,4 +28,4 @@
 @chat lf => да
 @chat ghbdtn => привет
 @chat hello => hello
-@chat rfr дела => как
+@chat *rfr* дела => как

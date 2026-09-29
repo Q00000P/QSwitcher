@@ -90,6 +90,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             SecureLog.shared.start()
         }
 
+        // Детектор и модели ядра 5 (частоты слов, символьная модель, ~70 МБ) — до
+        // установки хука, а не на первом слове: иначе первая граница платит за загрузку
+        // прямо в обработчике клавиатуры, и ввод во всей системе замирает на это время.
+        _ = Detector.shared
+
         switcher = Switcher()
         switcher.onLanguageChanged = { [weak self] lang in
             self?.updateStatusBar(trusted: true, lang: lang)

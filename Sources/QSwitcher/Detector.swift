@@ -76,6 +76,20 @@ final class Detector {
         _ = SemVec.shared
         _ = SemTopics.shared
         _ = SemProfile.shared
+        // Ядро 5: частоты слов и символьная модель — тоже сразу, и самопроверка порта
+        // в фоне: строка «Ядро 5 / самопроверка» в логе показывает, что решения
+        // совпадают с эталоном на Python (nn/lm/model.py) на тех же данных.
+        _ = NgramLM.shared
+        _ = CharLM.shared
+        if Core5.autoSelftest, let u = Core5.selftestURL {
+            DispatchQueue.global(qos: .utility).async {
+                let t0 = Date()
+                let (n, bad) = Core5.selftest(url: u)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                print("🧪 Ядро 5 / самопроверка: \(n - bad)/\(n) совпало с эталоном (\(ms) мс)"
+                      + (bad == 0 ? "" : " — ⚠️ порт расходится с nn/lm/model.py"))
+            }
+        }
     }
 
 
@@ -679,6 +693,208 @@ final class Detector {
             out[k.first!] = v.first!
         }
         return out
+    }
+}
+
+// MARK: - Ядро 5: решение по слову
+
+extension Detector {
+
+    /// Что должно стоять на экране после границы слова.
+    struct Verdict {
+        var shown: String
+        /// Ядро 5 исправляет предыдущее слово задним числом: было retroFrom, станет retroPrev.
+        var retroPrev: String? = nil
+        var retroFrom: String? = nil
+        var reason = ""
+        var explain = ""
+    }
+
+    /// Решение для живого ввода и прогона.
+    /// v5: решения человека (конфиг, выученные правила, поле пароля, список «английский
+    /// ввод», обученный профиль) → ядро 5 (одна формула, Core5.swift).
+    /// legacy: прежний каскад shouldSwitch, свап целиком.
+    /// sepIsSpace — между предыдущим словом и этим на экране ровно один пробел.
+    static func decide(word raw: String, currentLang: InputSource.Lang, context: InputSource.Lang?,
+                       history: [String], app: String?, topic: [String], field: String,
+                       sepIsSpace: Bool, core: Core5 = Core5.shared) -> Verdict {
+        let cfg = Config.shared
+        guard cfg.coreV5 else {
+            let sw = shouldSwitch(word: raw, currentLang: currentLang, context: context,
+                                  history: history, app: app, topic: topic, field: field)
+            return Verdict(shown: sw ? shared.swap(raw) : raw, reason: lastReason)
+        }
+        let lower = raw.lowercased()
+        let swapped = shared.swap(raw)
+        Detector.lastReason = ""
+        func external(_ shown: String, _ reason: String, confident: Bool = true) -> Verdict {
+            Detector.lastReason = reason
+            core.noteExternal(typed: raw, shown: shown, confident: confident)
+            return Verdict(shown: shown, reason: reason)
+        }
+
+        // 1. Списки из конфига. Слово с заглавными — с учётом регистра ("РФ" ≠ "рф").
+        func inList(_ list: Set<String>) -> Bool { list.contains(lower) || list.contains(raw) }
+        if inList(cfg.forceWords) {
+            print("  [det] '\(raw)' в forceWords конфига → SWITCH")
+            return external(swapped, "config")
+        }
+        if inList(cfg.stopWords) {
+            print("  [det] '\(raw)' в stopWords конфига → keep")
+            return external(raw, "config")
+        }
+
+        // 2. Выученное жёстким правилом (хоткей «свап и правило»). Коллизия, у которой
+        // профиль знает оба чтения, — решает контекст, не правило.
+        let collision = cfg.semEnabled && SemVec.shared.loaded
+            && ((LayoutNet.shared.keys(for: lower, ruToEn: shared.ruToEn).map { SemProfile.shared.readingCount(keys: $0) } ?? 0) >= 2
+                || (cfg.semZeroShot && SemProfile.shared.isBaseCollision(typed: lower, swapped: swapped.lowercased())))
+        if !collision, LearnedRules.shared.shouldForce(lower) {
+            print("  [det] '\(lower)' — выучено: переключаем")
+            return external(swapped, "learned")
+        }
+        if !collision, LearnedRules.shared.shouldStop(lower) {
+            print("  [det] '\(lower)' — выучено: не трогаем")
+            return external(raw, "learned")
+        }
+
+        // 3. Жёстко английский: поле пароля (и другие поля из expectEnglishFields, кроме
+        // адресной строки) и приложения из списка «английский ввод». Терминал, код и
+        // адресная строка — не правило, а сильное ожидание в ядре: русский промпт в
+        // терминале и русский запрос в адресной строке остаются русскими.
+        let appLower = app?.lowercased() ?? ""
+        let hardField = field != "address" && !field.isEmpty && cfg.expectEnglishFields.contains(field)
+        if hardField || (!appLower.isEmpty && cfg.expectEnglishBundles.contains(where: { appLower.contains($0) })) {
+            let cyr = lower.contains { shared.isCyrillicLetter($0) }
+            let where_ = hardField ? field : "список «английский ввод»"
+            print("  [det] '\(raw)' \(cyr ? "кириллица" : "латиница") в \(where_) → \(cyr ? "SWITCH (тут английский)" : "keep")")
+            return external(cyr ? swapped : raw, "place")
+        }
+
+        // 4. Кириллица вперемешку с латиницей / знаками EN-раскладки в одном слове —
+        // нормализация к одному алфавиту (';му' → 'жму'), как раньше.
+        if let mixed = shared.mixedVerdict(raw) {
+            if let m = mixed {
+                print("  [det] '\(raw)' смешанные алфавиты → '\(m)'")
+                return external(m, "mixed")
+            }
+            print("  [det] '\(raw)' смешанные алфавиты — нормализовать нечем → keep")
+            return external(raw, "mixed", confident: false)
+        }
+
+        // 4а. Адрес сайта, набранный в русской раскладке: «пщщпдуюсщь» → «google.com».
+        // Модель языка адрес не оценит (точка — не буква); зона из списка и то, что
+        // набранное — не русское слово, отсекают «клюем» → «rk.tv» и подобное.
+        if lower.contains(where: { shared.isCyrillicLetter($0) }), Detector.looksLikeDomain(swapped),
+           NgramLM.shared.uniD("ru", lower) == nil {
+            print("  [det] '\(raw)' — адрес '\(swapped)' в русской раскладке → SWITCH")
+            return external(swapped, "domain")
+        }
+
+        // 5. Профиль: клавиши, которые человек сам учил (HA/РФ…). Он знает про ЭТИ
+        // клавиши больше любой модели. Не уверен — решает ядро, а вопрос уходит
+        // LLM-арбитру (модуль «Full»), если он подключён.
+        if cfg.semEnabled, SemVec.shared.loaded,
+           let keys = LayoutNet.shared.keys(for: lower, ruToEn: shared.ruToEn),
+           SemProfile.shared.knows(keys: keys) {
+            let sem = SemVec.shared
+            SemProfile.shared.clearExplain()
+            let leftVec = history.first.map { sem.centered($0) }
+            let d = SemProfile.shared.decide(keys: keys, typed: raw, swapped: swapped,
+                                             topic: sem.topic(recentFirst: topic),
+                                             left: leftVec, leftWord: history.first,
+                                             usedInSentence: [], margin: Float(cfg.semMargin))
+            let leftWord = history.first ?? "—"
+            if let d = d {
+                if d.text == lower {
+                    print("  [det] профиль \(d.explain) (сосед '\(leftWord)') → keep")
+                    return external(raw, "profile")
+                }
+                if d.text == swapped.lowercased() {
+                    print("  [det] профиль \(d.explain) (сосед '\(leftWord)') → SWAP к '\(swapped)'")
+                    return external(swapped, "profile")
+                }
+                print("  [det] профиль \(d.explain) — чтение не совпало ни с '\(lower)', ни с '\(swapped)' → ядро")
+            } else {
+                print("  [det] профиль знает '\(keys)', но уверенности нет: \(SemProfile.shared.lastExplain) (сосед '\(leftWord)', порог \(cfg.semMargin)) → ядро")
+                let q = Arbiter.Query(typed: raw, swapped: swapped,
+                                      left: Array(history.prefix(3)), topic: Array(topic.prefix(40)),
+                                      app: cfg.appClass(for: app).name)
+                if Arbiter.shared.syncMode, Arbiter.shared.available {
+                    if let a = Arbiter.shared.ask(q, timeoutMs: 5000) {
+                        let verdict = a.reading.map { "'\($0)'" } ?? "молчит"
+                        print("  [det] арбитр → \(verdict) p=\(String(format: "%.2f", a.p)) \(a.ms) мс (\(a.raw))")
+                        if let r = a.reading, a.p >= cfg.arbiterThreshold {
+                            if r.lowercased() == swapped.lowercased() { return external(swapped, "arbiter") }
+                            if r.lowercased() == lower { return external(raw, "arbiter") }
+                        }
+                    } else {
+                        print("  [det] арбитр не ответил")
+                    }
+                } else if cfg.arbiterEnabled {
+                    Detector.pendingArbiter = q
+                }
+            }
+        }
+
+        // 6. Ядро 5.
+        let T = Core5.lang(raw)
+        guard !T.isEmpty else { return Verdict(shown: raw, reason: "") }     // ни одной буквы — не слово
+        let n = Core5.letters(raw, T)
+        if cfg.minWordLength > 2, n > 1, n < cfg.minWordLength {
+            print("  [det] '\(raw)' короче minWordLength=\(cfg.minWordLength) → keep")
+            return external(raw, "config", confident: false)
+        }
+        let d = core.decide(typed: raw, alt: swapped, T: T, sepIsSpace: sepIsSpace,
+                            swap: { shared.swap($0) })
+        Detector.lastReason = "core5"
+        print("  [det] ядро5: \(d.explain)")
+        return Verdict(shown: d.shown, retroPrev: d.retroPrev, retroFrom: d.retroFrom,
+                       reason: "core5", explain: d.explain)
+    }
+
+    /// Зоны, по которым строка считается адресом сайта. Без tv/cn/cs/cm и подобных:
+    /// «клюем» по раскладке — «rk.tv», «каюсь» — «rf.cm», «Андрюше» — «fylh.it».
+    static let domainZones: Set<String> = [
+        "com", "ru", "org", "net", "io", "dev", "app", "info", "me", "co", "ai", "gg", "xyz",
+        "site", "online", "tech", "pro", "biz", "edu", "gov", "eu", "us", "uk", "de", "fi", "su",
+        "by", "ua", "fr", "es", "nl", "se", "no", "pl", "jp", "ca", "au", "ch", "be",
+        "cloud", "store", "blog", "ly", "sh", "gl", "so", "to", "am", "in",
+    ]
+
+    /// «google.com», «www.youtube.com», «mail.yandex.ru» — метки из латиницы/цифр/дефиса
+    /// через точку, первая не короче двух символов, последняя — известная зона.
+    static func looksLikeDomain(_ s: String) -> Bool {
+        let l = s.lowercased()
+        guard l.count >= 5 else { return false }
+        let labels = l.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 2, labels[0].count >= 2,
+              let zone = labels.last, domainZones.contains(String(zone)) else { return false }
+        for lab in labels {
+            guard !lab.isEmpty, lab.allSatisfy({ ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" })
+            else { return false }
+        }
+        return true
+    }
+
+    /// Кириллица вперемешку с латиницей или знаками EN-раскладки: нормализуем к одному
+    /// алфавиту. nil — слово не смешанное; .some(nil) — смешанное, но менять нечем.
+    fileprivate func mixedVerdict(_ word: String) -> String?? {
+        let lower = word.lowercased()
+        let layoutPunct: Set<Character> = [";", "[", "]", "'", "`", "\\", ",", "."]
+        let hasCyr = lower.contains { isCyrillicLetter($0) }
+        let hasLat = lower.contains { isLatinLetter($0) }
+        let hasEnPunct = lower.contains { layoutPunct.contains($0) }
+        guard hasCyr && (hasLat || hasEnPunct) else { return nil }
+        let firstIsLayoutPunct = lower.first.map { layoutPunct.contains($0) } ?? false
+        let lettersCyr = String(lower.filter { isCyrillicLetter($0) })
+        // «привет,» — настоящая пунктуация после русского слова
+        if !firstIsLayoutPunct && !hasLat && Dictionary.shared.ru.contains(lettersCyr) { return .some(nil) }
+        let normalized = swap(word)
+        let nl = normalized.lowercased()
+        guard nl != lower else { return .some(nil) }
+        if nl.allSatisfy({ isLatinLetter($0) }) || nl.allSatisfy({ isCyrillicLetter($0) }) { return .some(normalized) }
+        return .some(nil)
     }
 }
 

@@ -56,6 +56,17 @@
     <EmbeddedResource Include="..\..\..\nn\qsnet-selftest.json" Link="Resources\qsnet-selftest.json"
                       LogicalName="QSwitcher.App.Resources.qsnet-selftest.json"
                       Condition="Exists('..\..\..\nn\qsnet-selftest.json')" />
+    <!-- Ядро 5: частоты слов (nn/ngram/build.py), символьная модель (nn/lm/charlm.py)
+         и эталон самопроверки порта (nn/lm/make_selftest.py) — общие с маком. -->
+    <EmbeddedResource Include="..\..\..\nn\ngram\qsngram.bin" Link="Resources\qsngram.bin"
+                      LogicalName="QSwitcher.App.Resources.qsngram.bin"
+                      Condition="Exists('..\..\..\nn\ngram\qsngram.bin')" />
+    <EmbeddedResource Include="..\..\..\nn\lm\qschar.bin" Link="Resources\qschar.bin"
+                      LogicalName="QSwitcher.App.Resources.qschar.bin"
+                      Condition="Exists('..\..\..\nn\lm\qschar.bin')" />
+    <EmbeddedResource Include="..\..\..\nn\lm\core5-selftest.json" Link="Resources\core5-selftest.json"
+                      LogicalName="QSwitcher.App.Resources.core5-selftest.json"
+                      Condition="Exists('..\..\..\nn\lm\core5-selftest.json')" />
   </ItemGroup>
   <!-- Словари качаются и готовятся автоматически перед сборкой (разово).
        Если ru.txt/en.txt уже на месте — мгновенный no-op. -->

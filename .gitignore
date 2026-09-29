@@ -31,4 +31,11 @@ nn/sem/profile.json
 
 nn/llm/models/
 Sources/QSwitcher/Resources/qsngram.bin
-nn/ngram/qsngram.bin
+# nn/ngram/qsngram.bin — в репозитории: без него ядру 5 не на чем решать (винда встраивает его в exe)
+# Ядро 5: копии в ресурсах делает make-app.sh из nn/lm/; данные обучения — nn/lm/data/
+Sources/QSwitcher/Resources/qschar.bin
+Sources/QSwitcher/Resources/core5-selftest.json
+nn/lm/data/
+__pycache__/
+# dev-watch.sh: сигнал, вывод и сохранённые прогоны
+.qs-*

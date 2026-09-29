@@ -221,4 +221,18 @@ public sealed class HotkeyDetector
 
     private static bool IsShift(uint vk) => vk is 0x10 or 0xA0 or 0xA1;
     public static bool IsTrackableModifier(uint vk) => vk is 0xA2 or 0xA3 or 0xA4 or 0xA5;
+
+    /// <summary>Ctrl/Alt удерживается прямо сейчас (не тап): нажатая с ним клавиша — сочетание,
+    /// а не набор. Сверяемся и с физическим состоянием: пропущенное отпускание (UAC,
+    /// экран блокировки) не должно навсегда превратить набор в «сочетания».</summary>
+    public bool ModifierHeldPhysically()
+    {
+        if (_heldModifier == 0) return false;
+        if ((GetAsyncKeyState((int)_heldModifier) & 0x8000) != 0) return true;
+        Reset();   // отпускание потерялось — слежение сбрасываем
+        return false;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
 }

@@ -10,7 +10,10 @@ final class NgramLM {
     private(set) var loaded = false
 
     private var uniBits = 0, biBits = 0, scale: Float = 0.1
-    private var tables: [String: (uni: Data, bi: Data)] = [:]
+    /// Шаг значения в Double — как в score.py (Python считает в double): ядро 5
+    /// сравнивает с порогами и должно совпадать с эталоном до бита.
+    private var scaleD: Double = 0.1
+    private var tables: [String: (uni: QSTable, bi: QSTable)] = [:]
 
     // Те же константы, что в score.py
     static let backoff: Float = 1.2   // пары нет — униграмма с надбавкой
@@ -41,7 +44,7 @@ final class NgramLM {
                 try parse(Data(contentsOf: url))
                 loaded = true
                 let mb = Double((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0) / 1e6
-                print("🔡 N-граммы: \(url.lastPathComponent) (\(String(format: "%.1f", mb)) МБ, слов 2^\(uniBits), пар 2^\(biBits) на язык)")
+                print("🔡 N-граммы: \(url.path) (\(String(format: "%.1f", mb)) МБ, слов 2^\(uniBits), пар 2^\(biBits) на язык)")
                 return
             } catch {
                 print("⚠️ N-граммы: \(url.path) не читаются: \(error)")
@@ -50,20 +53,29 @@ final class NgramLM {
         print("🔡 N-граммы: qsngram.bin не найден — сигнал выключен")
     }
 
-    private struct Header: Decodable { let v: Int; let uni_bits: Int; let bi_bits: Int; let langs: [String]; let scale: Float }
+    private struct Header: Decodable { let v: Int; let uni_bits: Int; let bi_bits: Int; let langs: [String]; let scale: Double }
 
     private func parse(_ d: Data) throws {
-        guard d.count > 9, d[0..<5] == Data("QSNG2".utf8) else { throw NSError(domain: "NgramLM", code: 1, userInfo: [NSLocalizedDescriptionKey: "не QSNG2"]) }
+        // Один массив на весь файл, таблицы — окна в нём (без копий по 20 МБ)
+        let all = [UInt8](d)
+        guard all.count > 9, Array(all[0..<5]) == Array("QSNG2".utf8) else { throw NSError(domain: "NgramLM", code: 1, userInfo: [NSLocalizedDescriptionKey: "не QSNG2"]) }
         var off = 5
-        func u32() -> Int { let v = d[off..<off+4].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }; off += 4; return Int(UInt32(littleEndian: v)) }
+        func u32() -> Int {
+            var v = Int(all[off])
+            v |= Int(all[off + 1]) << 8
+            v |= Int(all[off + 2]) << 16
+            v |= Int(all[off + 3]) << 24
+            off += 4
+            return v
+        }
         let hl = u32()
-        let h = try JSONDecoder().decode(Header.self, from: d[off..<off+hl]); off += hl
-        uniBits = h.uni_bits; biBits = h.bi_bits; scale = h.scale
-        var t: [String: (Data, Data)] = [:]
+        let h = try JSONDecoder().decode(Header.self, from: Data(all[off..<off+hl])); off += hl
+        uniBits = h.uni_bits; biBits = h.bi_bits; scale = Float(h.scale); scaleD = h.scale
+        var t: [String: (QSTable, QSTable)] = [:]
         for lang in h.langs {
             let ul = u32(), bl = u32()
-            let u = d.subdata(in: off..<off+ul); off += ul
-            let b = d.subdata(in: off..<off+bl); off += bl
+            let u = QSTable(base: all, offset: off, count: ul, bits: uniBits); off += ul
+            let b = QSTable(base: all, offset: off, count: bl, bits: biBits); off += bl
             t[lang] = (u, b)
         }
         tables = t
@@ -86,25 +98,24 @@ final class NgramLM {
         return (Int(a), Int(b != a ? b : (a &+ 1) & mask))
     }
 
-    private func get(_ table: Data, bits: Int, key: String) -> Float? {
-        let mask = UInt32((1 << bits) - 1)
-        let fp = NgramLM.fp16(key)
-        let (a, b) = NgramLM.slots(key, mask: mask)
-        for slot in [a, b] {
-            let i = table.startIndex + slot * 3
-            let cur = UInt16(table[i]) | (UInt16(table[i + 1]) << 8)
-            if cur == fp { return Float(table[i + 2]) * scale }
-        }
-        return nil
+    /// Сырое значение записи (0…255) или nil.
+    private func raw(_ lang: String, uni: Bool, key: String) -> UInt8? {
+        guard let t = tables[lang] else { return nil }
+        return (uni ? t.uni : t.bi).get(key)
     }
 
     func uni(_ lang: String, _ w: String) -> Float? {
-        guard let t = tables[lang] else { return nil }
-        return get(t.uni, bits: uniBits, key: w)
+        raw(lang, uni: true, key: w).map { Float($0) * scale }
     }
     func bi(_ lang: String, _ p: String, _ w: String) -> Float? {
-        guard let t = tables[lang] else { return nil }
-        return get(t.bi, bits: biBits, key: p + "\u{1F}" + w)
+        raw(lang, uni: false, key: p + "\u{1F}" + w).map { Float($0) * scale }
+    }
+    /// То же в Double — для ядра 5 (совпадает с эталоном на Python).
+    func uniD(_ lang: String, _ w: String) -> Double? {
+        raw(lang, uni: true, key: w).map { Double($0) * scaleD }
+    }
+    func biD(_ lang: String, _ p: String, _ w: String) -> Double? {
+        raw(lang, uni: false, key: p + "\u{1F}" + w).map { Double($0) * scaleD }
     }
 
     // MARK: - Балл чтения

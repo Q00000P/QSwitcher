@@ -6,9 +6,14 @@ namespace QSwitcher.Core;
 public enum Lang { Latin, Other }
 
 /// <summary>
-/// Результат решения детектора.
+/// Результат решения детектора. Ядро 5 может ещё исправить ПРЕДЫДУЩЕЕ слово
+/// задним числом: на экране было RetroFrom, должно стать RetroTo.
 /// </summary>
-public readonly record struct Verdict(bool ShouldSwap, string? Replacement, string Reason);
+public readonly record struct Verdict(bool ShouldSwap, string? Replacement, string Reason)
+{
+    public string? RetroFrom { get; init; }
+    public string? RetroTo { get; init; }
+}
 
 /// <summary>
 /// Детектор ошибочной раскладки. Перенесён с macOS-версии (Swift) правило в
@@ -17,6 +22,10 @@ public readonly record struct Verdict(bool ShouldSwap, string? Replacement, stri
 ///
 /// Решение по приоритету:
 ///   0. forceWords / stopWords из конфига, затем выученные правила
+///   ядро 5 (по умолчанию): смешанные алфавиты → нормализация, остальное —
+///      одна формула (Core5.cs): частоты слов, символьная модель, опечатки,
+///      сосед, ожидание приложения; короткое неуверенное — задним числом
+///   прежний каскад (Core = "legacy"):
 ///   1. Слово смешанных алфавитов → нормализация
 ///   2. Слово валидно в текущем языке → не трогаем
 ///      (для 2–3 букв — по частотным спискам, полный словарь там бесполезен)
@@ -32,9 +41,11 @@ public sealed class Detector
     private readonly DetectorConfig _cfg;
     private readonly Action<string>? _log;
     private readonly LayoutNet? _net;
+    private readonly Core5? _core;
 
     public Detector(LayoutPair pair, WordDictionary dict, LearnedRules learned,
-                    DetectorConfig cfg, Action<string>? log = null, LayoutNet? net = null)
+                    DetectorConfig cfg, Action<string>? log = null, LayoutNet? net = null,
+                    Core5? core = null)
     {
         _pair = pair;
         _dict = dict;
@@ -42,36 +53,57 @@ public sealed class Detector
         _cfg = cfg;
         _log = log;
         _net = net;
+        _core = core;
     }
+
+    /// Ядро живого ввода (контекст для него ведёт KeyboardMonitor).
+    public Core5? Core => _core;
+
+    /// Решает ядро 5 (есть модель и не выбран прежний каскад)?
+    public bool CoreV5 => _core is { Ready: true } && (_cfg.CoreV5?.Invoke() ?? true);
 
     /// <summary>
     /// Главная точка входа: вызывается на границе слова.
     /// history — предыдущие слова как они на экране, БЛИЖАЙШЕЕ ПЕРВЫМ (до трёх);
     /// app — имя процесса, где идёт ввод (для класса приложения сети).
     /// </summary>
+    /// sepIsSpace — между предыдущим словом и этим на экране ровно один пробел
+    /// (ядро 5 может исправить предыдущее задним числом); core — свой экземпляр ядра
+    /// для прогонов, по умолчанию ядро живого ввода.
     public Verdict Decide(string raw, Lang currentLang, Lang? context,
-                          IReadOnlyList<string>? history = null, string? app = null)
+                          IReadOnlyList<string>? history = null, string? app = null,
+                          bool sepIsSpace = false, Core5? core = null)
     {
         string lower = raw.ToLowerInvariant();
         int effectiveLen = raw.Count(c => char.IsLetter(c) || _pair.LayoutPunct.Contains(c));
+        var c5 = CoreV5 ? core ?? _core : null;
+        // Решение не ядра — всё равно контекст для следующего слова
+        Verdict Ext(bool swap, string reason)
+        {
+            string shown = swap ? _pair.Swap(raw) : raw;
+            c5?.NoteExternal(raw, shown);
+            return new(swap, swap ? shown : null, reason);
+        }
 
         // 0. Ручные списки важнее всего
         if (_cfg.ForceWords.Contains(lower))
-            return new(true, _pair.Swap(raw), "forceWords");
+            return Ext(true, "forceWords");
         if (_cfg.StopWords.Contains(lower))
-            return new(false, null, "stopWords");
+            return Ext(false, "stopWords");
 
         // Выученное на исправлениях: человек уже показал, чего хочет
         if (_learned.ShouldForce(lower))
         {
             Log($"'{lower}' — выучено: переключаем");
-            return new(true, _pair.Swap(raw), "learned-force");
+            return Ext(true, "learned-force");
         }
         if (_learned.ShouldStop(lower))
         {
             Log($"'{lower}' — выучено: не трогаем");
-            return new(false, null, "learned-stop");
+            return Ext(false, "learned-stop");
         }
+
+        if (c5 is not null) return DecideV5(raw, lower, sepIsSpace, c5);
 
         // Одиночная буква — только по контексту (предлоги)
         if (effectiveLen == 1)
@@ -89,6 +121,75 @@ public sealed class Detector
         return converted is null
             ? new(false, null, reason)
             : new(true, converted, reason);
+    }
+
+    /// <summary>
+    /// Ядро 5: смешанные алфавиты (кириллица + латиница в одном слове) — нормализация
+    /// как раньше, всё остальное — одна формула.
+    /// </summary>
+    private Verdict DecideV5(string raw, string lower, bool sepIsSpace, Core5 core)
+    {
+        bool hasLat = lower.Any(_pair.IsLatinLetter);
+        bool hasOth = lower.Any(c => _pair.IsOtherLetter(c));
+        if (hasLat && hasOth)
+        {
+            var norm = NormalizeMixed(raw, lower);
+            core.NoteExternal(raw, norm ?? raw, confident: norm is not null);
+            Log(norm is null ? $"'{raw}' смешанные алфавиты — нормализовать нечем → keep"
+                             : $"'{raw}' смешанные алфавиты → '{norm}'");
+            return norm is null ? new(false, null, "mixed") : new(true, norm, "mixed");
+        }
+        // Адрес сайта, набранный в русской раскладке: «пщщпдуюсщь» → «google.com».
+        // Модель языка адрес не оценит (точка — не буква); зона из списка и то, что
+        // набранное — не русское слово, отсекают «клюем» → «rk.tv» и подобное.
+        if (hasOth && !hasLat)
+        {
+            string sw = _pair.Swap(raw);
+            if (LooksLikeDomain(sw) && core.Known("ru", lower) is null)
+            {
+                core.NoteExternal(raw, sw);
+                Log($"'{raw}' — адрес '{sw}' в русской раскладке → SWITCH");
+                return new(true, sw, "domain");
+            }
+        }
+        string T = Core5.LangOf(raw);
+        if (T.Length == 0) return new(false, null, "no-letters");   // ни одной буквы — не слово
+        int n = Core5.Letters(raw, T);
+        if (_cfg.MinWordLength > 2 && n > 1 && n < _cfg.MinWordLength)
+        {
+            core.NoteExternal(raw, raw, confident: false);
+            return new(false, null, "too-short");
+        }
+        var d = core.Decide(raw, _pair.Swap(raw), T, sepIsSpace, _pair.Swap);
+        Log($"ядро5: {d.Explain}");
+        return new(d.SwitchNow, d.SwitchNow ? d.Shown : null, "core5")
+        {
+            RetroFrom = d.RetroFrom,
+            RetroTo = d.RetroPrev,
+        };
+    }
+
+    /// Зоны, по которым строка считается адресом сайта. Без tv/cn/cs/cm и подобных:
+    /// «клюем» по раскладке — «rk.tv», «каюсь» — «rf.cm», «Андрюше» — «fylh.it».
+    private static readonly HashSet<string> DomainZones = new()
+    {
+        "com", "ru", "org", "net", "io", "dev", "app", "info", "me", "co", "ai", "gg", "xyz",
+        "site", "online", "tech", "pro", "biz", "edu", "gov", "eu", "us", "uk", "de", "fi", "su",
+        "by", "ua", "fr", "es", "nl", "se", "no", "pl", "jp", "ca", "au", "ch", "be",
+        "cloud", "store", "blog", "ly", "sh", "gl", "so", "to", "am", "in",
+    };
+
+    /// «google.com», «www.youtube.com», «mail.yandex.ru» — метки из латиницы/цифр/дефиса
+    /// через точку, первая не короче двух символов, последняя — известная зона.
+    public static bool LooksLikeDomain(string s)
+    {
+        string l = s.ToLowerInvariant();
+        if (l.Length < 5) return false;
+        var labels = l.Split('.');
+        if (labels.Length < 2 || labels[0].Length < 2 || !DomainZones.Contains(labels[^1])) return false;
+        foreach (var lab in labels)
+            if (lab.Length == 0 || !lab.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-')) return false;
+        return true;
     }
 
     /// <summary>
@@ -300,4 +401,6 @@ public sealed class DetectorConfig
     public Func<NnSettings>? Nn { get; init; }
     /// <summary>Имя процесса → класс приложения для сети.</summary>
     public Func<string?, LayoutNet.AppClass>? AppClassOf { get; init; }
+    /// <summary>Решает ядро 5 (true) или прежний каскад (false). Читается на лету.</summary>
+    public Func<bool>? CoreV5 { get; init; }
 }

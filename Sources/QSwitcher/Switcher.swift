@@ -17,6 +17,9 @@ final class Switcher {
         let originalChars: String
         let convertedChars: String
         let triggerKeyCode: CGKeyCode
+        /// Символ границы как он был напечатан: знак возвращаем символом, а не клавишей —
+        /// та же клавиша в другой раскладке даёт другой знак ('?' ↔ ',').
+        let triggerChars: String
         var state: ToggleState
         var timestamp: Date
         /// Переключение было автоматическим (не по нажатию пользователя).
@@ -24,10 +27,11 @@ final class Switcher {
         let wasAutomatic: Bool
 
         init(originalChars: String, convertedChars: String, triggerKeyCode: CGKeyCode,
-             state: ToggleState, wasAutomatic: Bool = false) {
+             state: ToggleState, wasAutomatic: Bool = false, triggerChars: String = "") {
             self.originalChars = originalChars
             self.convertedChars = convertedChars
             self.triggerKeyCode = triggerKeyCode
+            self.triggerChars = triggerChars
             self.state = state
             self.wasAutomatic = wasAutomatic
             self.timestamp = Date()
@@ -144,6 +148,8 @@ final class Switcher {
         let chars: String
         let triggerKeyCode: CGKeyCode
         let lang: InputSource.Lang
+        /// Символ границы как напечатан (см. LastSwitch.triggerChars).
+        var triggerChars: String = ""
         /// Цифро-пунктуационный префикс, набранный вплотную перед словом
         /// и отброшенный буфером ('10' перед 'ю0ю0ю1' в IP-адресе).
         /// Ручной свап конвертирует слово ВМЕСТЕ с ним — как Punto.
@@ -204,6 +210,20 @@ final class Switcher {
     private var lastTrigger: String = ""
     /// После навигации стрелками до первого пробела: не видим, что вокруг курсора.
     private var editingBlind = false
+    /// Ядро 5: между предыдущим словом и текущим на экране ровно один пробел, ничего
+    /// не стёрто и не вставлено — предыдущее можно исправить задним числом.
+    private var retroSafe = false
+    /// Ядро 5: начать ввод заново (клик, другое приложение, навигация) — на следующей границе.
+    private var coreNeedsReset = true
+    private var lastBoundaryTime: Date = .distantPast
+
+    /// Начало нового ввода: курсор поставлен заново — что слева, неизвестно.
+    private func beginFreshInput() {
+        editingBlind = false
+        lastTrigger = ""
+        retroSafe = false
+        coreNeedsReset = true
+    }
     /// Тема окна: последние принятые слова по приложению (для семантики).
     /// Не синкается, живёт в памяти; ~40 слов хватает на «о чём разговор».
     private var topicWords: [String: [String]] = [:]
@@ -248,6 +268,7 @@ final class Switcher {
                 print("[layout] раскладка сменилась — сбрасываю незавершённое слово")
                 self.word.removeAll()
                 self.droppedPrefix = ""
+                self.retroSafe = false
             }
         }
 
@@ -282,6 +303,9 @@ final class Switcher {
         Detector.resolvedInSentence.removeAll()
         lastSwitch = nil
         lastCompletedWord = nil
+        // Другое приложение — другой ввод: прежний «слепой» режим и граница
+        // предыдущего слова сюда не относятся (раньше они протекали на первое слово).
+        beginFreshInput()
     }
 
     @objc private func inputSourceDidChange() {
@@ -351,6 +375,7 @@ final class Switcher {
             }
             lastSwitch = nil
             lastCompletedWord = nil
+            beginFreshInput()
             return Unmanaged.passUnretained(event)
         }
 
@@ -501,18 +526,23 @@ final class Switcher {
         if keyCode == 53 /* Escape */ {
             word.removeAll()
             droppedPrefix = ""
+            retroSafe = false
             return Unmanaged.passUnretained(event)
         }
 
         if !Config.shared.enabled || isCurrentAppExcluded {
             word.removeAll()
             droppedPrefix = ""
+            retroSafe = false
             return Unmanaged.passUnretained(event)
         }
 
         if flags.contains(.maskCommand) || flags.contains(.maskControl) {
             word.removeAll()
             droppedPrefix = ""
+            // Вставка, отмена, выделение всего — что теперь слева от курсора, неизвестно
+            retroSafe = false
+            coreNeedsReset = true
             return Unmanaged.passUnretained(event)
         }
 
@@ -546,6 +576,11 @@ final class Switcher {
         if keyCode == 51 /* Backspace */ {
             if !word.isEmpty { word.removeLast() }
             else if !droppedPrefix.isEmpty { droppedPrefix.removeLast() }
+            else {
+                // Стирают уже решённое (пробел, предыдущее слово): левый сосед ядра не тот
+                retroSafe = false
+                Core5.shared.forgetPrev()
+            }
             lastSwitch = nil
             lastCompletedWord = nil
             return Unmanaged.passUnretained(event)
@@ -572,13 +607,18 @@ final class Switcher {
             dualLayoutKeys.contains(keyCode)
             && isPunctuation(chars) && bufferLacksLetters
 
-        // Граница слова: пробел/Enter/Tab или «настоящая» пунктуация (но не layout-punct)
+        // Граница слова: пробел/Enter/Tab или «настоящая» пунктуация (но не layout-punct).
+        // Ядро 5: знак раскладки после русского слова («привет,» в RU) — тоже граница:
+        // раньше такое слово тихо выбрасывалось из буфера без всякого решения.
+        let bufferHasCyr = word.contains { $0.chars.contains { Switcher.isCyrillicLetter($0) } }
         let isWordEnd =
             keyCode == 49 || keyCode == 36 || keyCode == 76 || keyCode == 48 ||
-            (isPunctuation(chars) && !isLayoutPunct && !isShiftedDigitInNumericRun)
+            (isPunctuation(chars) && !isLayoutPunct && !isShiftedDigitInNumericRun) ||
+            (Config.shared.coreV5 && isLayoutPunct && bufferHasCyr && !(firstChar?.isLetter ?? false))
 
         if isWordEnd {
             if keyCode == 36 || keyCode == 76 { Detector.resolvedInSentence.removeAll() }   // Enter — конец предложения
+            let v5 = Config.shared.coreV5
             if !word.isEmpty {
                 let text = word.map { $0.chars }.joined()
                 let cur = InputSource.currentLanguage()
@@ -596,40 +636,82 @@ final class Switcher {
                 // систему: в обработчике тапа любой лишний запрос — риск задержать
                 // ввод во всей системе.
                 let frontApp = lastUserAppBundleId ?? "?"
-                // Сети — три последних слова как они на экране (ближайшее первым)
-                // и приложение, где идёт ввод.
-                // Ближайшие 3 слова — сосед и контекст; дальше по истории детектор
-                // ищет те же клавиши, уже занятые в этом предложении.
+                // Ближайшие слова как они на экране (ближайшее первым) — сосед и тема.
                 let recentWords = Array(wordHistory.suffix(8).reversed())
+                let appId = focusApp ?? lastUserAppBundleId
+                let field = AXSelection.focusedFieldKindCached()
+                // Ядро 5: между предыдущим словом и этим на экране ровно один пробел?
+                let sepIsSpace = v5 && retroSafe && droppedPrefix.isEmpty
+                if v5 {
+                    // Начало ввода (клик, другое приложение, навигация, долгая пауза):
+                    // левого соседа нет — ожидание по приложению (и адресной строке).
+                    let now = Date()
+                    if coreNeedsReset || now.timeIntervalSince(lastBoundaryTime) > 90 {
+                        let pr = field == "address" ? 0.05 : AppLangStats.shared.priorRu(appId)
+                        Core5.shared.reset(priorRu: pr)
+                        coreNeedsReset = false
+                        print("  [det] ядро5: начало ввода, ожидание P(ru)=\(String(format: "%.2f", pr)) (\(field == "address" ? "адресная строка" : Config.shared.appClass(for: appId).name))")
+                    }
+                    lastBoundaryTime = now
+                }
                 let blind = editingBlind
                 if chars.contains(where: { $0.isWhitespace || $0.isNewline }) { editingBlind = false }
-                if blind {
+                // Слепой режим после навигации (v5) — только для коротких: длинное слово
+                // набрано целиком после курсора, обломком чужого слова оно не бывает.
+                let maxLetters = max(text.filter { $0.isLetter }.count,
+                                     Detector.shared.swap(text).filter { $0.isLetter }.count)
+                let blindHere = blind && (!v5 || maxLetters <= 3)
+                if blindHere {
                     print("  [det] '\(text)' после навигации курсором — не видим окружения → keep")
                 }
-                let structural = !blind && isStructural(text: text, prefix: droppedPrefix, trigger: chars)
+                let structural = !blindHere && isStructural(text: text, prefix: droppedPrefix, trigger: chars)
                 if structural {
                     print("  [det] '\(text)' в формуле/списке (префикс '\(droppedPrefix)', граница '\(chars)') → keep")
                 }
-                let appId = focusApp ?? lastUserAppBundleId
-                let willSwitch = !structural && !blind
-                    && Detector.shouldSwitch(word: text, currentLang: cur, context: context,
-                                             history: recentWords, app: appId,
-                                             topic: topicRecentFirst(app: appId),
-                                             field: AXSelection.focusedFieldKindCached())
+                var verdict = Detector.Verdict(shown: text)
+                if structural || blindHere {
+                    if v5 { Core5.shared.noteExternal(typed: text, shown: text, confident: false) }
+                    Detector.lastReason = structural ? "structure" : "blind"
+                } else {
+                    verdict = Detector.decide(word: text, currentLang: cur, context: context,
+                                              history: recentWords, app: appId,
+                                              topic: topicRecentFirst(app: appId),
+                                              field: field, sepIsSpace: sepIsSpace)
+                }
+                let willSwitch = verdict.shown != text
+                // Задним числом — только если предыдущее слово на экране именно то
+                var retro: (from: String, to: String)? = nil
+                if let to = verdict.retroPrev, let from = verdict.retroFrom {
+                    if sepIsSpace, let last = wordHistory.last, last == from, !isPinned(wordHistory.count - 1) {
+                        retro = (from, to)
+                    } else {
+                        print("  [det] ядро5: предыдущее '\(from)' → '\(to)' — на экране не то, задним числом не правлю")
+                    }
+                }
                 let appMark = (focusApp != nil && focusApp != frontApp)
                     ? "\(frontApp)/фокус:\(focusApp!)" : frontApp
                 print("[\(Switcher.ts())] [boundary] '\(text)' (\(cur), ctx=\(context.map { String(describing: $0) } ?? "nil"), app=\(appMark)) → \(willSwitch ? "SWITCH" : "keep")")
                 SecureLog.shared.append("[boundary] '\(text)' (\(cur)) → \(willSwitch ? "SWITCH" : "keep")")
-                if willSwitch {
+                // Какой язык остаётся на экране в этом приложении — ожидание для первых слов
+                if v5, field != "address", field != "password" {
+                    AppLangStats.shared.note(appId, lang: Core5.lang(verdict.shown))
+                    if let r = retro {
+                        AppLangStats.shared.note(appId, lang: Core5.lang(r.from), delta: -1)
+                        AppLangStats.shared.note(appId, lang: Core5.lang(r.to))
+                    }
+                }
+                if willSwitch || retro != nil {
                     let replay = word
                     let trigger = Keystroke(keyCode: keyCode, flags: flags, chars: chars)
                     word.removeAll()
                     droppedPrefix = ""
-                    // В истории сохраняем уже свапнутую версию
-                    let swapped = Detector.shared.swap(text)
                     commitPendingCorrection()
-                    appendToHistory(swapped)
+                    // В истории — то, что будет на экране
+                    if let r = retro, !wordHistory.isEmpty { wordHistory[wordHistory.count - 1] = r.to }
+                    appendToHistory(v5 ? verdict.shown : Detector.shared.swap(text))
                     lastTrigger = chars
+                    // Батч сам напечатает границу — если это пробел, следующее слово встанет вплотную
+                    retroSafe = (keyCode == 49)
 
                     // v4 — «tap как замок»: собираем и отправляем замену ПРЯМО
                     // ЗДЕСЬ, не выходя из callback'а. Пока он не вернулся,
@@ -639,7 +721,12 @@ final class Switcher {
                     // Клавишу-границу съедаем: её печатает сам батч.
                     // Ни пауз, ни шлюза, ни очереди — гонка невозможна.
                     if Config.shared.engineV4 {
-                        performSwitchInline(proxy: proxy, replay: replay, trigger: trigger, fromLang: cur)
+                        if v5 {
+                            performCore5Inline(proxy: proxy, replay: replay, trigger: trigger, fromLang: cur,
+                                               shown: verdict.shown, retro: retro)
+                        } else {
+                            performSwitchInline(proxy: proxy, replay: replay, trigger: trigger, fromLang: cur)
+                        }
                         return nil
                     }
 
@@ -648,8 +735,13 @@ final class Switcher {
                     // нажатие успевает проскочить в приложение и попасть под
                     // backspace.
                     beginGate()
+                    let shown = verdict.shown
                     DispatchQueue.main.async { [weak self] in
-                        self?.performSwitch(replay: replay, trigger: trigger, fromLang: cur)
+                        if v5 {
+                            self?.performCore5(replay: replay, trigger: trigger, fromLang: cur, shown: shown, retro: retro)
+                        } else {
+                            self?.performSwitch(replay: replay, trigger: trigger, fromLang: cur)
+                        }
                     }
                     return nil
                 }
@@ -658,6 +750,7 @@ final class Switcher {
                 lastConversionTarget = nil
                 appendToHistory(text, pinned: structural)
                 lastTrigger = chars
+                retroSafe = (keyCode == 49)
                 // Обучение на ПРИНЯТОМ: если клавиши уже известны профилю (это
                 // коллизия, которую человек правил) и слово прошло без исправления —
                 // это пример в пользу того чтения, как набрано. Но не сразу: пример
@@ -677,6 +770,7 @@ final class Switcher {
                     chars: text,
                     triggerKeyCode: keyCode,
                     lang: cur,
+                    triggerChars: chars,
                     prefix: droppedPrefix,
                     keys: word
                 )
@@ -688,6 +782,11 @@ final class Switcher {
                 if let q = Detector.takePendingArbiter(), Arbiter.shared.available {
                     askArbiter(q, typed: text)
                 }
+            } else {
+                // Граница без слова (второй пробел, знак, Enter): соседство слов нарушено,
+                // а для формул важен именно этот знак ('a =b').
+                lastTrigger = chars
+                retroSafe = false
             }
             lastSwitch = nil
             return Unmanaged.passUnretained(event)
@@ -706,7 +805,11 @@ final class Switcher {
             // Курсор ушёл стрелкой — возможно, внутрь слова. Что вокруг, мы не видим,
             // поэтому до первого пробела автоматика молчит: «хотке» + ← + «й» иначе
             // даёт «хоткеq» (одиночная буква решается как отдельное слово).
+            // Ядро 5 молчит так только на коротких (≤3 букв) и начинает ввод заново.
             editingBlind = true
+            lastTrigger = ""
+            retroSafe = false
+            coreNeedsReset = true
             return Unmanaged.passUnretained(event)
         }
 
@@ -738,6 +841,7 @@ final class Switcher {
                 word.removeAll()
                 droppedPrefix = ""
                 lastCompletedWord = nil
+                retroSafe = false
                 return Unmanaged.passUnretained(event)
             }
 
@@ -777,7 +881,11 @@ final class Switcher {
     /// закончилось предыдущее слово.
     private static let structureChars: Set<Character> = Set("=+-*/\\()[]{}<>|&^%$#@~:;_")
     private func isStructural(text: String, prefix: String, trigger: String) -> Bool {
-        guard text.filter({ $0.isLetter }).count <= 2 else { return false }
+        // Букв — по обоим прочтениям: в «'nj» две латинские, а по-русски это «это» из
+        // трёх (апостроф — клавиша «э»). Раньше такое слово считалось формулой.
+        let lettersTyped = text.filter({ $0.isLetter }).count
+        let lettersSwap = Detector.shared.swap(text).filter({ $0.isLetter }).count
+        guard max(lettersTyped, lettersSwap) <= 2 else { return false }
         func isStruct(_ s: String) -> Bool {
             guard let c = s.first else { return false }
             return Switcher.structureChars.contains(c) || c.isNumber
@@ -805,6 +913,10 @@ final class Switcher {
             .map(String.init)
             .filter { !$0.isEmpty }
         guard !words.isEmpty else { return }
+        // Текст на экране поменяли — соседство для задним-числом нарушено, а левый
+        // сосед ядра — то, что теперь стоит последним (решение человека окончательно).
+        retroSafe = false
+        if let last = words.last { Core5.shared.noteManual(shown: last) }
 
         // Убираем из хвоста столько записей сколько заменяем (но не больше чем есть)
         let replaceCount = min(words.count, wordHistory.count)
@@ -1188,6 +1300,7 @@ final class Switcher {
     private func dispatch(_ action: HotkeyAction) {
         manualLang = InputSource.currentLanguage()
         cancelPendingAccept()   // человек вмешался — автопример по последнему слову не пишем
+        retroSafe = false       // ручное действие меняет текст — задним числом больше не правим
         switch action {
         case .swapWord:      handleBufferSwap(explicitLearn: false)
         case .swapAndLearn:  handleBufferSwap(explicitLearn: true)
@@ -1304,16 +1417,21 @@ final class Switcher {
         // стираем вместе со словом и возвращаем на место после триггера.
         let toDelete = original.count + triggerCount + tail.count
 
+        let trig = triggerReplay(keyCode: triggerCount > 0 ? last.triggerKeyCode : 0, chars: last.triggerChars)
         emitBatch(erase: toDelete, text: translated,
-                  triggerKey: triggerCount > 0 ? last.triggerKeyCode : 0,
-                  tail: tail, switchTo: target)
+                  triggerKey: trig.key,
+                  tail: trig.text + tail, switchTo: target)
+        noteLangChange(from: original, to: translated)
+        // История (и левый сосед ядра) — то, что теперь на экране
+        syncHistoryTail(with: translated)
 
         // Сохраняем как тоггл-состояние, чтобы Option повторно можно было откатить назад
         lastSwitch = LastSwitch(
             originalChars: original,
             convertedChars: translated,
             triggerKeyCode: last.triggerKeyCode,
-            state: .converted
+            state: .converted,
+            triggerChars: last.triggerChars
         )
         lastCompletedWord = nil
         playSound()
@@ -1357,13 +1475,15 @@ final class Switcher {
                 let original = last.prefix + last.chars
                 let translated = last.prefix + r
                 let triggerCount = (last.triggerKeyCode != 0) ? 1 : 0
+                let trig = self.triggerReplay(keyCode: last.triggerKeyCode, chars: last.triggerChars)
                 self.emitBatch(erase: original.count + triggerCount, text: translated,
-                               triggerKey: triggerCount > 0 ? last.triggerKeyCode : 0,
-                               tail: "", switchTo: nil)
+                               triggerKey: trig.key,
+                               tail: trig.text, switchTo: nil)
                 self.syncHistoryTail(with: translated, pinned: false)
+                self.noteLangChange(from: original, to: translated)
                 self.lastSwitch = LastSwitch(originalChars: original, convertedChars: translated,
                                              triggerKeyCode: last.triggerKeyCode, state: .converted,
-                                             wasAutomatic: true)
+                                             wasAutomatic: true, triggerChars: last.triggerChars)
                 self.lastCompletedWord = nil
                 self.playSound(.convertOnly)
                 print("[arbiter] '\(original)' → '\(translated)'")
@@ -1506,7 +1626,8 @@ final class Switcher {
             convertedChars: translated,
             triggerKeyCode: trigger.keyCode,
             state: .converted,
-            wasAutomatic: true
+            wasAutomatic: true,
+            triggerChars: trigger.chars
         )
         lastCompletedWord = nil
         playSound(shouldSwitchLayout ? .convertAndSwitch : .convertOnly)
@@ -1591,11 +1712,128 @@ final class Switcher {
             convertedChars: translated,
             triggerKeyCode: trigger.keyCode,
             state: .converted,
-            wasAutomatic: true
+            wasAutomatic: true,
+            triggerChars: trigger.chars
         )
         lastCompletedWord = nil
 
         playSound(shouldSwitchLayout ? .convertAndSwitch : .convertOnly)
+    }
+
+    // MARK: - Ядро 5: замена слова и/или предыдущего слова задним числом
+
+    private struct Core5Plan {
+        var erase = 0
+        var text = ""
+        var origSpan = ""
+        var convSpan = ""
+        var target: InputSource.Lang? = nil
+        var switchLayout = false
+    }
+
+    /// Что стереть и что напечатать. Текущее слово — как решило ядро (со «своим»
+    /// хвостом: «ghbdtn,» → «привет,»), предыдущее — исправление задним числом.
+    private func core5Plan(original: String, fromLang: InputSource.Lang, shown: String,
+                           retro: (from: String, to: String)?) -> Core5Plan {
+        var p = Core5Plan()
+        let switched = shown != original
+        if switched {
+            let t = Switcher.langOf(shown) ?? ((fromLang == .ru) ? .en : .ru)
+            p.target = t
+            if lastConversionTarget == t { consecutiveConversions += 1 } else {
+                lastConversionTarget = t
+                consecutiveConversions = 1
+            }
+            // «yt [jxe» → «не хочу»: два слова подряд в одну сторону — смена языка подтверждена
+            if let r = retro, Switcher.langOf(r.to) == t { consecutiveConversions += 1 }
+            let threshold = Config.shared.switchLayoutAfter
+            p.switchLayout = threshold > 0 && consecutiveConversions >= threshold
+            if !p.switchLayout {
+                print("[layout] раскладку не трогаем (\(consecutiveConversions)/\(threshold) подряд)")
+            }
+        } else {
+            // Текущее слово верное — исправляется только предыдущее, раскладка уже та
+            consecutiveConversions = 0
+            lastConversionTarget = nil
+        }
+        p.erase = original.count
+        p.text = shown
+        p.origSpan = original
+        p.convSpan = shown
+        if let r = retro {
+            p.erase += 1 + r.from.count
+            p.text = r.to + " " + shown
+            p.origSpan = r.from + " " + original
+            p.convSpan = p.text
+        }
+        return p
+    }
+
+    /// v5 + v4: всё одним батчем изнутри tap-callback (как performSwitchInline).
+    private func performCore5Inline(proxy: CGEventTapProxy, replay: [Keystroke], trigger: Keystroke,
+                                    fromLang: InputSource.Lang, shown: String,
+                                    retro: (from: String, to: String)?) {
+        let original = replay.map { $0.chars }.joined()
+        let p = core5Plan(original: original, fromLang: fromLang, shown: shown, retro: retro)
+        if let r = retro { print("[retro] цепочка: \(r.from)→\(r.to)") }
+        print("[switch/v5] '\(p.origSpan)' → '\(p.convSpan)'" + (p.target.map { "  (\(fromLang) → \($0))" } ?? ""))
+
+        for _ in 0..<p.erase { postVirtualKeyInline(proxy, 51) }
+        postUnicodeInline(proxy, p.text)
+        let controlKeys: Set<CGKeyCode> = [49, 36, 48, 76]
+        if controlKeys.contains(trigger.keyCode) {
+            postVirtualKeyInline(proxy, trigger.keyCode)
+        } else if !trigger.chars.isEmpty {
+            postUnicodeInline(proxy, trigger.chars)
+        }
+        if p.switchLayout, let t = p.target {
+            DispatchQueue.main.async { InputSource.switchTo(t) }
+        }
+        lastSwitch = LastSwitch(
+            originalChars: p.origSpan,
+            convertedChars: p.convSpan,
+            triggerKeyCode: trigger.keyCode,
+            state: .converted,
+            wasAutomatic: true,
+            triggerChars: trigger.chars
+        )
+        lastCompletedWord = nil
+        playSound(p.switchLayout ? .convertAndSwitch : .convertOnly)
+    }
+
+    /// v5 + LEGACY-движок (emitQueue + шлюз, как performSwitch).
+    private func performCore5(replay: [Keystroke], trigger: Keystroke, fromLang: InputSource.Lang,
+                              shown: String, retro: (from: String, to: String)?) {
+        let original = replay.map { $0.chars }.joined()
+        let p = core5Plan(original: original, fromLang: fromLang, shown: shown, retro: retro)
+        if let r = retro { print("[retro] цепочка: \(r.from)→\(r.to)") }
+        print("[switch/v5] '\(p.origSpan)' → '\(p.convSpan)'" + (p.target.map { "  (\(fromLang) → \($0))" } ?? ""))
+        emitQueue.async { [weak self] in
+            guard let self = self else { return }
+            defer { self.endGate() }
+            self.sendBackspaces(p.erase)
+            if p.switchLayout, let t = p.target { InputSource.switchTo(t) }
+            self.postUnicode(p.text)
+            self.emitTrigger(trigger)
+        }
+        lastSwitch = LastSwitch(
+            originalChars: p.origSpan,
+            convertedChars: p.convSpan,
+            triggerKeyCode: trigger.keyCode,
+            state: .converted,
+            wasAutomatic: true,
+            triggerChars: trigger.chars
+        )
+        lastCompletedWord = nil
+        playSound(p.switchLayout ? .convertAndSwitch : .convertOnly)
+    }
+
+    /// Человек (или арбитр) поменял язык уже учтённого слова — поправить ожидание приложения.
+    private func noteLangChange(from: String, to: String) {
+        guard Config.shared.coreV5 else { return }
+        let app = AXSelection.focusedAppBundleIDCached() ?? lastUserAppBundleId
+        AppLangStats.shared.note(app, lang: Core5.lang(from), delta: -1)
+        AppLangStats.shared.note(app, lang: Core5.lang(to))
     }
 
     /// Свап кейстроков по кейкодам через ПРОТИВОПОЛОЖНУЮ раскладку — как Punto.
@@ -1655,6 +1893,10 @@ final class Switcher {
         }
 
         emitBatch(erase: original.count, text: translated, switchTo: target)
+        if Config.shared.coreV5 {
+            AppLangStats.shared.note(AXSelection.focusedAppBundleIDCached() ?? lastUserAppBundleId,
+                                     lang: Core5.lang(translated))
+        }
 
         lastSwitch = LastSwitch(
             originalChars: original,
@@ -1667,6 +1909,15 @@ final class Switcher {
         // История должна отражать то что теперь на экране, иначе контекст соврёт
         syncHistoryTail(with: translated)
         playSound()
+    }
+
+    /// Как вернуть границу слова при ручной замене: пробел/Enter/Tab — клавишей,
+    /// знак — тем же символом (клавишей в другой раскладке он стал бы другим знаком).
+    private func triggerReplay(keyCode: CGKeyCode, chars: String) -> (key: CGKeyCode, text: String) {
+        if keyCode == 0 { return (0, "") }
+        let control: Set<CGKeyCode> = [49, 36, 48, 76]
+        if control.contains(keyCode) || chars.isEmpty { return (keyCode, "") }
+        return (0, chars)
     }
 
     /// Тоггл последнего свитча — переключает между исходным и конвертированным.
@@ -1688,9 +1939,11 @@ final class Switcher {
         }
         last.timestamp = Date()
 
+        let trig = triggerReplay(keyCode: last.triggerKeyCode, chars: last.triggerChars)
         emitBatch(erase: currentText.count + triggerCount + tail.count, text: targetText,
-                  triggerKey: last.triggerKeyCode, tail: tail,
+                  triggerKey: trig.key, tail: trig.text + tail,
                   switchTo: Switcher.langOf(targetText))
+        noteLangChange(from: currentText, to: targetText)
 
         // Тоггл НЕ обучает.
         //
