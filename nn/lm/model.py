@@ -78,16 +78,68 @@ class WordLM:
         return self.lm.bi(lang, p, w)
 
 class Personal:
-    """Личные частоты: слова, которые человек оставил на экране (в своём языке)."""
+    """Личный слой: что человек оставляет на экране — слова, пары соседей, свои опечатки.
+
+    Веса: принятое слово +1, исправление (тоггл назад, ручной свап, стёр и набрал в другой
+    раскладке) +3. Доводом слово/пара становится с веса MIN — одно исправление сразу,
+    одно случайное слово — нет. Пара — с ЛЮБЫМ предыдущим словом (и другого языка:
+    «сервер HA»), хранится у языка второго слова. Опечатки: «как набрал → как исправил
+    внутри слова»; привычная опечатка читается как слово своего языка, чуть дороже.
+    В приложениях таблицы по устройствам (слияние = сумма); здесь — уже сумма.
+    """
+    MIN = 2.0
+    SMOOTH = 50.0        # к числу слов языка: пока слов мало, частоты не раздуваются
+    PAIR_SMOOTH = 5.0    # к числу вхождений первого слова пары
+    TYPO_COST = math.log(2)   # надбавка к стоимости исправленного слова
+
     def __init__(self):
-        self.c = {'ru': defaultdict(float), 'en': defaultdict(float)}
+        self.uni = {'ru': {}, 'en': {}}
         self.n = {'ru': 0.0, 'en': 0.0}
-    def add(self, lang, w, k=1.0):
-        self.c[lang][w.lower()] += k; self.n[lang] += k
+        self.bi = {'ru': {}, 'en': {}}
+        self.typos = {'ru': {}, 'en': {}}
+
+    def add(self, lang, w, k=1.0, prev=None):
+        w = w.lower(); u = self.uni[lang]
+        u[w] = u.get(w, 0.0) + k; self.n[lang] += k
+        if prev:
+            key = prev.lower() + '\x1f' + w; b = self.bi[lang]
+            b[key] = b.get(key, 0.0) + k
+
+    def add_typo(self, lang, wrong, right, k=1.0):
+        t = self.typos[lang].setdefault(wrong.lower(), {})
+        r = right.lower(); t[r] = t.get(r, 0.0) + k
+
     def cost(self, lang, w):
-        v = self.c[lang].get(w.lower())
-        if not v or v < 2: return None               # одно вхождение — не довод
-        return -math.log(v / (self.n[lang] + 50.0))
+        v = self.uni[lang].get(w.lower())
+        if v is None or v < self.MIN: return None
+        return -math.log(v / (self.n[lang] + self.SMOOTH))
+
+    def pair(self, lang, p, w):
+        v = self.bi[lang].get(p.lower() + '\x1f' + w.lower())
+        if v is None or v < self.MIN: return None
+        pl = lang_of(p) or lang          # сколько раз было само первое слово — в его языке
+        return -math.log(v / (self.uni[pl].get(p.lower(), 0.0) + self.PAIR_SMOOTH))
+
+    def typo_of(self, lang, w):
+        """Во что человек обычно исправляет это написание (самое частое; при равенстве —
+        первое по кодам символов), или None."""
+        t = self.typos[lang].get(w.lower())
+        if not t: return None
+        r, v = sorted(t.items(), key=lambda x: (-x[1], x[0]))[0]
+        return r if v >= self.MIN else None
+
+    def to_json(self):
+        return {'uni': self.uni, 'bi': self.bi, 'typo': self.typos}
+
+    @classmethod
+    def from_json(cls, d):
+        p = cls()
+        for L in ('ru', 'en'):
+            p.uni[L] = dict(d.get('uni', {}).get(L, {}))
+            p.n[L] = sum(p.uni[L].values())
+            p.bi[L] = dict(d.get('bi', {}).get(L, {}))
+            p.typos[L] = {k: dict(v) for k, v in d.get('typo', {}).get(L, {}).items()}
+        return p
 
 @dataclass
 class Params:
@@ -132,9 +184,19 @@ class Scorer:
         self.pers = personal
 
     def known(self, lang, w):
-        """−ln P_известн(w): смесь корпуса и личного, или None."""
+        """−ln P_известн(w): смесь корпуса и личного, или None. Привычная личная опечатка —
+        как исправленное слово, чуть дороже (TYPO_COST)."""
         u = self.wl.uni(lang, w)
         pc = self.pers.cost(lang, w) if self.pers else None
+        if u is None and pc is None:
+            r = self.pers.typo_of(lang, w) if self.pers else None
+            if r is not None and r != w.lower():
+                k = self._known_mix(lang, r, self.wl.uni(lang, r), self.pers.cost(lang, r))
+                return None if k is None else k + Personal.TYPO_COST
+            return None
+        return self._known_mix(lang, w, u, pc)
+
+    def _known_mix(self, lang, w, u, pc):
         if u is None and pc is None: return None
         g = self.p.gamma if pc is not None else 0.0
         pu = math.exp(-u) if u is not None else 0.0
@@ -159,7 +221,9 @@ class Scorer:
         if best is None: return None
         return best + math.log(len(cands))
 
-    def word_cost(self, w, lang, prev=None):
+    def word_cost(self, w, lang, prev=None, pprev=None):
+        """prev — предыдущее слово того же языка (пара корпуса), pprev — предыдущее слово
+        любого языка (личная пара: «сервер HA»)."""
         p = self.p
         lw = w.lower()
         k = self.known(lang, lw)
@@ -174,13 +238,19 @@ class Scorer:
             if b is not None:
                 pw = p.beta * math.exp(-b) + (1 - p.beta) * pw
                 parts['пара'] = b
+        if pprev and self.pers:
+            b = self.pers.pair(lang, pprev, lw)
+            if b is not None:
+                pw = p.beta * math.exp(-b) + (1 - p.beta) * pw
+                parts['л.пара'] = b
         return -math.log(max(pw, 1e-300)), parts
 
     def reading(self, r, lang, prev_word=None, prev_lang=None, caps=False):
         pre, cr, post = split_punct(r, lang)
         if not cr: return 60.0, {'пусто': 0.0}, cr
         prev = prev_word if (prev_word and prev_lang == lang) else None
-        cost, parts = self.word_cost(cr, lang, prev)
+        pcore = split_punct(prev_word, prev_lang)[1] if (prev_word and prev_lang) else None
+        cost, parts = self.word_cost(cr, lang, prev, pcore)
         cost += self.p.edge * (len(pre) + len(post))
         if caps:
             cp = self.ch.caps_p(cr, lang)
@@ -241,6 +311,11 @@ class Decoder:
             c2, parts2, core2 = self.s.reading(swap(cr), A, pw, pl, caps)
             if c2 < cA: cA, partsA, coreA, alt = c2, parts2, core2, swap(cr) + post
         tT = self._trans(T, prev); tA = self._trans(A, prev)
+        # личная пара через смену языка («сервер HA») уже содержит эту смену — второй раз
+        # за неё не платим
+        if prev is not None and prev.confident:
+            if 'л.пара' in partsT and T != prev.lang: tT = -math.log(1 - p.pi)
+            if 'л.пара' in partsA and A != prev.lang: tA = -math.log(1 - p.pi)
         lo = (cT + tT) - (cA + tA + p.bK)
         nT = max(1, letters(coreT, T))
         ok = self.s.is_word(coreA, A, partsA, caps, lo, partsT.get('симв', 0.0) / (nT + 1))

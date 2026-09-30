@@ -150,17 +150,21 @@ def run(sessions, dec, show=False, personal=None):
             by['старое ' + it['old']][t] += 1
             if t in ('FS', 'MS') or (it['old'] in ('FS', 'MS') and show):
                 shown.append((t, it['old'], it['typed'], r.shown, it['app'].split('.')[-1], f'{si}:{pos}', r.explain))
-        # что осталось на экране (истина) — в ожидание приложения и в личные частоты
+        # что осталось на экране (истина) — в ожидание приложения и в личный слой:
+        # принятое +1, исправленное человеком (тоггл, ручной свап, перенабор) +3,
+        # пара — с предыдущим словом той же сессии (любого языка)
+        prev_core = None
         for it, did, r in out:
-            if it.get('skip'): continue
+            if it.get('skip'): prev_core = None; continue
             fin = swap(it['typed']) if it['need_swap'] else it['typed']
             L = lang_of(fin)
-            if not L: continue
+            if not L: prev_core = None; continue
             app_lang[app][0 if L == 'ru' else 1] += 1
-            if personal is not None:
-                _, core_, _ = split_punct(fin, L)
-                if core_ and letters(core_, L) >= 2:
-                    personal.add(L, core_)
+            _, core_, _ = split_punct(fin, L)
+            if personal is not None and core_ and letters(core_, L) >= 2 and letters(core_, L) == len(core_):
+                k = 3.0 if it['old'] in ('FS', 'MS', 'preempt') else 1.0
+                personal.add(L, core_, k, prev=prev_core)
+            prev_core = core_ if core_ else None
     return res, by, shown
 
 def report(res, by, title):
@@ -176,7 +180,9 @@ if __name__ == '__main__':
     ap.add_argument('events')
     ap.add_argument('--char', required=True); ap.add_argument('--ngram', required=True)
     ap.add_argument('--show', action='store_true')
-    ap.add_argument('--personal', action='store_true', help='личные частоты: учиться на том, что осталось на экране')
+    ap.add_argument('--personal', action='store_true', help='личный слой: учиться на том, что осталось на экране')
+    ap.add_argument('--warm', action='store_true',
+                    help='с --personal: сначала весь лог в режиме «обучение», потом прогон (как через месяц)')
     ap.add_argument('--truth', default=os.path.join(HERE, 'data', 'log-truth.json'))
     ap.add_argument('--set', action='append', default=[], help='параметр=значение')
     a = ap.parse_args()
@@ -204,6 +210,11 @@ if __name__ == '__main__':
             ob['позиция ' + (str(pos) if pos < 3 else '3+')][t] += 1
     report(oc, ob, 'старое ядро')
     pers = Personal() if a.personal else None
+    if pers is not None and a.warm:
+        # режим «обучение»: ядро решает без личного слоя, слой только копит
+        run(sessions, Decoder(Scorer(a.char, a.ngram, p, None), p), personal=pers)
+        print(f"личный слой после обучения: ru {len(pers.uni['ru'])} слов, en {len(pers.uni['en'])}, "
+              f"пар {len(pers.bi['ru']) + len(pers.bi['en'])}")
     dec = Decoder(Scorer(a.char, a.ngram, p, pers), p)
     res, by, shown = run(sessions, dec, show=a.show, personal=pers)
     report(res, by, 'новое ядро')

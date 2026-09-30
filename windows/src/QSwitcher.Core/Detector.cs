@@ -69,10 +69,10 @@ public sealed class Detector
     /// </summary>
     /// sepIsSpace — между предыдущим словом и этим на экране ровно один пробел
     /// (ядро 5 может исправить предыдущее задним числом); core — свой экземпляр ядра
-    /// для прогонов, по умолчанию ядро живого ввода.
+    /// для прогонов, по умолчанию ядро живого ввода; field — "password" в поле пароля.
     public Verdict Decide(string raw, Lang currentLang, Lang? context,
                           IReadOnlyList<string>? history = null, string? app = null,
-                          bool sepIsSpace = false, Core5? core = null)
+                          bool sepIsSpace = false, Core5? core = null, string? field = null)
     {
         string lower = raw.ToLowerInvariant();
         int effectiveLen = raw.Count(c => char.IsLetter(c) || _pair.LayoutPunct.Contains(c));
@@ -101,6 +101,23 @@ public sealed class Detector
         {
             Log($"'{lower}' — выучено: не трогаем");
             return Ext(false, "learned-stop");
+        }
+
+        // Место ввода. Поле пароля — не трогаем ничего: пароль бывает и кириллицей, а
+        // исправленный «на английский» пароль не подойдёт (на маке такие поля хук не видит
+        // вовсе). Приложения из списка «английский ввод» (поиск Windows, лаунчеры): кириллица
+        // свапается сразу, латиница не трогается — как expectEnglishBundles на маке.
+        if (field == "password")
+        {
+            c5?.NoteExternal(raw, raw, confident: false);
+            return new(false, null, "password");
+        }
+        if (app is { Length: > 0 } && _cfg.EnglishApps?.Invoke() is { Count: > 0 } eng
+            && eng.Any(a => a.Length > 0 && app.Contains(a, StringComparison.OrdinalIgnoreCase)))
+        {
+            bool cyr = lower.Any(c => _pair.IsOtherLetter(c));
+            Log(cyr ? $"'{raw}' — английский ввод ({app}) → SWITCH" : $"'{raw}' — английский ввод ({app}) → keep");
+            return Ext(cyr, "place");
         }
 
         if (c5 is not null) return DecideV5(raw, lower, sepIsSpace, c5);
@@ -403,4 +420,6 @@ public sealed class DetectorConfig
     public Func<string?, LayoutNet.AppClass>? AppClassOf { get; init; }
     /// <summary>Решает ядро 5 (true) или прежний каскад (false). Читается на лету.</summary>
     public Func<bool>? CoreV5 { get; init; }
+    /// Процессы с английским вводом (меню «Английский ввод»): подстрока имени процесса.
+    public Func<IReadOnlyCollection<string>>? EnglishApps { get; init; }
 }

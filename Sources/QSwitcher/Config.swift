@@ -49,6 +49,11 @@ final class Config {
     /// В чате первое слово без контекста — скорее русское.
     private(set) var expectRussianInChat: Bool = true
 
+    /// Личный слой ядра 5: "on" — работа + обучение, "learn" — только обучение (наблюдает,
+    /// в решениях не участвует), "frozen" — только работа (не учится), "off" — выключен.
+    private(set) var personalModeRaw: String = "on"
+    var personalMode: PersonalMode { PersonalMode(rawValue: personalModeRaw) ?? .on }
+
     // Ядро решения. "v5" — одна формула (Core5.swift, эталон nn/lm/model.py): частоты
     // слов + символьная модель + опечатки + сосед + ожидание приложения; "legacy" —
     // прежний каскад (сеть, n-граммы, щит, словари). Меняется на лету.
@@ -217,6 +222,37 @@ final class Config {
         }
     }
 
+    func setPersonalMode(_ m: PersonalMode) {
+        personalModeRaw = m.rawValue
+        patchOnDisk { $0["personalMode"] = m.rawValue }
+    }
+
+    /// Импорт навыков: списки объединяются (ничего не удаляется), на диск — одной записью.
+    /// Возвращает, сколько элементов добавилось.
+    @discardableResult
+    func mergeLists(stop: [String], force: [String], excluded: [String], english: [String]) -> Int {
+        var added = 0
+        for w in stop.map({ $0.trimmingCharacters(in: .whitespaces) }) where !w.isEmpty && !stopWords.contains(w) {
+            stopWords.insert(w); added += 1
+        }
+        for w in force.map({ $0.trimmingCharacters(in: .whitespaces) }) where !w.isEmpty && !forceWords.contains(w) {
+            forceWords.insert(w); added += 1
+        }
+        for a in excluded where !a.isEmpty && !excludedApps.contains(a) { excludedApps.insert(a); added += 1 }
+        for a in english.map({ $0.lowercased() }) where !a.isEmpty && !expectEnglishBundles.contains(a) {
+            expectEnglishBundles.append(a); added += 1
+        }
+        if added > 0 {
+            patchOnDisk { json in
+                json["stopWords"] = self.stopWords.sorted()
+                json["forceWords"] = self.forceWords.sorted()
+                json["excludedApps"] = self.excludedApps.sorted()
+                json["expectEnglishBundles"] = self.expectEnglishBundles
+            }
+        }
+        return added
+    }
+
     func setArbiterEnabled(_ flag: Bool) {
         arbiterEnabled = flag
         patchOnDisk { $0["arbiterEnabled"] = flag }
@@ -281,6 +317,7 @@ final class Config {
             corePi              = json["corePi"]              as? Double ?? 0.04
             coreLayoutBias      = json["coreLayoutBias"]      as? Double ?? 1.0
             coreDeferShort      = json["coreDeferShort"]      as? Bool ?? true
+            personalModeRaw     = (json["personalMode"]       as? String ?? "on").lowercased()
             arbiterEnabled      = json["arbiterEnabled"]      as? Bool ?? false
             arbiterSocket       = json["arbiterSocket"]       as? String ?? ""
             arbiterTimeoutMs    = json["arbiterTimeoutMs"]    as? Int ?? 400

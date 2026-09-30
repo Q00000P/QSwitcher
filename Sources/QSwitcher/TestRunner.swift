@@ -141,6 +141,7 @@ enum TestRunner {
     static func runV5(_ text: String, verbose: Bool) -> Report {
         var rep = Report()
         let core = Core5(useConfig: true)
+        core.personal = PersonalLM.readOnlyShared   // как в живом вводе, но прогон его не пополняет
         for raw in text.components(separatedBy: .newlines) {
             var line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") { continue }

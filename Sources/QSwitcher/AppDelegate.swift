@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var englishAppsMenuItem: NSMenuItem!
     private var infoItem: NSMenuItem!
     private var logSubmenuItem: NSMenuItem!
+    private var personalMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Профиль старого формата — пересборка из журнала, когда все синглтоны уже живы
@@ -94,6 +95,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // установки хука, а не на первом слове: иначе первая граница платит за загрузку
         // прямо в обработчике клавиатуры, и ввод во всей системе замирает на это время.
         _ = Detector.shared
+        // Личный слой — тоже до хука: файл расшифровывается при первом обращении
+        Core5.shared.personal = PersonalLM.shared
+        PersonalLM.shared.startAutosave()
+        print("🧠 Личный слой: режим \(Config.shared.personalMode.rawValue)")
 
         switcher = Switcher()
         switcher.onLanguageChanged = { [weak self] lang in
@@ -229,6 +234,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         resetLearn.target = self
         menu.addItem(resetLearn)
 
+        // Личный слой: режим, сводка, очистка; навыки в файл и из файла (формат общий с виндой)
+        personalMenuItem = NSMenuItem(title: "Личный слой", action: nil, keyEquivalent: "")
+        personalMenuItem.submenu = NSMenu()
+        menu.addItem(personalMenuItem)
+
+        let exportItem = NSMenuItem(title: "Экспорт навыков в файл…", action: #selector(exportSkills), keyEquivalent: "")
+        exportItem.target = self
+        menu.addItem(exportItem)
+
+        let importItem = NSMenuItem(title: "Импорт навыков из файла…", action: #selector(importSkills), keyEquivalent: "")
+        importItem.target = self
+        menu.addItem(importItem)
+
         let finetune = NSMenuItem(title: "Дообучить сеть на моих исправлениях…",
                                   action: #selector(finetuneNet), keyEquivalent: "")
         finetune.target = self
@@ -284,6 +302,143 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Config.shared.reload()
         refreshDynamicMenuItems()
         refreshLogSubmenu()
+        refreshPersonalSubmenu()
+    }
+
+    // MARK: - Личный слой
+
+    private func refreshPersonalSubmenu() {
+        guard let sub = personalMenuItem?.submenu else { return }
+        sub.removeAllItems()
+        let cur = Config.shared.personalMode
+        for (m, title) in [(PersonalMode.off, "Выключен"),
+                           (PersonalMode.learn, "Обучение — только наблюдает"),
+                           (PersonalMode.on, "Работа + обучение"),
+                           (PersonalMode.frozen, "Только работа — больше не учится")] {
+            let it = NSMenuItem(title: title, action: #selector(setPersonalMode(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = m.rawValue
+            it.state = m == cur ? .on : .off
+            sub.addItem(it)
+        }
+        sub.addItem(NSMenuItem.separator())
+        let st = PersonalLM.shared.stats()
+        let nf = NumberFormatter()
+        nf.numberStyle = .decimal
+        func f(_ x: Int) -> String { nf.string(from: NSNumber(value: x)) ?? "\(x)" }
+        let i1 = NSMenuItem(title: "Слов: ru \(f(st.wordsRu)) · en \(f(st.wordsEn)) · пар \(f(st.pairs))", action: nil, keyEquivalent: "")
+        i1.isEnabled = false
+        sub.addItem(i1)
+        let i2 = NSMenuItem(title: "Исправлений \(f(Int(st.corrections))) · опечаток \(f(st.typoForms)) · устройств \(st.devices)",
+                            action: nil, keyEquivalent: "")
+        i2.isEnabled = false
+        sub.addItem(i2)
+        sub.addItem(NSMenuItem.separator())
+        let clear = NSMenuItem(title: "Очистить личный слой…", action: #selector(clearPersonal), keyEquivalent: "")
+        clear.target = self
+        sub.addItem(clear)
+    }
+
+    @objc private func setPersonalMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let m = PersonalMode(rawValue: raw) else { return }
+        Config.shared.setPersonalMode(m)
+        print("🧠 Личный слой: режим \(m.rawValue)")
+    }
+
+    @objc private func clearPersonal() {
+        let alert = NSAlert()
+        alert.messageText = "Очистить личный слой?"
+        alert.informativeText = "Все слова, пары и опечатки личного слоя будут удалены (и таблицы других устройств, "
+            + "полученные импортом). Выученные правила и списки остаются."
+        alert.addButton(withTitle: "Отмена")
+        alert.addButton(withTitle: "Очистить")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        PersonalLM.shared.clear()
+        PersonalLM.shared.save()
+        print("🧠 Личный слой очищен")
+    }
+
+    /// Пароль (скрытый ввод). confirm — второй раз для проверки. nil — отмена или не совпало.
+    private func promptPassword(title: String, message: String, confirm: Bool) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Отмена")
+        let w: CGFloat = 260
+        let box = NSSecureTextField(frame: NSRect(x: 0, y: confirm ? 30 : 0, width: w, height: 24))
+        box.placeholderString = "пароль"
+        let box2 = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: w, height: 24))
+        box2.placeholderString = "ещё раз"
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: w, height: confirm ? 54 : 24))
+        view.addSubview(box)
+        if confirm { view.addSubview(box2) }
+        alert.accessoryView = view
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = box
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let pw = box.stringValue
+        if pw.isEmpty {
+            info(title, "Пустой пароль. Для файла без пароля выбери тип «Открытый JSON».")
+            return nil
+        }
+        if confirm && pw != box2.stringValue {
+            info(title, "Пароли не совпали.")
+            return nil
+        }
+        return pw
+    }
+
+    @objc private func exportSkills() {
+        let panel = NSSavePanel()
+        panel.title = "Экспорт навыков QSwitcher"
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        panel.nameFieldStringValue = "qswitcher-\(SkillsFile.computerName)-\(df.string(from: Date())).qsskills"
+        panel.message = "Расширение .json — открытый файл без пароля, иначе — с паролем"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        var pw: String? = nil
+        if url.pathExtension.lowercased() != "json" {
+            pw = promptPassword(title: "Экспорт навыков", message: "Пароль для файла (спросится при импорте):", confirm: true)
+            if pw == nil { return }
+        }
+        do {
+            let data = try SkillsFile.pack(Skills.export(), password: pw)
+            try data.write(to: url, options: .atomic)
+            print("[skills] экспорт → \(url.path)\(pw == nil ? " (без пароля)" : "")")
+            info("Экспорт навыков", "Сохранено:\n\(url.path)" + (pw == nil ? "\n\nБез пароля — файл читается как текст." : ""))
+        } catch {
+            info("Экспорт не удался", error.localizedDescription)
+        }
+    }
+
+    @objc private func importSkills() {
+        let panel = NSOpenPanel()
+        panel.title = "Импорт навыков QSwitcher"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url)
+            var pw: String? = nil
+            if SkillsFile.isEncrypted(data) {
+                pw = promptPassword(title: "Импорт навыков", message: "Пароль файла:", confirm: false)
+                if pw == nil { return }
+            }
+            let doc = try SkillsFile.unpack(data, password: pw)
+            let report = Skills.importDoc(doc)
+            print("[skills] импорт ← \(url.path): \(report.replacingOccurrences(of: "\n", with: " "))")
+            info("Импорт навыков", report)
+        } catch SkillsFile.Failure.wrongPassword {
+            info("Импорт навыков", "Неверный пароль или файл повреждён.")
+        } catch SkillsFile.Failure.notSkills {
+            info("Импорт навыков", "Это не файл навыков QSwitcher.")
+        } catch {
+            info("Импорт не удался", error.localizedDescription)
+        }
     }
 
     private func refreshDynamicMenuItems() {
@@ -1178,6 +1333,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         SecureLog.shared.stop()
+        // Личный слой — отложенное слово засчитать и записать (синхронно: процесс завершается)
+        if Core5.shared.personal != nil {
+            PersonalLM.shared.flush()
+            PersonalLM.shared.save(sync: true)
+        }
     }
 
     // MARK: - Word input dialog

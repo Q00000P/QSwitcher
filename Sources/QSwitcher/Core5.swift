@@ -260,6 +260,29 @@ final class AppLangStats {
         save(s)
     }
 
+    /// Копия счётчиков (экспорт навыков).
+    func allCounts() -> [String: [Double]] {
+        lock.lock(); defer { lock.unlock() }
+        return counts
+    }
+
+    /// Слить счётчики из файла навыков: по каждому приложению и языку — большее (повторный
+    /// импорт того же файла ничего не удваивает). Возвращает, сколько приложений изменилось.
+    @discardableResult
+    func mergeMax(_ other: [String: [Double]]) -> Int {
+        lock.lock()
+        var changed = 0
+        for (app, v) in other where v.count == 2 {
+            var c = counts[app] ?? [0, 0]
+            var ch = false
+            for i in 0..<2 where v[i] > c[i] { c[i] = v[i]; ch = true }
+            if ch { counts[app] = c; changed += 1 }
+        }
+        lock.unlock()
+        if changed > 0 { saveNow() }
+        return changed
+    }
+
     private func save(_ snapshot: [String: [Double]]) {
         guard let d = try? JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys]) else { return }
         try? d.write(to: url, options: .atomic)
@@ -277,6 +300,7 @@ final class Core5 {
     struct Params {
         var alpha = 0.03        // доля новых/редких слов (символьная модель)
         var tau = 0.02          // доля опечаток
+        var gamma = 0.3         // вес личных частот (личный слой)
         var beta = 0.5          // вес пары с предыдущим словом
         var pi = 0.04           // смена языка между соседними словами
         var bK = 1.0            // «язык не совпадает с раскладкой»
@@ -312,6 +336,7 @@ final class Core5 {
         var char = 0.0
         var typo: Double? = nil
         var pair: Double? = nil
+        var pPair: Double? = nil        // личная пара с предыдущим словом
         var caps: Double? = nil
         var text: String {
             var s: [String] = []
@@ -319,6 +344,7 @@ final class Core5 {
             s.append(String(format: "симв %.1f", char))
             if let t = typo { s.append(String(format: "опеч %.1f", t)) }
             if let pr = pair { s.append(String(format: "пара %.1f", pr)) }
+            if let pp = pPair { s.append(String(format: "л.пара %.1f", pp)) }
             if let c = caps { s.append(String(format: "капс %.1f", c)) }
             return "{" + s.joined(separator: ", ") + "}"
         }
@@ -349,6 +375,11 @@ final class Core5 {
     ]
 
     init(useConfig: Bool = true) { self.useConfig = useConfig }
+
+    /// Личный слой (PersonalLM.swift): участвует в решениях в режимах «работа + обучение» и
+    /// «только работа». nil или другой режим — ядро как без него.
+    var personal: PersonalLM? = nil
+    private var pers: PersonalLM? { (personal?.uses ?? false) ? personal : nil }
 
     private func applyConfig() {
         let c = Config.shared
@@ -461,8 +492,29 @@ final class Core5 {
 
     // MARK: модель
 
+    /// −ln P_известн(слово): смесь частот корпуса и личных (γ), или nil. Привычная личная
+    /// опечатка — как исправленное слово, чуть дороже (PersonalLM.typoCost).
     private func known(_ lang: String, _ w: String) -> Double? {
-        return NgramLM.shared.uniD(lang, w)
+        let u = NgramLM.shared.uniD(lang, w)
+        let ps = pers
+        let pc = ps?.cost(lang, w)
+        if u == nil && pc == nil {
+            if let pl = ps, let r = pl.typoOf(lang, w), r != w.lowercased() {
+                guard let k = knownMix(NgramLM.shared.uniD(lang, r), pl.cost(lang, r)) else { return nil }
+                return k + PersonalLM.typoCost
+            }
+            return nil
+        }
+        return pc == nil ? u : knownMix(u, pc)
+    }
+
+    private func knownMix(_ u: Double?, _ pc: Double?) -> Double? {
+        if u == nil && pc == nil { return nil }
+        let g = pc != nil ? p.gamma : 0.0
+        let pu: Double = u.map { exp(-$0) } ?? 0.0
+        let pp: Double = pc.map { exp(-$0) } ?? 0.0
+        let sum = (1 - g) * pu + g * pp
+        return sum > 0 ? -log(sum) : nil
     }
 
     /// Ближайшее известное слово в одной правке: −ln P(соседа) + ln(число правок).
@@ -489,7 +541,9 @@ final class Core5 {
         return b + log(Double(cands.count))
     }
 
-    private func wordCost(_ w: String, _ lang: String, prevWord: String?) -> (Double, Parts) {
+    /// prevWord — предыдущее слово того же языка (пара корпуса), pprev — ядро предыдущего
+    /// слова любого языка (личная пара: «сервер HA»).
+    private func wordCost(_ w: String, _ lang: String, prevWord: String?, pprev: String?) -> (Double, Parts) {
         let lw = w.lowercased()
         var parts = Parts()
         let k = known(lang, lw)
@@ -506,6 +560,10 @@ final class Core5 {
             pw = p.beta * exp(-b) + (1 - p.beta) * pw
             parts.pair = b
         }
+        if let pp = pprev, !pp.isEmpty, let ps = pers, let b = ps.pair(lang, pp, lw) {
+            pw = p.beta * exp(-b) + (1 - p.beta) * pw
+            parts.pPair = b
+        }
         return (-log(max(pw, 1e-300)), parts)
     }
 
@@ -513,7 +571,9 @@ final class Core5 {
         let (pre, cr, post) = Core5.splitPunct(r, lang)
         if cr.isEmpty { return (60, Parts(), cr) }
         let pw = (prevWord != nil && prevLang == lang) ? prevWord : nil
-        var (cost, parts) = wordCost(cr, lang, prevWord: pw)
+        var pcore: String? = nil
+        if let pv = prevWord, let pl = prevLang, !pl.isEmpty { pcore = Core5.splitPunct(pv, pl).1 }
+        var (cost, parts) = wordCost(cr, lang, prevWord: pw, pprev: pcore)
         cost += p.edge * Double(pre.count + post.count)
         if caps {
             let cp: Double
@@ -576,7 +636,13 @@ final class Core5 {
             let (c2, parts2, core2) = reading(a2, A, prevWord: pw, prevLang: pl, caps: caps)
             if c2 < cA { cA = c2; partsA = parts2; coreA = core2; alt = a2 + post }
         }
-        let tT = trans(T, prev), tA = trans(A, prev)
+        var tT = trans(T, prev), tA = trans(A, prev)
+        // личная пара через смену языка («сервер HA») уже содержит эту смену — второй раз
+        // за неё не платим
+        if let pv = prev, pv.confident {
+            if partsT.pPair != nil && T != pv.lang { tT = -log(1 - p.pi) }
+            if partsA.pPair != nil && A != pv.lang { tA = -log(1 - p.pi) }
+        }
         let lo = (cT + tT) - (cA + tA + p.bK)
         let nT = max(1, Core5.letters(coreT, T))
         s.ok = isWord(coreA, A, partsA, caps: caps, lo: lo, typedCpc: partsT.char / Double(nT + 1))
@@ -682,30 +748,41 @@ final class Core5 {
                 print("  ✗ символьная '\(w)' [\(l)] \(String(format: "%.4f", got)) ≠ \(String(format: "%.4f", e))")
             }
         }
-        let c = Core5(useConfig: false)
-        for seq in (j["seqs"] as? [[String: Any]]) ?? [] {
-            let pr = (seq["prior"] as? NSNumber)?.doubleValue ?? 0.5
-            c.reset(priorRu: pr)
-            for row in (seq["words"] as? [[Any]]) ?? [] {
-                guard row.count == 5, let typed = row[0] as? String, let shown = row[1] as? String,
-                      let lo = (row[2] as? NSNumber)?.doubleValue else { continue }
-                let pend = (row[3] as? NSNumber)?.boolValue ?? false
-                let retro = (row[4] as? NSNumber)?.boolValue ?? false
-                let T = Core5.lang(typed)
-                if T.isEmpty { continue }
-                let r = c.decide(typed: typed, alt: Core5.letterSwap(typed), T: T, sepIsSpace: true, swap: Core5.letterSwap)
-                checked += 1
-                let okShown = r.shown == shown, okLo = abs(r.lo - lo) <= 0.05
-                let okPend = r.pending == pend, okRetro = (r.retroPrev != nil) == retro
-                if !(okShown && okLo && okPend && okRetro) {
-                    bad += 1
-                    if verbose || bad <= 20 {
-                        print("  ✗ '\(typed)' → '\(r.shown)' (ждали '\(shown)') LO \(String(format: "%.3f", r.lo)) (ждали \(String(format: "%.3f", lo)))"
-                              + (okPend ? "" : " отложено \(r.pending)") + (okRetro ? "" : " ретро \(r.retroPrev ?? "-")"))
-                        if verbose { print("     \(r.explain)") }
+        func runSeqs(_ c: Core5, _ seqs: [[String: Any]], _ tag: String) {
+            for seq in seqs {
+                let pr = (seq["prior"] as? NSNumber)?.doubleValue ?? 0.5
+                c.reset(priorRu: pr)
+                for row in (seq["words"] as? [[Any]]) ?? [] {
+                    guard row.count == 5, let typed = row[0] as? String, let shown = row[1] as? String,
+                          let lo = (row[2] as? NSNumber)?.doubleValue else { continue }
+                    let pend = (row[3] as? NSNumber)?.boolValue ?? false
+                    let retro = (row[4] as? NSNumber)?.boolValue ?? false
+                    let T = Core5.lang(typed)
+                    if T.isEmpty { continue }
+                    let r = c.decide(typed: typed, alt: Core5.letterSwap(typed), T: T, sepIsSpace: true, swap: Core5.letterSwap)
+                    checked += 1
+                    let okShown = r.shown == shown, okLo = abs(r.lo - lo) <= 0.05
+                    let okPend = r.pending == pend, okRetro = (r.retroPrev != nil) == retro
+                    if !(okShown && okLo && okPend && okRetro) {
+                        bad += 1
+                        if verbose || bad <= 20 {
+                            var msg = "  ✗\(tag) '\(typed)' → '\(r.shown)' (ждали '\(shown)') "
+                            msg += "LO \(String(format: "%.3f", r.lo)) (ждали \(String(format: "%.3f", lo)))"
+                            if !okPend { msg += " отложено \(r.pending)" }
+                            if !okRetro { msg += " ретро \(r.retroPrev ?? "-")" }
+                            print(msg)
+                            if verbose { print("     \(r.explain)") }
+                        }
                     }
                 }
             }
+        }
+        runSeqs(Core5(useConfig: false), (j["seqs"] as? [[String: Any]]) ?? [], "")
+        // С личным слоем эталона (выдуманные открытые фразы) — стоимости и решения те же
+        if let pj = j["personal"] as? [String: Any], let pseqs = j["pseqs"] as? [[String: Any]] {
+            let cp = Core5(useConfig: false)
+            cp.personal = PersonalLM.fromReference(pj)
+            runSeqs(cp, pseqs, " (личный слой)")
         }
         return (checked, bad)
     }

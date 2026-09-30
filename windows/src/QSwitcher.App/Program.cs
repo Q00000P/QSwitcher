@@ -120,6 +120,13 @@ internal static class Program
         var ngram = NgramLM.Load(Res.Open, Log);
         var charLm = CharLM.Load(Res.Open, Log);
         var core = MakeCore(cfg, ngram, charLm);
+        // Личный слой: что человек оставляет на экране (зашифрован DPAPI, режим — из конфига)
+        var personal = PersonalStore.Load(DataDir, Log);
+        personal.ModeSource = () => cfg.PersonalModeValue;
+        personal.Swap = pair.Swap;
+        core.Personal = personal;
+        Log($"🧠 Личный слой: режим {AppConfig.ModeName(cfg.PersonalModeValue)}");
+        void SavePersonal() => PersonalStore.Save(personal, DataDir, Log);
         var appStats = new AppLangStats(Path.Combine(DataDir, "app-lang.json"), app =>
         {
             var cls = cfg.AppClassOf(app);
@@ -174,6 +181,7 @@ internal static class Program
         using var monitor = new KeyboardMonitor(detector, pair, replacer, learned, Log)
         {
             Corrections = corrections,
+            Personal = personal,
             EngineV4 = engineV4,
             Foreground = foreground,
             AppStats = appStats,
@@ -187,7 +195,13 @@ internal static class Program
             RetroPrepositionsOnly = cfg.RetroPrepositionsOnly,
             SwitchLayoutAfter = cfg.SwitchLayoutAfter,
         };
-        using var tray = new TrayUi(cfg, learned, secureLog, pair, Log, net, corrections);
+        using var tray = new TrayUi(cfg, learned, secureLog, pair, Log, net, corrections,
+                                    personal, appStats, SavePersonal);
+        // Личный слой — на диск раз в 5 минут, если менялся, и при выходе
+        using var personalTimer = new System.Threading.Timer(_ =>
+        {
+            if (personal.Dirty > 0) SavePersonal();
+        }, null, 300_000, 300_000);
         tray.IsPaused = () => monitor.Paused;
         tray.TogglePause = monitor.TogglePause;
         tray.StartUpdateChecks(cfg, Log);
@@ -201,6 +215,8 @@ internal static class Program
         Application.Run();
         learned.Flush();
         appStats.SaveNow();
+        personal.Flush();
+        SavePersonal();
     }
 
     /// <summary>Ядро 5 с параметрами из config.json — читаются на каждое решение,
@@ -230,6 +246,7 @@ internal static class Program
                 Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen, cfg.NnThresholdShort),
                 AppClassOf = cfg.AppClassOf,
                 CoreV5 = () => cfg.CoreOn,
+                EnglishApps = () => cfg.EnglishApps,
             }, log, net, core);
 }
 
@@ -271,7 +288,7 @@ public static class AppVersion
 {
     public const string Version = "4.0";
     /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
-    public const string Build = "wave15";
+    public const string Build = "wave16";
 }
 
 /// <summary>
@@ -308,6 +325,33 @@ public sealed class AppConfig
     public double CoreLayoutBias { get; set; } = 1.0;
     /// Короткое неуверенное слово ждёт правого соседа и исправляется задним числом.
     public bool CoreDeferShort { get; set; } = true;
+
+    /// Личный слой ядра 5: "on" — работа + обучение, "learn" — только обучение (наблюдает,
+    /// в решениях не участвует), "frozen" — только работа (не учится), "off" — выключен.
+    public string PersonalMode { get; set; } = "on";
+    [System.Text.Json.Serialization.JsonIgnore]
+    public QSwitcher.Core.PersonalMode PersonalModeValue => (PersonalMode ?? "").ToLowerInvariant() switch
+    {
+        "off" => QSwitcher.Core.PersonalMode.Off,
+        "learn" => QSwitcher.Core.PersonalMode.Learn,
+        "frozen" => QSwitcher.Core.PersonalMode.Frozen,
+        _ => QSwitcher.Core.PersonalMode.On,
+    };
+    public static string ModeName(QSwitcher.Core.PersonalMode m) => m switch
+    {
+        QSwitcher.Core.PersonalMode.Off => "off",
+        QSwitcher.Core.PersonalMode.Learn => "learn",
+        QSwitcher.Core.PersonalMode.Frozen => "frozen",
+        _ => "on",
+    };
+
+    /// Процессы с английским вводом (меню «Английский ввод»): кириллица свапается сразу,
+    /// латиница не трогается. Поиск Windows, PowerToys Run, Flow Launcher — как Spotlight,
+    /// Raycast и Alfred на маке. Совпадение — подстрока имени процесса.
+    public List<string> EnglishApps { get; set; } = new()
+    {
+        "SearchHost", "SearchApp", "PowerToys.PowerLauncher", "Flow.Launcher",
+    };
 
     /// <summary>Горячие клавиши. Переназначаются через меню трея.</summary>
     public HotkeyMap Hotkeys { get; set; } = new();
@@ -485,6 +529,8 @@ public sealed class AppConfig
         CorePi = fresh.CorePi;
         CoreLayoutBias = fresh.CoreLayoutBias;
         CoreDeferShort = fresh.CoreDeferShort;
+        PersonalMode = fresh.PersonalMode;
+        EnglishApps.Clear(); EnglishApps.AddRange(fresh.EnglishApps);
         log("🔄 Конфиг перечитан (горячие клавиши и движок — после перезапуска)");
     }
 
@@ -504,7 +550,8 @@ public sealed class TrayUi : IDisposable
 
     public TrayUi(AppConfig cfg, LearnedRules learned, SecureLog secureLog,
                   LayoutPair pairForRules, Action<string> log,
-                  LayoutNet? net = null, Corrections? corrections = null)
+                  LayoutNet? net = null, Corrections? corrections = null,
+                  PersonalLM? personal = null, AppLangStats? appStats = null, Action? savePersonal = null)
     {
         var menu = new ContextMenuStrip();
 
@@ -560,6 +607,36 @@ public sealed class TrayUi : IDisposable
         // Пустышка, чтобы стрелка подменю была видна до первого открытия
         excludedListItem.DropDownItems.Add(new ToolStripMenuItem("…") { Enabled = false });
         menu.Items.Add(excludedListItem);
+
+        // === Английский ввод (как на маке): кириллица свапается сразу, латиница не трогается ===
+        var englishItem = new ToolStripMenuItem("Английский ввод: текущее приложение");
+        englishItem.Click += (_, _) =>
+        {
+            var p = _lastForeignProcess;
+            if (string.IsNullOrEmpty(p)) return;
+            int i = cfg.EnglishApps.FindIndex(x => string.Equals(x, p, StringComparison.OrdinalIgnoreCase));
+            if (i >= 0) { cfg.EnglishApps.RemoveAt(i); log($"[english] убран {p}"); }
+            else { cfg.EnglishApps.Add(p); log($"[english] добавлен {p}"); }
+            cfg.Save();
+        };
+        menu.Items.Add(englishItem);
+
+        var englishListItem = new ToolStripMenuItem("Приложения с английским вводом");
+        englishListItem.DropDownOpening += (_, _) =>
+        {
+            englishListItem.DropDownItems.Clear();
+            englishListItem.DropDownItems.Add(new ToolStripMenuItem("Кириллица — сразу в латиницу, латиница — как есть") { Enabled = false });
+            foreach (var p in cfg.EnglishApps.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+            {
+                var it = new ToolStripMenuItem($"{p}    ✕") { ToolTipText = "Клик — убрать из списка" };
+                it.Click += (_, _) => { cfg.EnglishApps.RemoveAll(x => string.Equals(x, p, StringComparison.OrdinalIgnoreCase)); cfg.Save(); };
+                englishListItem.DropDownItems.Add(it);
+            }
+            if (cfg.EnglishApps.Count == 0)
+                englishListItem.DropDownItems.Add(new ToolStripMenuItem("(список пуст)") { Enabled = false });
+        };
+        englishListItem.DropDownItems.Add(new ToolStripMenuItem("…") { Enabled = false });
+        menu.Items.Add(englishListItem);
 
         menu.Items.Add(new ToolStripSeparator());
 
@@ -718,6 +795,124 @@ public sealed class TrayUi : IDisposable
         };
         menu.Items.Add(resetLearnedItem);
 
+        // === Личный слой: режим, сводка, очистка ===
+        ToolStripMenuItem? personalItem = null;
+        if (personal is not null)
+        {
+            personalItem = new ToolStripMenuItem("Личный слой");
+            var modeItems = new List<(QSwitcher.Core.PersonalMode Mode, ToolStripMenuItem Item)>();
+            foreach (var (m, text) in new (QSwitcher.Core.PersonalMode, string)[]
+                     {
+                         (QSwitcher.Core.PersonalMode.Off, "Выключен"),
+                         (QSwitcher.Core.PersonalMode.Learn, "Обучение — только наблюдает"),
+                         (QSwitcher.Core.PersonalMode.On, "Работа + обучение"),
+                         (QSwitcher.Core.PersonalMode.Frozen, "Только работа — больше не учится"),
+                     })
+            {
+                var it = new ToolStripMenuItem(text);
+                var mode = m;
+                it.Click += (_, _) =>
+                {
+                    cfg.PersonalMode = AppConfig.ModeName(mode);
+                    cfg.Save();
+                    log($"🧠 Личный слой: режим {cfg.PersonalMode}");
+                };
+                personalItem.DropDownItems.Add(it);
+                modeItems.Add((mode, it));
+            }
+            personalItem.DropDownItems.Add(new ToolStripSeparator());
+            var info1 = new ToolStripMenuItem("") { Enabled = false };
+            var info2 = new ToolStripMenuItem("") { Enabled = false };
+            personalItem.DropDownItems.Add(info1);
+            personalItem.DropDownItems.Add(info2);
+            personalItem.DropDownItems.Add(new ToolStripSeparator());
+            var clearItem = new ToolStripMenuItem("Очистить личный слой…");
+            clearItem.Click += (_, _) =>
+            {
+                if (MessageBox.Show("Все слова, пары и опечатки личного слоя будут удалены (и таблицы других устройств, " +
+                                    "полученные импортом). Выученные правила и списки остаются.",
+                                    "Очистить личный слой?", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                    return;
+                personal.Clear();
+                savePersonal?.Invoke();
+                log("🧠 Личный слой очищен");
+            };
+            personalItem.DropDownItems.Add(clearItem);
+            personalItem.DropDownOpening += (_, _) =>
+            {
+                var cur = cfg.PersonalModeValue;
+                foreach (var (m, it) in modeItems) it.Checked = m == cur;
+                var st = personal.Stats();
+                info1.Text = $"Слов: ru {st.WordsRu:N0} · en {st.WordsEn:N0} · пар {st.Pairs:N0}";
+                info2.Text = $"Исправлений {st.Corrections:N0} · опечаток {st.TypoForms:N0} · устройств {st.Devices}";
+            };
+            menu.Items.Add(personalItem);
+
+            // === Навыки в файл и из файла (формат общий с маком) ===
+            var exportItem = new ToolStripMenuItem("Экспорт навыков в файл…");
+            exportItem.Click += (_, _) =>
+            {
+                using var dlg = new SaveFileDialog
+                {
+                    Title = "Экспорт навыков QSwitcher",
+                    Filter = "Навыки QSwitcher с паролем (*.qsskills)|*.qsskills|Открытый JSON без пароля (*.json)|*.json",
+                    FileName = $"qswitcher-{Environment.MachineName}-{DateTime.Now:yyyy-MM-dd}.qsskills",
+                };
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+                string? pw = null;
+                if (!dlg.FileName.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                {
+                    pw = PromptPassword("Пароль для файла (спросится при импорте):", "Экспорт навыков", confirm: true);
+                    if (pw is null) return;
+                }
+                try
+                {
+                    var doc = Skills.Export(cfg, learned, appStats ?? new AppLangStats(Path.Combine(Program.DataDir, "app-lang.json"), _ => 0.5),
+                                            personal, Program.DataDir);
+                    File.WriteAllBytes(dlg.FileName, SkillsFile.Pack(doc, pw));
+                    log($"[skills] экспорт → {dlg.FileName}{(pw is null ? " (без пароля)" : "")}");
+                    MessageBox.Show($"Сохранено:\n{dlg.FileName}" + (pw is null ? "\n\nБез пароля — файл читается как текст." : ""),
+                                    "Экспорт навыков");
+                }
+                catch (Exception e) { MessageBox.Show(e.Message, "Экспорт не удался", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            };
+            menu.Items.Add(exportItem);
+
+            var importItem = new ToolStripMenuItem("Импорт навыков из файла…");
+            importItem.Click += (_, _) =>
+            {
+                using var dlg = new OpenFileDialog
+                {
+                    Title = "Импорт навыков QSwitcher",
+                    Filter = "Навыки QSwitcher (*.qsskills;*.json)|*.qsskills;*.json|Все файлы (*.*)|*.*",
+                };
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+                try
+                {
+                    byte[] data = File.ReadAllBytes(dlg.FileName);
+                    string? pw = null;
+                    if (SkillsFile.IsEncrypted(data))
+                    {
+                        pw = PromptPassword("Пароль файла:", "Импорт навыков", confirm: false);
+                        if (pw is null) return;
+                    }
+                    var doc = SkillsFile.Unpack(data, pw);
+                    string report = Skills.Import(doc, cfg, learned,
+                                                  appStats ?? new AppLangStats(Path.Combine(Program.DataDir, "app-lang.json"), _ => 0.5),
+                                                  personal, Program.DataDir);
+                    savePersonal?.Invoke();
+                    log($"[skills] импорт ← {dlg.FileName}: {report.Replace('\n', ' ')}");
+                    MessageBox.Show(report, "Импорт навыков");
+                }
+                catch (SkillsFile.WrongPasswordException)
+                {
+                    MessageBox.Show("Неверный пароль или файл повреждён.", "Импорт навыков", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                catch (Exception e) { MessageBox.Show(e.Message, "Импорт не удался", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            };
+            menu.Items.Add(importItem);
+        }
+
         // === Сеть-детектор: дообучение и сброс ===
         if (net is not null && corrections is not null)
         {
@@ -846,6 +1041,18 @@ public sealed class TrayUi : IDisposable
             excludeCurrentItem.Text = string.IsNullOrEmpty(_lastForeignProcess)
                 ? "Исключить: (нет окна)" : $"Исключить: {_lastForeignProcess}";
             excludeCurrentItem.Enabled = !string.IsNullOrEmpty(_lastForeignProcess);
+            if (string.IsNullOrEmpty(_lastForeignProcess))
+            {
+                englishItem.Text = "Английский ввод: текущее приложение";
+                englishItem.Enabled = false;
+            }
+            else
+            {
+                bool on = cfg.EnglishApps.Any(x => string.Equals(x, _lastForeignProcess, StringComparison.OrdinalIgnoreCase));
+                englishItem.Text = on ? $"Английский ввод — убрать: {_lastForeignProcess}" : $"Английский ввод: {_lastForeignProcess}";
+                englishItem.Enabled = true;
+            }
+            englishListItem.Text = $"Приложения с английским вводом ({cfg.EnglishApps.Count})";
             excludedListItem.Text = $"Исключённые приложения ({cfg.ExcludedProcesses.Count})";
             stopItem.Text = $"Стоп-слова (никогда не переключать) ({cfg.StopWords.Count})";
             forceItem.Text = $"Форс-слова (всегда переключать) ({cfg.ForceWords.Count})";
@@ -948,6 +1155,40 @@ public sealed class TrayUi : IDisposable
     }
 
     /// Простейший ввод строки (в WinForms нет InputBox).
+    /// <summary>Пароль (скрытый ввод). confirm — второй раз для проверки. null — отмена
+    /// или не совпало.</summary>
+    private static string? PromptPassword(string label, string title, bool confirm)
+    {
+        using var form = new Form
+        {
+            Text = title, ClientSize = new Size(340, confirm ? 140 : 96),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterScreen,
+            MinimizeBox = false, MaximizeBox = false, TopMost = true,
+        };
+        var lbl = new Label { Text = label, Left = 10, Top = 10, AutoSize = true };
+        var box = new TextBox { Left = 10, Top = 30, Width = 320, UseSystemPasswordChar = true };
+        var lbl2 = new Label { Text = "Ещё раз:", Left = 10, Top = 56, AutoSize = true, Visible = confirm };
+        var box2 = new TextBox { Left = 10, Top = 76, Width = 320, UseSystemPasswordChar = true, Visible = confirm };
+        int by = confirm ? 106 : 62;
+        var ok = new Button { Text = "OK", Left = 174, Top = by, Width = 75, DialogResult = DialogResult.OK };
+        var cancel = new Button { Text = "Отмена", Left = 255, Top = by, Width = 75, DialogResult = DialogResult.Cancel };
+        form.Controls.AddRange(new Control[] { lbl, box, lbl2, box2, ok, cancel });
+        form.AcceptButton = ok; form.CancelButton = cancel;
+        if (form.ShowDialog() != DialogResult.OK) return null;
+        if (box.Text.Length == 0)
+        {
+            MessageBox.Show("Пустой пароль. Для файла без пароля выбери тип «Открытый JSON».", title);
+            return null;
+        }
+        if (confirm && box.Text != box2.Text)
+        {
+            MessageBox.Show("Пароли не совпали.", title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return null;
+        }
+        return box.Text;
+    }
+
     private static string? Prompt(string label, string title)
     {
         using var form = new Form

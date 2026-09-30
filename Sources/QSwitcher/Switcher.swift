@@ -216,6 +216,11 @@ final class Switcher {
     /// Ядро 5: начать ввод заново (клик, другое приложение, навигация) — на следующей границе.
     private var coreNeedsReset = true
     private var lastBoundaryTime: Date = .distantPast
+    /// Личный слой: каким было слово до первого Backspace внутри него (личные опечатки).
+    private var editAttempt: String? = nil
+    /// Сколько раз подряд стёрли назад за границу слова; стёрто ли предыдущее целиком.
+    private var eraseRun = 0
+    private var erasedFull = false
 
     /// Начало нового ввода: курсор поставлен заново — что слева, неизвестно.
     private func beginFreshInput() {
@@ -223,6 +228,11 @@ final class Switcher {
         lastTrigger = ""
         retroSafe = false
         coreNeedsReset = true
+        // Курсор ушёл: принятое слово засчитывается, правки внутри слова забываются
+        PersonalLM.shared.flush()
+        editAttempt = nil
+        eraseRun = 0
+        erasedFull = false
     }
     /// Тема окна: последние принятые слова по приложению (для семантики).
     /// Не синкается, живёт в памяти; ~40 слов хватает на «о чём разговор».
@@ -574,12 +584,27 @@ final class Switcher {
         }
 
         if keyCode == 51 /* Backspace */ {
-            if !word.isEmpty { word.removeLast() }
+            if !word.isEmpty {
+                // Первая правка внутри слова: запомнить, каким оно было (личные опечатки)
+                if editAttempt == nil && PersonalLM.shared.learns { editAttempt = word.map { $0.chars }.joined() }
+                word.removeLast()
+            }
             else if !droppedPrefix.isEmpty { droppedPrefix.removeLast() }
             else {
                 // Стирают уже решённое (пробел, предыдущее слово): левый сосед ядра не тот
                 retroSafe = false
                 Core5.shared.forgetPrev()
+                // Личный слой: предыдущее слово правят — оно не довод; стёрто целиком —
+                // запомнить: вдруг его наберут заново в другой раскладке
+                let pl = PersonalLM.shared
+                if pl.learns {
+                    if eraseRun == 0 { pl.dropPending() }
+                    eraseRun += 1
+                    if let last = wordHistory.last, eraseRun == lastTrigger.count + last.count {
+                        pl.erasedWord(last)
+                        erasedFull = true
+                    }
+                }
             }
             lastSwitch = nil
             lastCompletedWord = nil
@@ -642,6 +667,9 @@ final class Switcher {
                 let field = AXSelection.focusedFieldKindCached()
                 // Ядро 5: между предыдущим словом и этим на экране ровно один пробел?
                 let sepIsSpace = v5 && retroSafe && droppedPrefix.isEmpty
+                // Личный слой: предыдущее слово на экране и стоит ли текущее вплотную к нему
+                let adjacentPrev = retroSafe && droppedPrefix.isEmpty
+                let prevOnScreen = wordHistory.last
                 if v5 {
                     // Начало ввода (клик, другое приложение, навигация, долгая пауза):
                     // левого соседа нет — ожидание по приложению (и адресной строке).
@@ -692,6 +720,19 @@ final class Switcher {
                     ? "\(frontApp)/фокус:\(focusApp!)" : frontApp
                 print("[\(Switcher.ts())] [boundary] '\(text)' (\(cur), ctx=\(context.map { String(describing: $0) } ?? "nil"), app=\(appMark)) → \(willSwitch ? "SWITCH" : "keep")")
                 SecureLog.shared.append("[boundary] '\(text)' (\(cur)) → \(willSwitch ? "SWITCH" : "keep")")
+                // Личный слой: что осталось на экране (засчитается на следующей границе, если
+                // слово не тронут). Обломок частично стёртого слова — не слово.
+                let personal = PersonalLM.shared
+                if personal.learns, !structural, !blindHere, field != "password" {
+                    if let r = retro { personal.retroChanged(r.to) }
+                    if let a = editAttempt { personal.inWordEdit(attempt: a, final: text) }
+                    if eraseRun > 0 && !erasedFull { personal.dropPending() }
+                    else { personal.observe(shown: verdict.shown, prevShown: retro?.to ?? prevOnScreen, adjacent: adjacentPrev) }
+                }
+                editAttempt = nil
+                eraseRun = 0
+                erasedFull = false
+
                 // Какой язык остаётся на экране в этом приложении — ожидание для первых слов
                 if v5, field != "address", field != "password" {
                     AppLangStats.shared.note(appId, lang: Core5.lang(verdict.shown))
@@ -1424,6 +1465,7 @@ final class Switcher {
         noteLangChange(from: original, to: translated)
         // История (и левый сосед ядра) — то, что теперь на экране
         syncHistoryTail(with: translated)
+        PersonalLM.shared.manualFix(translated)
 
         // Сохраняем как тоггл-состояние, чтобы Option повторно можно было откатить назад
         lastSwitch = LastSwitch(
@@ -1480,6 +1522,7 @@ final class Switcher {
                                triggerKey: trig.key,
                                tail: trig.text, switchTo: nil)
                 self.syncHistoryTail(with: translated, pinned: false)
+                PersonalLM.shared.retroChanged(translated)
                 self.noteLangChange(from: original, to: translated)
                 self.lastSwitch = LastSwitch(originalChars: original, convertedChars: translated,
                                              triggerKeyCode: last.triggerKeyCode, state: .converted,
@@ -1908,6 +1951,8 @@ final class Switcher {
         lastCompletedWord = nil
         // История должна отражать то что теперь на экране, иначе контекст соврёт
         syncHistoryTail(with: translated)
+        PersonalLM.shared.manualWord(translated)
+        editAttempt = nil
         playSound()
     }
 
@@ -1970,6 +2015,7 @@ final class Switcher {
 
         // История должна отражать то что теперь на экране
         syncHistoryTail(with: targetText)
+        PersonalLM.shared.manualFix(targetText)
 
         print("[toggle] '\(currentText)' → '\(targetText)' (state теперь = \(last.state))")
         playSound()

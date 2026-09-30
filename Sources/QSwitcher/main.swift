@@ -118,6 +118,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--test"), i + 1 < CommandLine.a
     SemProfile.shared.rebuildIfNeeded()
     print("🧭 Профиль: \(SemProfile.shared.readingCount) чтений")
     print("⚙️ Ядро: \(Config.shared.coreV5 ? "v5 (одна формула)" : "legacy (каскад)")")
+    let ps = PersonalLM.readOnlyShared.stats()
+    print("🧠 Личный слой: " + (PersonalLM.readOnlyShared.uses ? "слов \(ps.wordsRu + ps.wordsEn), пар \(ps.pairs)" : "не участвует"))
     let rep = TestRunner.run(text, verbose: false)
     if rep.total > 0 { print("\nИтого: \(rep.ok)/\(rep.total) верно") }
     exit(0)

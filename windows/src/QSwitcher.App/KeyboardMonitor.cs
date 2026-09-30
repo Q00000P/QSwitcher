@@ -36,6 +36,15 @@ public sealed class KeyboardMonitor : IDisposable
     /// Ожидание языка по приложению (ядро 5): что остаётся на экране в каком процессе.
     public AppLangStats? AppStats { get; init; }
 
+    /// Личный слой: что остаётся на экране — слова, пары, исправления, опечатки
+    /// (режимы — в PersonalLM; пароли, исключения и формулы сюда не попадают).
+    public PersonalLM? Personal { get; init; }
+    /// Внутри слова начали править: каким оно было до первого Backspace.
+    private string? _editAttempt;
+    /// Сколько раз подряд стёрли назад за границу слова; стёрто ли предыдущее целиком.
+    private int _eraseRun;
+    private bool _erasedFull;
+
     /// Ядро 5: между предыдущим словом и текущим на экране ровно один пробел, ничего
     /// не стёрто и не вставлено — предыдущее можно исправить задним числом.
     private bool _retroSafe;
@@ -49,6 +58,19 @@ public sealed class KeyboardMonitor : IDisposable
     {
         _retroSafe = false;
         _coreNeedsReset = true;
+        // Курсор ушёл: принятое слово засчитывается, правки внутри слова забываются
+        Personal?.Flush();
+        _editAttempt = null;
+        _eraseRun = 0;
+        _erasedFull = false;
+    }
+
+    /// Набираемое слово как на экране сейчас (для первой правки внутри слова).
+    private string CurrentWordText()
+    {
+        bool other = KeyMap.QueryOtherLayoutActive();
+        return string.Concat(_word.Select(k =>
+            k.Chars.Length > 0 ? k.Chars : KeyMap.Translate(k.VirtualKey, other, k.Shift, k.Caps)));
     }
 
     /// Кольцевой журнал ввода (для починки по журналу).
@@ -554,7 +576,12 @@ public sealed class KeyboardMonitor : IDisposable
                 Journal.Add(KeyJournal.Kind.Reset, vk);
                 return false;
             case 0x08: // Backspace — убираем последний символ из буфера
-                if (_word.Count > 0) _word.RemoveAt(_word.Count - 1);
+                if (_word.Count > 0)
+                {
+                    // Первая правка внутри слова: запомнить, каким оно было (личные опечатки)
+                    if (_editAttempt is null && Personal is { Learns: true }) _editAttempt = CurrentWordText();
+                    _word.RemoveAt(_word.Count - 1);
+                }
                 else if (_droppedPrefix.Length > 0)
                     _droppedPrefix = _droppedPrefix[..^1];
                 else
@@ -562,6 +589,18 @@ public sealed class KeyboardMonitor : IDisposable
                     // Стирают уже решённое (пробел, предыдущее слово): левый сосед ядра не тот
                     _retroSafe = false;
                     _detector.Core?.ForgetPrev();
+                    // Личный слой: предыдущее слово правят — оно не довод; стёрто целиком —
+                    // запомнить: вдруг его наберут заново в другой раскладке
+                    if (Personal is { Learns: true })
+                    {
+                        if (_eraseRun == 0) Personal.DropPending();
+                        _eraseRun++;
+                        if (_history.Count > 0)
+                        {
+                            var h = _history[^1];
+                            if (_eraseRun == h.Trigger.Length + h.Text.Length) { Personal.Erased(h.Text); _erasedFull = true; }
+                        }
+                    }
                 }
                 Journal.Add(KeyJournal.Kind.Backspace, vk);
                 return false;
@@ -733,6 +772,12 @@ public sealed class KeyboardMonitor : IDisposable
         bool v5 = _detector.CoreV5;
         string? process = Foreground?.ProcessName;
         bool sepIsSpace = false;
+        // Поле пароля (UIA IsPassword): не трогаем и не учимся
+        bool pwdField = Foreground is { } fg && fg.PasswordAt(fg.Generation) == true;
+        // Предыдущее слово на экране и стоит ли текущее вплотную к нему (пара для личного слоя)
+        string? prevOnScreen = _history.Count > 0 ? _history[^1].Text : null;
+        bool adjacentPrev = _retroSafe && _lastCompletedPrefix.Length == 0
+                            && _history.Count > 0 && _history[^1].Trigger == " ";
         if (v5 && _detector.Core is { } core)
         {
             var now = DateTime.UtcNow;
@@ -764,7 +809,8 @@ public sealed class KeyboardMonitor : IDisposable
             if (v5) _detector.Core?.NoteExternal(text, text, confident: false);
             verdict = new Verdict(false, null, "structure");
         }
-        else verdict = _detector.Decide(text, current, context, recent, process, sepIsSpace);
+        else verdict = _detector.Decide(text, current, context, recent, process, sepIsSpace,
+                                        field: pwdField ? "password" : null);
         // Задним числом — только если предыдущее слово на экране именно то и его не
         // правил человек (пришпиленное — root-решение, автоматика не трогает)
         (string From, string To)? retro5 = null;
@@ -779,8 +825,22 @@ public sealed class KeyboardMonitor : IDisposable
             ? $"{text} → {verdict.Replacement}"
             : text);
 
+        // Личный слой: что осталось на экране (засчитается на следующей границе, если
+        // слово не тронут). Обломок частично стёртого слова — не слово.
+        if (Personal is { Learns: true } && !structural && !pwdField)
+        {
+            if (retro5 is { } rp) Personal.RetroChanged(rp.To);
+            if (_editAttempt is not null) Personal.InWordEdit(_editAttempt, text);
+            if (_eraseRun > 0 && !_erasedFull) Personal.DropPending();
+            else Personal.Observe(verdict.ShouldSwap && verdict.Replacement is not null ? verdict.Replacement : text,
+                                  retro5?.To ?? prevOnScreen, adjacentPrev);
+        }
+        _editAttempt = null;
+        _eraseRun = 0;
+        _erasedFull = false;
+
         // Какой язык остаётся на экране в этом приложении — ожидание для первых слов
-        if (v5 && AppStats is not null)
+        if (v5 && AppStats is not null && !pwdField)
         {
             AppStats.Note(process, Core5.LangOf(verdict.ShouldSwap && verdict.Replacement is not null ? verdict.Replacement : text));
             if (retro5 is { } rs)
@@ -1091,6 +1151,8 @@ public sealed class KeyboardMonitor : IDisposable
             _lastSwitch = new LastSwitch(full, swappedFull, "");
             _lastWordLang = LangOf(swappedFull);
             NoteManualCore(null, swappedFull);
+            Personal?.ManualWord(swappedFull);
+            _editAttempt = null;
             // Любой ручной свап — пример для сети с контекстом (не правило)
             Corrections?.Record(bufText, intendedOther: LangOf(bufSwapped) == Lang.Other,
                                 RecentHistory(full, swappedFull), Foreground?.ProcessName);
@@ -1119,6 +1181,7 @@ public sealed class KeyboardMonitor : IDisposable
 
             _lastWordLang = LangOf(to);
             NoteManualCore(from, to);
+            Personal?.ManualFix(to);
             PinLastHistory(to, last.TriggerChar);
             // Любой тоггл — пример для сети: что теперь на экране, то и имелось в виду
             Corrections?.Record(last.Original, intendedOther: LangOf(to) == Lang.Other,
@@ -1166,6 +1229,7 @@ public sealed class KeyboardMonitor : IDisposable
         _lastSwitch = new LastSwitch(fullText, swapped, triggerChar);
         _lastWordLang = LangOf(swapped);
         NoteManualCore(fullText, swapped);
+        Personal?.ManualFix(swapped);
         PinLastHistory(swapped, triggerChar);
         // Любой ручной свап — пример для сети с контекстом (не правило)
         Corrections?.Record(text, intendedOther: LangOf(swapped) == Lang.Other,
@@ -1248,6 +1312,7 @@ public sealed class KeyboardMonitor : IDisposable
     /// Экран изменился не нами — всё, что помним про позицию, недействительно.
     private void InvalidateHistory(string why)
     {
+        Personal?.Flush();
         if (_history.Count == 0 && _lastSwitch is null) return;
         if (this.Trace) _log($"[trace] история сброшена: {why}");
         _history.Clear();

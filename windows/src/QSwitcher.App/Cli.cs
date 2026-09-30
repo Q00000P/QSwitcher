@@ -85,18 +85,25 @@ internal static class Cli
         var ngram = NgramLM.Load(Res.Open, Quiet);
         var charLm = CharLM.Load(Res.Open, Quiet);
 
+        // Личный слой — как в живом вводе (в своём режиме), но прогон его не пополняет
+        var personal = PersonalStore.Load(Program.DataDir, Quiet, readOnly: true);
+        personal.ModeSource = () => cfg.PersonalModeValue == PersonalMode.Learn || cfg.PersonalModeValue == PersonalMode.Off
+            ? PersonalMode.Off : PersonalMode.Frozen;
+        Core5 MakeCore() { var c = Program.MakeCore(cfg, ngram, charLm); c.Personal = personal; return c; }
+
         // Рассуждения детектора — по целевому слову; слова вокруг решаются молча
         bool muted = false;
-        var detector = Program.MakeDetector(cfg, pair, dict, learned, net,
-                                            Program.MakeCore(cfg, ngram, charLm),
+        var detector = Program.MakeDetector(cfg, pair, dict, learned, net, MakeCore(),
                                             s => { if (!muted) Say(s); });
         bool Silence(bool on) { bool was = muted; muted = on; return was; }
 
         var (stop, force) = learned.Snapshot();
-        Say($"⚙️ Ядро: {(detector.CoreV5 ? "v5 (одна формула)" : "legacy (каскад)")}; выученных правил: {stop.Count + force.Count}");
+        var ps = personal.Stats();
+        Say($"⚙️ Ядро: {(detector.CoreV5 ? "v5 (одна формула)" : "legacy (каскад)")}; выученных правил: {stop.Count + force.Count}; " +
+            $"личный слой: {(personal.Uses ? $"слов {ps.WordsRu + ps.WordsEn}, пар {ps.Pairs}" : "не участвует")}");
         var rep = detector.CoreV5
             // Свой экземпляр ядра: контекст прогона не смешивается с живым
-            ? TestRunner.RunV5(text, detector, Program.MakeCore(cfg, ngram, charLm), pair, Say, Silence)
+            ? TestRunner.RunV5(text, detector, MakeCore(), pair, Say, Silence)
             : TestRunner.Run(text, detector, pair, Say, Silence);
         File.WriteAllText(ReportPath, rep.Text, new UTF8Encoding(true));
         if (rep.Total > 0) Say("\n" + rep.Summary);

@@ -294,6 +294,33 @@ public sealed class AppLangStats
         Save(snapshot);
     }
 
+    /// <summary>Копия счётчиков (экспорт навыков).</summary>
+    public Dictionary<string, double[]> Counts()
+    {
+        lock (_lock) return _counts.ToDictionary(kv => kv.Key, kv => (double[])kv.Value.Clone());
+    }
+
+    /// <summary>Слить счётчики из файла навыков: по каждому приложению и языку — большее
+    /// (повторный импорт того же файла ничего не удваивает). Возвращает, сколько приложений
+    /// изменилось.</summary>
+    public int MergeMax(IReadOnlyDictionary<string, double[]> other)
+    {
+        int changed = 0;
+        lock (_lock)
+        {
+            foreach (var (app, v) in other)
+            {
+                if (v is not { Length: 2 }) continue;
+                if (!_counts.TryGetValue(app, out var c)) { c = new double[2]; _counts[app] = c; }
+                bool ch = false;
+                for (int i = 0; i < 2; i++) if (v[i] > c[i]) { c[i] = v[i]; ch = true; }
+                if (ch) changed++;
+            }
+        }
+        if (changed > 0) SaveNow();
+        return changed;
+    }
+
     private void Save(Dictionary<string, double[]> snapshot)
     {
         // Запись в фоне: вызывают из потока хука, диск там недопустим
@@ -317,6 +344,7 @@ public sealed class Core5
     {
         public double Alpha = 0.03;        // доля новых/редких слов (символьная модель)
         public double Tau = 0.02;          // доля опечаток
+        public double Gamma = 0.3;         // вес личных частот (личный слой)
         public double Beta = 0.5;          // вес пары с предыдущим словом
         public double Pi = 0.04;           // смена языка между соседними словами
         public double BK = 1.0;            // «язык не совпадает с раскладкой»
@@ -351,6 +379,7 @@ public sealed class Core5
         public double Char;
         public double? Typo;
         public double? Pair;
+        public double? PPair;              // личная пара с предыдущим словом
         public double? Caps;
         public override string ToString()
         {
@@ -361,6 +390,7 @@ public sealed class Core5
             };
             if (Typo.HasValue) s.Add("опеч " + Typo.Value.ToString("F1", Inv));
             if (Pair.HasValue) s.Add("пара " + Pair.Value.ToString("F1", Inv));
+            if (PPair.HasValue) s.Add("л.пара " + PPair.Value.ToString("F1", Inv));
             if (Caps.HasValue) s.Add("капс " + Caps.Value.ToString("F1", Inv));
             return "{" + string.Join(", ", s) + "}";
         }
@@ -407,6 +437,11 @@ public sealed class Core5
 
     public double PriorRu { get { lock (_lock) return _priorRu; } }
     public bool Ready => _lm.Loaded;
+
+    /// Личный слой (PersonalLM.cs): участвует в решениях в режимах «работа + обучение» и
+    /// «только работа». null или другой режим — ядро как без него.
+    public PersonalLM? Personal { get; set; }
+    private PersonalLM? Pers => Personal is { Uses: true } p ? p : null;
 
     // --- состояние ввода ---
 
@@ -525,8 +560,35 @@ public sealed class Core5
 
     // --- модель ---
 
-    /// −ln P(слово) по частотам или null — слова нет в корпусе.
-    public double? Known(string lang, string w) => _lm.UniD(lang, w);
+    /// −ln P_известн(слово): смесь частот корпуса и личных (γ), или null. Привычная личная
+    /// опечатка — как исправленное слово, чуть дороже (PersonalLM.TypoCost).
+    public double? Known(string lang, string w)
+    {
+        var u = _lm.UniD(lang, w);
+        var pers = Pers;
+        double? pc = pers?.Cost(lang, w);
+        if (u is null && pc is null)
+        {
+            string? r = pers?.TypoOf(lang, w);
+            if (r is not null && r != w.ToLowerInvariant())
+            {
+                var k = KnownMix(_lm.UniD(lang, r), pers!.Cost(lang, r));
+                return k is null ? null : k.Value + PersonalLM.TypoCost;
+            }
+            return null;
+        }
+        return pc is null ? u : KnownMix(u, pc);
+    }
+
+    private double? KnownMix(double? u, double? pc)
+    {
+        if (u is null && pc is null) return null;
+        double g = pc.HasValue ? P.Gamma : 0.0;
+        double pu = u.HasValue ? Math.Exp(-u.Value) : 0.0;
+        double pp = pc.HasValue ? Math.Exp(-pc.Value) : 0.0;
+        double sum = (1 - g) * pu + g * pp;
+        return sum > 0 ? -Math.Log(sum) : null;
+    }
 
     /// Ближайшее известное слово в одной правке: −ln P(соседа) + ln(число правок).
     private double? Typo(string lang, string w)
@@ -560,7 +622,9 @@ public sealed class Core5
         return best.Value + Math.Log(cands.Count);
     }
 
-    private (double Cost, Parts Parts) WordCost(string w, string lang, string? prevWord)
+    /// prevWord — предыдущее слово того же языка (пара корпуса), pprev — ядро предыдущего
+    /// слова любого языка (личная пара: «сервер HA»).
+    private (double Cost, Parts Parts) WordCost(string w, string lang, string? prevWord, string? pprev)
     {
         string lw = w.ToLowerInvariant();
         var parts = new Parts();
@@ -583,6 +647,15 @@ public sealed class Core5
                 parts.Pair = b;
             }
         }
+        if (!string.IsNullOrEmpty(pprev) && Pers is { } pers)
+        {
+            var b = pers.Pair(lang, pprev, lw);
+            if (b.HasValue)
+            {
+                pw = P.Beta * Math.Exp(-b.Value) + (1 - P.Beta) * pw;
+                parts.PPair = b;
+            }
+        }
         return (-Math.Log(Math.Max(pw, 1e-300)), parts);
     }
 
@@ -591,7 +664,8 @@ public sealed class Core5
         var (pre, cr, post) = SplitPunct(r, lang);
         if (cr.Length == 0) return (60, new Parts(), cr);
         string? pw = prevWord is not null && prevLang == lang ? prevWord : null;
-        var (cost, parts) = WordCost(cr, lang, pw);
+        string? pcore = prevWord is not null && !string.IsNullOrEmpty(prevLang) ? SplitPunct(prevWord, prevLang).Core : null;
+        var (cost, parts) = WordCost(cr, lang, pw, pcore);
         cost += P.Edge * (CodePoints(pre) + CodePoints(post));
         if (caps)
         {
@@ -664,6 +738,13 @@ public sealed class Core5
             if (c2 < cA) { cA = c2; partsA = parts2; coreA = core2; alt = a2 + post; }
         }
         double tT = Trans(T, prev), tA = Trans(A, prev);
+        // личная пара через смену языка («сервер HA») уже содержит эту смену — второй раз
+        // за неё не платим
+        if (prev is { Confident: true })
+        {
+            if (partsT.PPair.HasValue && T != prev.Lang) tT = -Math.Log(1 - P.Pi);
+            if (partsA.PPair.HasValue && A != prev.Lang) tA = -Math.Log(1 - P.Pi);
+        }
         double lo = (cT + tT) - (cA + tA + P.BK);
         int nT = Math.Max(1, Letters(coreT, T));
         s.Ok = IsWord(coreA, A, partsA, caps, lo, partsT.Char / (nT + 1));
@@ -767,8 +848,8 @@ public sealed class Core5
                     log?.Invoke($"  ✗ символьная '{w}' [{l}] {got.ToString("F4", Inv)} ≠ {e.ToString("F4", Inv)}");
                 }
             }
-        var c = new Core5(lm, ch);
-        if (root.TryGetProperty("seqs", out var seqs))
+        void RunSeqs(Core5 c, JsonElement seqs, string tag)
+        {
             foreach (var seq in seqs.EnumerateArray())
             {
                 double pr = seq.TryGetProperty("prior", out var p) ? p.GetDouble() : 0.5;
@@ -789,13 +870,22 @@ public sealed class Core5
                         bad++;
                         if (verbose || bad <= 20)
                         {
-                            log?.Invoke($"  ✗ '{typed}' → '{r.Shown}' (ждали '{shown}') LO {r.Lo.ToString("F3", Inv)} (ждали {lo.ToString("F3", Inv)})"
+                            log?.Invoke($"  ✗{tag} '{typed}' → '{r.Shown}' (ждали '{shown}') LO {r.Lo.ToString("F3", Inv)} (ждали {lo.ToString("F3", Inv)})"
                                         + (okPend ? "" : $" отложено {r.Pending}") + (okRetro ? "" : $" ретро {r.RetroPrev ?? "-"}"));
                             if (verbose) log?.Invoke("     " + r.Explain);
                         }
                     }
                 }
             }
+        }
+        if (root.TryGetProperty("seqs", out var seqs)) RunSeqs(new Core5(lm, ch), seqs, "");
+        // С личным слоем эталона (выдуманные открытые фразы) — стоимости и решения те же
+        if (root.TryGetProperty("personal", out var pj) && root.TryGetProperty("pseqs", out var pseqs))
+        {
+            var pers = PersonalLM.FromReference(pj);
+            pers.ModeSource = () => PersonalMode.On;
+            RunSeqs(new Core5(lm, ch) { Personal = pers }, pseqs, " (личный слой)");
+        }
         return (checkedN, bad);
     }
 }
