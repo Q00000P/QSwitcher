@@ -39,8 +39,12 @@ extension Data {
             streamPtr.pointee.dst_size = dstBufferSize
 
             let flags = Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
+            // Обрезанный поток не доходит до END, а process продолжает отвечать OK без движения —
+            // без этой проверки цикл крутился бы вечно
+            var stalls = 0
 
             while true {
+                let srcBefore = streamPtr.pointee.src_size
                 let s = compression_stream_process(streamPtr, flags)
                 switch s {
                 case COMPRESSION_STATUS_OK, COMPRESSION_STATUS_END:
@@ -52,6 +56,12 @@ extension Data {
                     streamPtr.pointee.dst_size = dstBufferSize
                     if s == COMPRESSION_STATUS_END {
                         return output
+                    }
+                    if produced == 0 && streamPtr.pointee.src_size == srcBefore {
+                        stalls += 1
+                        if stalls > 3 { return nil }
+                    } else {
+                        stalls = 0
                     }
                 case COMPRESSION_STATUS_ERROR:
                     return nil

@@ -95,7 +95,7 @@ final class SemVec {
                     var s: Float = 0
                     memcpy(&s, p, 4)
                     scales[i] = s
-                    q.withUnsafeMutableBytes { qb in
+                    _ = q.withUnsafeMutableBytes { qb in
                         memcpy(qb.baseAddress!.advanced(by: i * dim), p.advanced(by: 4), dim)
                     }
                 }

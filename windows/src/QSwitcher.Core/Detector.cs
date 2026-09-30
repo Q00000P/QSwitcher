@@ -85,10 +85,11 @@ public sealed class Detector
             return new(swap, swap ? shown : null, reason);
         }
 
-        // 0. Ручные списки важнее всего
-        if (_cfg.ForceWords.Contains(lower))
+        // 0. Ручные списки важнее всего. Как на маке: строчное слово в списке совпадает без
+        // учёта регистра, слово с заглавными — только точно («РФ» ≠ «рф»)
+        if (_cfg.ForceWords.Contains(lower) || _cfg.ForceWords.Contains(raw))
             return Ext(true, "forceWords");
-        if (_cfg.StopWords.Contains(lower))
+        if (_cfg.StopWords.Contains(lower) || _cfg.StopWords.Contains(raw))
             return Ext(false, "stopWords");
 
         // Выученное на исправлениях: человек уже показал, чего хочет

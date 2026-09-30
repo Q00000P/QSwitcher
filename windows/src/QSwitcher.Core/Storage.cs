@@ -146,6 +146,29 @@ public sealed class LearnedRules
         }
     }
 
+    /// <summary>Синхронизация: слово → "f" (переключать), "s" (не трогать), null (правила нет).
+    /// Одной записью на диск. Возвращает, сколько правил изменилось.</summary>
+    public int ApplySync(IEnumerable<(string Word, string? State)> changes)
+    {
+        int n = 0;
+        lock (_lock)
+        {
+            foreach (var (word, state) in changes)
+            {
+                var w = word.ToLowerInvariant();
+                if (w.Length == 0) continue;
+                bool wasF = _force.Contains(w), wasS = _stop.Contains(w);
+                _force.Remove(w);
+                _stop.Remove(w);
+                if (state == "f") _force.Add(w);
+                else if (state == "s") _stop.Add(w);
+                if (wasF != _force.Contains(w) || wasS != _stop.Contains(w)) n++;
+            }
+            if (n > 0) Save();
+        }
+        return n;
+    }
+
     public (IReadOnlyList<string> stop, IReadOnlyList<string> force) Snapshot()
     {
         lock (_lock) return (_stop.OrderBy(x => x).ToList(), _force.OrderBy(x => x).ToList());

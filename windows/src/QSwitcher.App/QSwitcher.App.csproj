@@ -71,6 +71,17 @@
                       LogicalName="QSwitcher.App.Resources.core5-selftest.json"
                       Condition="Exists('..\..\..\nn\lm\core5-selftest.json')" />
   </ItemGroup>
+  <!-- Синхронизация через Google Drive: client id и secret Desktop-клиента Google — ТОЛЬКО из
+       переменных окружения QS_GOOGLE_CLIENT_ID / QS_GOOGLE_CLIENT_SECRET (в репозитории их нет).
+       Заданы при сборке — встраиваются в метаданные exe; приложение читает и переменные при
+       запуске. WebDAV работает без них. -->
+  <ItemGroup>
+    <AssemblyMetadata Include="QSGoogleClientId" Value="$(QS_GOOGLE_CLIENT_ID)" />
+    <AssemblyMetadata Include="QSGoogleClientSecret" Value="$(QS_GOOGLE_CLIENT_SECRET)" />
+  </ItemGroup>
+  <Target Name="GoogleKeyNote" BeforeTargets="Build" Condition="'$(QS_GOOGLE_CLIENT_ID)' == '' Or '$(QS_GOOGLE_CLIENT_SECRET)' == ''">
+    <Message Importance="high" Text="QSwitcher: QS_GOOGLE_CLIENT_ID / QS_GOOGLE_CLIENT_SECRET не заданы — Google Drive будет доступен, только если задать их к запуску (WebDAV работает)." />
+  </Target>
   <!-- Словари качаются и готовятся автоматически перед сборкой (разово).
        Если ru.txt/en.txt уже на месте — мгновенный no-op. -->
   <Target Name="DownloadDicts" BeforeTargets="PrepareForBuild">

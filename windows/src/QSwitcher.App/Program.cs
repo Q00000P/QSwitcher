@@ -169,7 +169,9 @@ internal static class Program
             () => cfg.SoundConvertOnly,
             () => cfg.SoundConvertAndSwitch,
             () => cfg.SoundUndo);
-        var exclusions = new AppExclusions(() => cfg.ExcludedProcesses);
+        // Копия списка на каждое обращение: хук читает его в своём потоке, а меню и синхронизация
+        // меняют в потоке интерфейса (перебор живого списка во время правки падал бы)
+        var exclusions = new AppExclusions(() => cfg.ExcludedProcesses.ToArray());
 
         // Фокус — по событиям: имя процесса для исключений и поле пароля для
         // защищённого лога узнаются заранее, хук читает готовое.
@@ -197,6 +199,10 @@ internal static class Program
         };
         using var tray = new TrayUi(cfg, learned, secureLog, pair, Log, net, corrections,
                                     personal, appStats, SavePersonal);
+        // Синхронизация навыков с другими устройствами (после меню: ей нужен поток интерфейса)
+        using var sync = new SyncService(DataDir, cfg, learned, appStats, personal, SavePersonal, Log);
+        tray.AttachSync(sync);
+        sync.Start();
         // Личный слой — на диск раз в 5 минут, если менялся, и при выходе
         using var personalTimer = new System.Threading.Timer(_ =>
         {
@@ -217,6 +223,7 @@ internal static class Program
         appStats.SaveNow();
         personal.Flush();
         SavePersonal();
+        sync.Shutdown();        // своё — в облако, пока не вышли
     }
 
     /// <summary>Ядро 5 с параметрами из config.json — читаются на каждое решение,
@@ -246,7 +253,7 @@ internal static class Program
                 Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen, cfg.NnThresholdShort),
                 AppClassOf = cfg.AppClassOf,
                 CoreV5 = () => cfg.CoreOn,
-                EnglishApps = () => cfg.EnglishApps,
+                EnglishApps = () => cfg.EnglishApps.ToArray(),
             }, log, net, core);
 }
 
@@ -288,7 +295,7 @@ public static class AppVersion
 {
     public const string Version = "4.0";
     /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
-    public const string Build = "wave16";
+    public const string Build = "wave17";
 }
 
 /// <summary>
@@ -835,6 +842,7 @@ public sealed class TrayUi : IDisposable
                     return;
                 personal.Clear();
                 savePersonal?.Invoke();
+                _sync?.Request(true, "очистка личного слоя");
                 log("🧠 Личный слой очищен");
             };
             personalItem.DropDownItems.Add(clearItem);
@@ -901,6 +909,7 @@ public sealed class TrayUi : IDisposable
                                                   appStats ?? new AppLangStats(Path.Combine(Program.DataDir, "app-lang.json"), _ => 0.5),
                                                   personal, Program.DataDir);
                     savePersonal?.Invoke();
+                    _sync?.Request(true, "импорт навыков");
                     log($"[skills] импорт ← {dlg.FileName}: {report.Replace('\n', ' ')}");
                     MessageBox.Show(report, "Импорт навыков");
                 }
@@ -912,6 +921,7 @@ public sealed class TrayUi : IDisposable
             };
             menu.Items.Add(importItem);
         }
+        _syncIndex = menu.Items.Count;          // сюда встанет «Синхронизация» (AttachSync)
 
         // === Сеть-детектор: дообучение и сброс ===
         if (net is not null && corrections is not null)
@@ -1060,6 +1070,7 @@ public sealed class TrayUi : IDisposable
             _countersItem.Text = $"Исключений: {cfg.ExcludedProcesses.Count} · стоп: {cfg.StopWords.Count} · форс: {cfg.ForceWords.Count}";
         };
 
+        _menu = menu;
         _icon = new NotifyIcon
         {
             Text = $"QSwitcher {AppVersion.Version}",
@@ -1090,6 +1101,24 @@ public sealed class TrayUi : IDisposable
     }
 
     private readonly System.Threading.Timer? _layoutTimer;
+    private readonly ContextMenuStrip _menu = null!;
+    private readonly int _syncIndex;
+    private SyncService? _sync;
+
+    /// <summary>Подменю «Синхронизация» — после экспорта/импорта навыков.</summary>
+    public void AttachSync(SyncService sync)
+    {
+        _sync = sync;
+        _menu.Items.Insert(Math.Min(_syncIndex, _menu.Items.Count), SyncMenu.Build(sync, Balloon));
+    }
+
+    /// <summary>Всплывающее сообщение у значка в трее.</summary>
+    public void Balloon(string title, string text, bool warning)
+    {
+        try { _icon.ShowBalloonTip(5000, title, text, warning ? ToolTipIcon.Warning : ToolTipIcon.Info); }
+        catch { }
+    }
+
     private string _lastLabel = "";
     private bool _lastPaused;
 
@@ -1139,7 +1168,7 @@ public sealed class TrayUi : IDisposable
             var addItem = new ToolStripMenuItem("Добавить…");
             addItem.Click += (_, _) =>
             {
-                string? w = Prompt("Слово:", parent.Text);
+                string? w = Prompt("Слово:", parent.Text ?? "");
                 w = w?.Trim().ToLowerInvariant();
                 if (!string.IsNullOrEmpty(w)) { words.Add(w); cfg.Save(); log($"[words] + {w}"); }
             };
@@ -1154,7 +1183,6 @@ public sealed class TrayUi : IDisposable
         };
     }
 
-    /// Простейший ввод строки (в WinForms нет InputBox).
     /// <summary>Пароль (скрытый ввод). confirm — второй раз для проверки. null — отмена
     /// или не совпало.</summary>
     private static string? PromptPassword(string label, string title, bool confirm)
@@ -1189,6 +1217,7 @@ public sealed class TrayUi : IDisposable
         return box.Text;
     }
 
+    /// Простейший ввод строки (в WinForms нет InputBox).
     private static string? Prompt(string label, string title)
     {
         using var form = new Form

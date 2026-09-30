@@ -253,6 +253,40 @@ final class Config {
         return added
     }
 
+    /// Синхронизация: списки — как в реестре (точные значения: true — есть, false — нет), одной
+    /// записью на диск. Возвращает, сколько элементов изменилось.
+    @discardableResult
+    func applySync(stop: [(String, Bool)], force: [(String, Bool)],
+                   excluded: [(String, Bool)], english: [(String, Bool)]) -> Int {
+        var n = 0
+        func set(_ s: inout Set<String>, _ changes: [(String, Bool)]) {
+            for (x, on) in changes {
+                if on { if s.insert(x).inserted { n += 1 } } else if s.remove(x) != nil { n += 1 }
+            }
+        }
+        set(&stopWords, stop)
+        set(&forceWords, force)
+        set(&excludedApps, excluded)
+        for (a, on) in english {
+            if on {
+                if !expectEnglishBundles.contains(a) { expectEnglishBundles.append(a); n += 1 }
+            } else {
+                let before = expectEnglishBundles.count
+                expectEnglishBundles.removeAll { $0 == a }
+                if expectEnglishBundles.count != before { n += 1 }
+            }
+        }
+        if n > 0 {
+            patchOnDisk { json in
+                json["stopWords"] = self.stopWords.sorted()
+                json["forceWords"] = self.forceWords.sorted()
+                json["excludedApps"] = self.excludedApps.sorted()
+                json["expectEnglishBundles"] = self.expectEnglishBundles
+            }
+        }
+        return n
+    }
+
     func setArbiterEnabled(_ flag: Bool) {
         arbiterEnabled = flag
         patchOnDisk { $0["arbiterEnabled"] = flag }

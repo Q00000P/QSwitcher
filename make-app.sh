@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 # от реальной версии, и то же самое попадало в отчёты о падениях.
 APP_VERSION="4.0"
 # Метка волны разработки — видна в логе запуска и в «О программе».
-APP_WAVE="wave51"
+APP_WAVE="wave53"
 
 BUILD_FILE=".build_number"
 if [ -f "$BUILD_FILE" ]; then
@@ -170,6 +170,26 @@ else
     echo "ℹ️  Иконки нет — запусти ./make-icon.sh чтобы собрать"
 fi
 
+# Синхронизация через Google Drive: client id и secret Desktop-клиента Google — ТОЛЬКО из
+# переменных окружения QS_GOOGLE_CLIENT_ID / QS_GOOGLE_CLIENT_SECRET (в репозитории их нет).
+# Нет переменных — Google Drive в этой сборке недоступен, WebDAV работает.
+# Не видны в этом процессе (dev-watch запущен раньше, чем их задали) — спросить zsh: он читает
+# ~/.zshenv при каждом запуске, там их и держать.
+if { [ -z "${QS_GOOGLE_CLIENT_ID:-}" ] || [ -z "${QS_GOOGLE_CLIENT_SECRET:-}" ]; } && [ -x /bin/zsh ]; then
+    QS_GOOGLE_CLIENT_ID=$(/bin/zsh -c 'printf "%s" "$QS_GOOGLE_CLIENT_ID"' 2>/dev/null </dev/null || true)
+    QS_GOOGLE_CLIENT_SECRET=$(/bin/zsh -c 'printf "%s" "$QS_GOOGLE_CLIENT_SECRET"' 2>/dev/null </dev/null || true)
+fi
+GOOGLE_KEYS=""
+if [ -n "${QS_GOOGLE_CLIENT_ID:-}" ] && [ -n "${QS_GOOGLE_CLIENT_SECRET:-}" ]; then
+    GOOGLE_KEYS="    <key>QSGoogleClientID</key>
+    <string>${QS_GOOGLE_CLIENT_ID}</string>
+    <key>QSGoogleClientSecret</key>
+    <string>${QS_GOOGLE_CLIENT_SECRET}</string>"
+    echo "🔑 Google Drive: ключ из переменных окружения"
+else
+    echo "ℹ️  QS_GOOGLE_CLIENT_ID / QS_GOOGLE_CLIENT_SECRET не заданы (~/.zshenv) — Google Drive в этой сборке недоступен (WebDAV работает)"
+fi
+
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -195,6 +215,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <string>11.0</string>
     <key>NSFaceIDUsageDescription</key>
     <string>Подтверждение для изменения настроек защищённого лога и доступа к нему.</string>
+${GOOGLE_KEYS}
 </dict>
 </plist>
 EOF

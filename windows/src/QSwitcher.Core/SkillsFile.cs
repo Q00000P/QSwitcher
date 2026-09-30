@@ -8,7 +8,7 @@ using System.Text.Json.Nodes;
 namespace QSwitcher.Core;
 
 /// <summary>
-/// Файл навыков QSwitcher — экспорт/импорт и (дальше) синхронизация между устройствами.
+/// Файл навыков QSwitcher — экспорт/импорт; тот же шифр у файлов синхронизации (SyncModel.cs).
 /// Один формат на маке и винде:
 ///
 ///   без пароля — JSON как есть (UTF-8, читается глазами);
@@ -58,10 +58,38 @@ public static class SkillsFile
     {
         if (string.IsNullOrEmpty(password))
             return Encoding.UTF8.GetBytes(doc.ToJsonString(JsonIndented));
-        byte[] plain = Deflate(Encoding.UTF8.GetBytes(doc.ToJsonString(Json)));
-        byte[] salt = RandomNumberGenerator.GetBytes(16);
+        return Seal(Encoding.UTF8.GetBytes(doc.ToJsonString(Json)), password);
+    }
+
+    /// <summary>Распаковать. Зашифрованный без пароля или с неверным — WrongPasswordException.
+    /// format — ожидаемый формат документа (навыки или файл синхронизации).</summary>
+    public static JsonNode Unpack(byte[] data, string? password, string format = Format)
+    {
+        string text;
+        if (IsEncrypted(data))
+        {
+            if (string.IsNullOrEmpty(password)) throw new WrongPasswordException();
+            text = Encoding.UTF8.GetString(Open(data, password));
+        }
+        else
+        {
+            text = Encoding.UTF8.GetString(data).TrimStart('\uFEFF');
+        }
+        var node = JsonNode.Parse(text) ?? throw new InvalidDataException("пустой файл");
+        if (node["format"]?.GetValue<string>() != format)
+            throw new InvalidDataException(format == Format ? "это не файл навыков QSwitcher" : "это не файл синхронизации QSwitcher");
+        return node;
+    }
+
+    /// <summary>Зашифровать JSON (сжимается внутри). stableSalt — одна соль на весь запуск:
+    /// ключ выводится один раз (600 тыс. итераций), а не на каждую отправку файла
+    /// синхронизации; nonce при этом всегда новый.</summary>
+    public static byte[] Seal(byte[] json, string password, bool stableSalt = false)
+    {
+        byte[] plain = Deflate(json);
+        byte[] salt = stableSalt ? StableSalt : RandomNumberGenerator.GetBytes(16);
         byte[] nonce = RandomNumberGenerator.GetBytes(12);
-        byte[] key = Rfc2898DeriveBytes.Pbkdf2(password, salt, Iterations, HashAlgorithmName.SHA256, 32);
+        byte[] key = KeyFor(password, salt, Iterations);
         byte[] cipher = new byte[plain.Length];
         byte[] tag = new byte[16];
         using (var gcm = new AesGcm(key, 16)) gcm.Encrypt(nonce, plain, cipher, tag);
@@ -75,37 +103,46 @@ public static class SkillsFile
         return ms.ToArray();
     }
 
-    /// <summary>Распаковать. Зашифрованный без пароля или с неверным — WrongPasswordException.</summary>
-    public static JsonNode Unpack(byte[] data, string? password)
+    /// <summary>Расшифровать QSX1 → JSON (UTF-8). Неверный пароль — WrongPasswordException.</summary>
+    public static byte[] Open(byte[] data, string password)
     {
-        string text;
-        if (IsEncrypted(data))
+        if (!IsEncrypted(data) || data.Length < 4 + 16 + 4 + 12 + 16) throw new WrongPasswordException();
+        byte[] salt = data.AsSpan(4, 16).ToArray();
+        uint iters = BitConverter.ToUInt32(data, 20);
+        if (iters < 1000 || iters > 10_000_000) throw new InvalidDataException("странное число итераций");
+        var nonce = data.AsSpan(24, 12);
+        int clen = data.Length - 36 - 16;
+        var cipher = data.AsSpan(36, clen);
+        var tag = data.AsSpan(36 + clen, 16);
+        byte[] key = KeyFor(password, salt, (int)iters);
+        byte[] plain = new byte[clen];
+        try
         {
-            if (string.IsNullOrEmpty(password) || data.Length < 4 + 16 + 4 + 12 + 16) throw new WrongPasswordException();
-            var salt = data.AsSpan(4, 16);
-            uint iters = BitConverter.ToUInt32(data, 20);
-            if (iters < 1000 || iters > 10_000_000) throw new InvalidDataException("странное число итераций");
-            var nonce = data.AsSpan(24, 12);
-            int clen = data.Length - 36 - 16;
-            var cipher = data.AsSpan(36, clen);
-            var tag = data.AsSpan(36 + clen, 16);
-            byte[] key = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt.ToArray(), (int)iters, HashAlgorithmName.SHA256, 32);
-            byte[] plain = new byte[clen];
-            try
-            {
-                using var gcm = new AesGcm(key, 16);
-                gcm.Decrypt(nonce, cipher, tag, plain);
-            }
-            catch (CryptographicException) { throw new WrongPasswordException(); }
-            text = Encoding.UTF8.GetString(Inflate(plain));
+            using var gcm = new AesGcm(key, 16);
+            gcm.Decrypt(nonce, cipher, tag, plain);
         }
-        else
+        catch (CryptographicException) { throw new WrongPasswordException(); }
+        return Inflate(plain);
+    }
+
+    private static readonly byte[] StableSalt = RandomNumberGenerator.GetBytes(16);
+    private static readonly Dictionary<string, byte[]> Keys = new(StringComparer.Ordinal);
+
+    /// PBKDF2 с кэшем: файлы других устройств тоже с постоянной солью — ключ считается раз
+    /// на устройство за запуск.
+    private static byte[] KeyFor(string password, byte[] salt, int iters)
+    {
+        string id = iters + "|" + Convert.ToBase64String(salt) + "|"
+                    + Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(password)));
+        lock (Keys)
+            if (Keys.TryGetValue(id, out var k)) return k;
+        byte[] key = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt, iters, HashAlgorithmName.SHA256, 32);
+        lock (Keys)
         {
-            text = Encoding.UTF8.GetString(data).TrimStart('﻿');
+            if (Keys.Count > 64) Keys.Clear();
+            Keys[id] = key;
         }
-        var node = JsonNode.Parse(text) ?? throw new InvalidDataException("пустой файл");
-        if (node["format"]?.GetValue<string>() != Format) throw new InvalidDataException("это не файл навыков QSwitcher");
-        return node;
+        return key;
     }
 
     public static byte[] Deflate(byte[] input)

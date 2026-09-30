@@ -7,7 +7,8 @@ namespace QSwitcher.App;
 /// <summary>
 /// Режимы командной строки — как на маке (main.swift):
 ///   QSwitcher.exe --test nn\sem\test-phrases.txt [--verbose]
-///   QSwitcher.exe --selftest-core [nn\lm\core5-selftest.json]
+///   QSwitcher.exe --selftest-core [nn\lm\core5-selftest.json]   (и самопроверка синхронизации)
+///   QSwitcher.exe --selftest-sync
 /// Идут рядом с запущенным свитчером: его не завершают, хук не ставят, лог не трогают.
 /// Прогон — тем же детектором и с тем же config.json и выученными правилами, что живой
 /// ввод; отчёт — в %APPDATA%\QSwitcher\test-report.txt (его читает nn\sem\sweep.ps1).
@@ -20,7 +21,7 @@ internal static class Cli
     private static extern bool AttachConsole(int dwProcessId);
 
     public static bool Handles(string[] args) =>
-        args.Length > 0 && args[0] is "--test" or "--selftest-core";
+        args.Length > 0 && args[0] is "--test" or "--selftest-core" or "--selftest-sync";
 
     public static string ReportPath => Path.Combine(Program.DataDir, "test-report.txt");
 
@@ -33,7 +34,12 @@ internal static class Cli
         Directory.CreateDirectory(Program.DataDir);
         try
         {
-            return args[0] == "--test" ? Test(args) : Selftest(args);
+            return args[0] switch
+            {
+                "--test" => Test(args),
+                "--selftest-sync" => SyncSelftest(),
+                _ => Selftest(args),
+            };
         }
         catch (Exception e)
         {
@@ -62,7 +68,18 @@ internal static class Cli
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var (n, bad) = Core5.Selftest(st, ngram, charLm, Say, verbose: args.Contains("--verbose"));
         Say($"Ядро 5 / самопроверка: {n - bad}/{n} совпало с эталоном ({sw.ElapsedMilliseconds} мс)");
-        return bad == 0 && n > 0 ? 0 : 1;
+        int rs = SyncSelftest();
+        return bad == 0 && n > 0 && rs == 0 ? 0 : 1;
+    }
+
+    /// Самопроверка синхронизации: слияние реестров и файл устройства — те же сценарии и тот же
+    /// образец файла, что на маке (SyncModel.swift).
+    private static int SyncSelftest()
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (n, bad) = SyncMerge.Selftest(Say);
+        Say($"Синхронизация / самопроверка: {n - bad}/{n} ({sw.ElapsedMilliseconds} мс)");
+        return bad == 0 ? 0 : 1;
     }
 
     /// Прогон фраз: строка «[@место] слова … *цель* … => ожидание» (формат nn/sem/*.txt).

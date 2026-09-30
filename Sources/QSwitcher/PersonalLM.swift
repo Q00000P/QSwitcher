@@ -86,6 +86,10 @@ final class PersonalLM {
     var swap: (String) -> String = { $0 }
     /// Сколько изменений с последнего сохранения.
     private(set) var dirty = 0
+    /// Сколько раз за запуск менялась своя таблица (или слой очищали) — по нему синхронизация
+    /// решает, отправлять ли слой.
+    var localVersion: Int64 { lock.lock(); defer { lock.unlock() }; return localVersionRaw }
+    private var localVersionRaw: Int64 = 0
 
     init(device: String, name: String, platform: String) {
         local = PersonalTable(device: device, name: name, platform: platform)
@@ -172,6 +176,7 @@ final class PersonalLM {
     private func touch() {
         local.updated = Int64(Date().timeIntervalSince1970 * 1000)
         dirty += 1
+        localVersionRaw += 1
     }
 
     /// Добавить напрямую (тесты): слово и пара с предыдущим.
@@ -441,6 +446,14 @@ final class PersonalLM {
         let fresh = PersonalTable(device: local.device, name: local.name, platform: local.platform)
         tables[local.device] = fresh
         local = fresh
+        localVersionRaw += 1
+    }
+
+    /// Только своя таблица (для файла синхронизации: каждое устройство отправляет своё, чужие
+    /// таблицы другие устройства берут из файлов их хозяев). Без обрезки и без сброса dirty.
+    func snapshotLocal() -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        return ["v": 1, "self": local.device, "clearedAt": clearedAt, "tables": [PersonalLM.tableToJSON(local)]]
     }
 
     /// Очистить весь слой (все устройства). При синхронизации очистка расходится по метке.
@@ -497,70 +510,195 @@ final class PersonalLM {
         return true
     }
 
-    // MARK: диск — personal.qsp ("QSP1" + AES-GCM ключом из Keychain от JSON, сжатого DEFLATE)
+    // MARK: диск — personal.qsp ("QSP2" + AES-GCM ключом данных QSwitcher (DataKey) от JSON,
+    // сжатого DEFLATE; "QSP1" — прежний формат ключом защищённого лога: читается, пишется уже QSP2)
 
     static var fileURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return appSupport.appendingPathComponent("QSwitcher/personal.qsp")
     }
 
-    private static let magic = Data("QSP1".utf8)
+    private static let magic = Data("QSP2".utf8)
+    private static let legacyMagic = Data("QSP1".utf8)
     private static let saveQueue = DispatchQueue(label: "qswitcher.personal.save", qos: .utility)
+    private static var computerName: String { (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? "Mac" }
 
-    /// readOnly — для прогонов из командной строки: битый файл не трогать.
-    static func load(readOnly: Bool = false) -> PersonalLM {
-        let name = (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? "Mac"
-        let url = fileURL
-        if let data = try? Data(contentsOf: url) {
-            do {
-                guard data.count > 4, data.prefix(4) == magic else { throw NSError(domain: "QSP", code: 1) }
-                let plain = try SecureLogCrypto.decrypt(Data(data.dropFirst(4)))
-                guard let raw = plain.decompressed(),
-                      let root = try JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
-                    throw NSError(domain: "QSP", code: 2)
-                }
-                let lm = fromJSON(root, defaultDevice: UUID().uuidString, name: name, platform: "mac")
-                let s = lm.stats()
-                print("🧠 Личный слой: слов ru \(s.wordsRu), en \(s.wordsEn), пар \(s.pairs), опечаток \(s.typoForms), устройств \(s.devices)")
-                return lm
-            } catch {
-                if readOnly {
-                    print("⚠️ Личный слой не прочитался — прогон без него")
-                } else {
-                    let broken = url.appendingPathExtension("broken")
-                    try? FileManager.default.removeItem(at: broken)
-                    try? FileManager.default.moveItem(at: url, to: broken)
-                    print("⚠️ Личный слой не прочитался — начинаю заново, старый файл: \(broken.path)")
-                }
+    /// Файл ещё читается: на диск не писать (затёрли бы его почти пустым слоем).
+    private var loading = false
+    private var onLoaded: [() -> Void] = []
+
+    private enum ReadResult {
+        case loaded(PersonalLM)
+        case missing
+        /// Ключ недоступен (связка ключей не дала): сам файл цел.
+        case unreadable(String)
+        case broken(String)
+    }
+
+    /// Прочитать файл. Может ждать разрешения связки ключей — не с главного потока приложения.
+    private static func readFile(name: String) -> ReadResult {
+        guard let data = try? Data(contentsOf: fileURL) else { return .missing }
+        guard data.count > 4 else { return .broken("короткий файл") }
+        let head = data.prefix(4), body = Data(data.dropFirst(4))
+        let plain: Data
+        do {
+            if head == magic {
+                plain = try DataKey.open(body)
+            } else if head == legacyMagic {
+                plain = try SecureLogCrypto.decryptWithExistingKey(body)
+            } else {
+                return .broken("не QSP")
             }
-        } else {
+        } catch let e as DataKey.Failure {
+            return .unreadable(e.description)
+        } catch SecureLogCrypto.CryptoError.keyLoadFailed(let st) {
+            return .unreadable("ключ защищённого лога недоступен (\(st))")
+        } catch {
+            return .broken("не расшифровался")
+        }
+        guard let raw = plain.decompressed(),
+              let root = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else { return .broken("не JSON") }
+        return .loaded(fromJSON(root, defaultDevice: UUID().uuidString, name: name, platform: "mac"))
+    }
+
+    private static func report(_ lm: PersonalLM) {
+        let s = lm.stats()
+        print("🧠 Личный слой: слов ru \(s.wordsRu), en \(s.wordsEn), пар \(s.pairs), опечаток \(s.typoForms), устройств \(s.devices)")
+    }
+
+    /// Прочитать сразу (прогоны из командной строки). readOnly — битый файл не трогать.
+    static func load(readOnly: Bool = false) -> PersonalLM {
+        let name = computerName
+        switch readFile(name: name) {
+        case .loaded(let lm):
+            report(lm)
+            return lm
+        case .missing:
             print("🧠 Личный слой: пока пуст")
+        case .unreadable(let why):
+            print("⚠️ Личный слой не прочитался (\(why)) — \(readOnly ? "прогон без него" : "работаю без него")")
+        case .broken(let why):
+            if readOnly {
+                print("⚠️ Личный слой не прочитался (\(why)) — прогон без него")
+            } else {
+                moveAside("broken")
+                print("⚠️ Личный слой не прочитался (\(why)) — начинаю заново, старый файл: \(fileURL.path).broken")
+            }
         }
         return PersonalLM(device: UUID().uuidString, name: name, platform: "mac")
     }
 
+    private static func moveAside(_ ext: String) {
+        let to = fileURL.appendingPathExtension(ext)
+        try? FileManager.default.removeItem(at: to)
+        try? FileManager.default.moveItem(at: fileURL, to: to)
+    }
+
+    /// Слой приложения: сразу (старт и ввод не ждут связку ключей), файл — в фоне. Пока читается,
+    /// слой копит то, что набрано за это время, и на диск не пишется; прочитанное сливается с ним.
     private static func loadShared() -> PersonalLM {
-        let lm = load()
+        let name = computerName
+        let lm = PersonalLM(device: UUID().uuidString, name: name, platform: "mac")
         lm.modeSource = { Config.shared.personalMode }
         lm.swap = { Detector.shared.swap($0) }
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            lm.loading = true
+            DispatchQueue.global(qos: .userInitiated).async { lm.finishLoading(readFile(name: name)) }
+        } else {
+            print("🧠 Личный слой: пока пуст")
+        }
         return lm
     }
 
-    /// Записать (в фоне): снимок под замком слоя, шифрование и файл — вне его.
+    private func finishLoading(_ r: ReadResult) {
+        switch r {
+        case .loaded(let other):
+            adopt(other)
+            PersonalLM.report(self)
+        case .missing:
+            print("🧠 Личный слой: пока пуст")
+        case .unreadable(let why):
+            // Файл цел, но ключа нет — отложить его (не затирать) и учиться заново
+            PersonalLM.moveAside("unread")
+            print("⚠️ Личный слой не прочитался (\(why)) — файл отложен: \(PersonalLM.fileURL.path).unread, начинаю заново")
+        case .broken(let why):
+            PersonalLM.moveAside("broken")
+            print("⚠️ Личный слой не прочитался (\(why)) — начинаю заново, старый файл: \(PersonalLM.fileURL.path).broken")
+        }
+        lock.lock()
+        loading = false
+        let callbacks = onLoaded
+        onLoaded = []
+        lock.unlock()
+        if !callbacks.isEmpty { DispatchQueue.main.async { callbacks.forEach { $0() } } }
+    }
+
+    /// Выполнить на главном потоке, когда файл прочитан (синхронизация ждёт: ей нужен id устройства).
+    func whenLoaded(_ block: @escaping () -> Void) {
+        lock.lock()
+        if loading { onLoaded.append(block); lock.unlock(); return }
+        lock.unlock()
+        if Thread.isMainThread { block() } else { DispatchQueue.main.async(execute: block) }
+    }
+
+    /// Прочитанный файл плюс выученное за время чтения.
+    private func adopt(_ other: PersonalLM) {
+        lock.lock(); defer { lock.unlock() }
+        let session = local
+        let mine = other.local                        // своя таблица и id устройства — из файла
+        if clearedAt > other.clearedAt {
+            // Пока читали, слой очистили: из файла — только id устройства
+            let old = session.device
+            session.device = mine.device
+            tables.removeValue(forKey: old)
+            tables[session.device] = session
+        } else {
+            for i in 0..<2 {
+                for (k, v) in session.uni[i] { PersonalLM.inc(&mine.uni[i], k, v) }
+                for (k, v) in session.bi[i] { PersonalLM.inc(&mine.bi[i], k, v) }
+                for (k, rights) in session.typo[i] {
+                    for (rk, rv) in rights { PersonalLM.inc(&mine.typo[i][k, default: [:]], rk, rv) }
+                }
+            }
+            mine.words += session.words
+            mine.corrections += session.corrections
+            mine.typos += session.typos
+            mine.updated = max(mine.updated, session.updated)
+            var merged = other.tables
+            // Таблицы других устройств, пришедшие за время чтения (импорт), — если свежее
+            for (dev, t) in tables where dev != session.device {
+                if let o = merged[dev], o.updated >= t.updated { continue }
+                merged[dev] = t
+            }
+            merged[mine.device] = mine
+            tables = merged
+            local = mine
+            clearedAt = other.clearedAt
+        }
+        rebuild()
+        localVersionRaw += 1
+        dirty += 1
+    }
+
+    /// Записать (в фоне): снимок под замком слоя, шифрование и файл — вне его. Пока файл
+    /// читается — не пишется.
     func save(sync: Bool = false) {
+        lock.lock()
+        let busy = loading
+        lock.unlock()
+        guard !busy else { return }
         let snap = snapshot()
         let work = {
             guard let json = try? JSONSerialization.data(withJSONObject: snap, options: [.sortedKeys]),
                   let packed = json.compressed() else { return }
             do {
-                let enc = try SecureLogCrypto.encrypt(packed)
                 var out = PersonalLM.magic
-                out.append(enc)
+                out.append(try DataKey.seal(packed))
                 let url = PersonalLM.fileURL
                 try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try out.write(to: url, options: .atomic)
             } catch {
-                print("⚠️ Личный слой не записался: \(error.localizedDescription)")
+                print("⚠️ Личный слой не записался: \(error)")
             }
         }
         if sync { PersonalLM.saveQueue.sync(execute: work) } else { PersonalLM.saveQueue.async(execute: work) }

@@ -123,6 +123,18 @@ enum SecureLogCrypto {
         }
     }
 
+    /// Расшифровать только существующим ключом, без создания нового: прочитать прежние данные
+    /// (личный слой формата QSP1), не рискуя пересоздать ключ — старые логи перестали бы читаться.
+    static func decryptWithExistingKey(_ ciphertext: Data) throws -> Data {
+        let key = try loadKey()
+        do {
+            let box = try AES.GCM.SealedBox(combined: ciphertext)
+            return try AES.GCM.open(box, using: key)
+        } catch {
+            throw CryptoError.decryptionFailed(error.localizedDescription)
+        }
+    }
+
     // MARK: - Touch ID gate
 
     /// Запросить Touch ID / пароль для защищённого действия.

@@ -64,9 +64,10 @@ public static class Skills
             if (!haveStop.Contains(w.ToLowerInvariant())) { learned.Add(w, force: false); rules++; }
         if (rules > 0) report.Add($"выученных правил: +{rules}");
 
+        // Слова — как написаны (строчное совпадает без учёта регистра, с заглавными — точно; как на маке)
         int words = 0;
-        foreach (var w in SkillsFile.ReadStrings(doc["forceWords"])) if (cfg.ForceWords.Add(w.ToLowerInvariant())) words++;
-        foreach (var w in SkillsFile.ReadStrings(doc["stopWords"])) if (cfg.StopWords.Add(w.ToLowerInvariant())) words++;
+        foreach (var w in SkillsFile.ReadStrings(doc["forceWords"])) if (w.Trim().Length > 0 && cfg.ForceWords.Add(w.Trim())) words++;
+        foreach (var w in SkillsFile.ReadStrings(doc["stopWords"])) if (w.Trim().Length > 0 && cfg.StopWords.Add(w.Trim())) words++;
         if (words > 0) report.Add($"стоп- и форс-слов: +{words}");
 
         int apps = 0;

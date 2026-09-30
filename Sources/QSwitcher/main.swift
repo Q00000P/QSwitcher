@@ -32,8 +32,17 @@ func setupFileLogging() {
 }
 
 // Режимы командной строки — без фоновой самопроверки ядра (она печатала бы посреди вывода)
-if CommandLine.arguments.contains(where: { ["--train", "--forget-tag", "--test", "--selftest-core"].contains($0) }) {
+if CommandLine.arguments.contains(where: { ["--train", "--forget-tag", "--test", "--selftest-core", "--selftest-sync"].contains($0) }) {
     Core5.autoSelftest = false
+}
+
+// === Самопроверка синхронизации: QSwitcher --selftest-sync ===
+// Те же сценарии слияния и тот же образец файла (сделан на винде), что SyncMerge.Selftest в C#.
+func runSyncSelftest() -> Bool {
+    let t0 = Date()
+    let (n, bad) = SyncMerge.selftest(log: { print($0) })
+    print("Синхронизация / самопроверка: \(n - bad)/\(n) (\(Int(Date().timeIntervalSince(t0) * 1000)) мс)")
+    return bad == 0
 }
 
 // === Самопроверка ядра 5: QSwitcher --selftest-core [файл] [--verbose] ===
@@ -58,7 +67,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--selftest-core") {
     let (n, bad) = Core5.selftest(url: u, verbose: CommandLine.arguments.contains("--verbose"))
     let ms = Int(Date().timeIntervalSince(t0) * 1000)
     print("Ядро 5 / самопроверка: \(n - bad)/\(n) совпало с эталоном (\(ms) мс)")
-    exit(bad == 0 && n > 0 ? 0 : 1)
+    let syncOk = runSyncSelftest()
+    exit(bad == 0 && n > 0 && syncOk ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--selftest-sync") {
+    setvbuf(stdout, nil, _IOLBF, 0)
+    exit(runSyncSelftest() ? 0 : 1)
 }
 
 // === Обучение из файла: QSwitcher --train файл ===

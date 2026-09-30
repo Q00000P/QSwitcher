@@ -44,7 +44,7 @@ final class Arbiter {
             let cap = MemoryLayout.size(ofValue: ptr.pointee)
             guard path.utf8.count < cap else { return false }
             let raw = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: CChar.self)
-            path.withCString { strncpy(raw, $0, cap) }
+            _ = path.withCString { strncpy(raw, $0, cap) }
             return true
         }
         guard ok else { return nil }

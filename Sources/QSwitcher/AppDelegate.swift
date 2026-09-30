@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var infoItem: NSMenuItem!
     private var logSubmenuItem: NSMenuItem!
     private var personalMenuItem: NSMenuItem!
+    private var syncMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Профиль старого формата — пересборка из журнала, когда все синглтоны уже живы
@@ -95,10 +96,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // установки хука, а не на первом слове: иначе первая граница платит за загрузку
         // прямо в обработчике клавиатуры, и ввод во всей системе замирает на это время.
         _ = Detector.shared
-        // Личный слой — тоже до хука: файл расшифровывается при первом обращении
+        // Личный слой — сразу: файл читается в фоне (расшифровка может ждать разрешения связки
+        // ключей — старт и ввод этого не ждут), до конца чтения слой копит набранное
         Core5.shared.personal = PersonalLM.shared
         PersonalLM.shared.startAutosave()
         print("🧠 Личный слой: режим \(Config.shared.personalMode.rawValue)")
+        // Синхронизация навыков с другими устройствами — когда слой прочитан (нужен id устройства)
+        PersonalLM.shared.whenLoaded { SyncService.shared.start() }
 
         switcher = Switcher()
         switcher.onLanguageChanged = { [weak self] lang in
@@ -247,6 +251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         importItem.target = self
         menu.addItem(importItem)
 
+        // Синхронизация с другими устройствами (Google Drive / WebDAV) — пункты как на винде
+        syncMenuItem = NSMenuItem(title: "Синхронизация", action: nil, keyEquivalent: "")
+        syncMenuItem.submenu = NSMenu()
+        menu.addItem(syncMenuItem)
+
         let finetune = NSMenuItem(title: "Дообучить сеть на моих исправлениях…",
                                   action: #selector(finetuneNet), keyEquivalent: "")
         finetune.target = self
@@ -303,6 +312,148 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshDynamicMenuItems()
         refreshLogSubmenu()
         refreshPersonalSubmenu()
+        refreshSyncSubmenu()
+    }
+
+    // MARK: - Синхронизация
+
+    private func refreshSyncSubmenu() {
+        guard let sub = syncMenuItem?.submenu else { return }
+        let sync = SyncService.shared
+        sub.removeAllItems()
+        func line(_ t: String) { let it = NSMenuItem(title: t, action: nil, keyEquivalent: ""); it.isEnabled = false; sub.addItem(it) }
+        func item(_ t: String, _ a: Selector, on: Bool = false, enabled: Bool = true) {
+            let it = NSMenuItem(title: t, action: enabled ? a : nil, keyEquivalent: "")
+            it.target = self
+            it.state = on ? .on : .off
+            it.isEnabled = enabled
+            sub.addItem(it)
+        }
+        line(sync.statusLine())
+        if sync.configured {
+            line("Устройства:")
+            for d in sync.deviceLines() { line("    " + d) }
+        }
+        sub.addItem(NSMenuItem.separator())
+        item("Синхронизировать сейчас", #selector(syncNow), enabled: sync.configured)
+        item("Автоматически (раз в минуту и по событиям)", #selector(toggleSyncAuto), on: sync.auto)
+        sub.addItem(NSMenuItem.separator())
+        item("Подключить Google Drive…", #selector(connectGoogleDrive), on: sync.backend == "gdrive")
+        item("Подключить WebDAV (Яндекс Диск)…", #selector(connectWebDAV), on: sync.backend == "webdav")
+        item("Пароль синхронизации…", #selector(changeSyncPassword))
+        item("Отключить", #selector(disconnectSync), enabled: sync.configured)
+    }
+
+    /// Короткое сообщение у значка в строке меню (как всплывающее у трея на винде).
+    private var toastPopover: NSPopover?
+
+    private func toast(_ title: String, _ text: String) {
+        guard let button = statusItem.button else { info(title, text); return }
+        toastPopover?.close()
+        let label = NSTextField(wrappingLabelWithString: title + "\n" + text)
+        label.font = NSFont.systemFont(ofSize: 12)
+        label.preferredMaxLayoutWidth = 320
+        let size = label.fittingSize
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: min(340, size.width + 24), height: size.height + 20))
+        label.frame = NSRect(x: 12, y: 10, width: view.frame.width - 24, height: size.height)
+        view.addSubview(label)
+        let vc = NSViewController()
+        vc.view = view
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = vc
+        pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        toastPopover = pop
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak pop] in pop?.close() }
+    }
+
+    private func syncReport(_ ok: Bool, _ title: String, _ text: String) {
+        if ok { toast(title, text) } else { info(title, text) }
+    }
+
+    @objc private func syncNow() {
+        toast("Синхронизация", "Синхронизирую…")
+        SyncService.shared.syncNow { [weak self] ok, text in self?.syncReport(ok, "Синхронизация", text) }
+    }
+
+    @objc private func toggleSyncAuto() {
+        SyncService.shared.setAuto(!SyncService.shared.auto)
+    }
+
+    /// Пароль синхронизации — если ещё не задан. false — отказались.
+    private func ensureSyncPassword() -> Bool {
+        if SyncService.shared.hasPassword { return true }
+        guard let pw = promptPassword(title: "Пароль синхронизации",
+                                      message: "Придумайте пароль — одинаковый на всех устройствах (мак, винда). Им шифруются файлы в облаке.",
+                                      confirm: true, emptyMessage: "Пустой пароль не подходит.") else { return false }
+        SyncService.shared.setPassword(pw)
+        return true
+    }
+
+    @objc private func connectGoogleDrive() {
+        guard SyncService.googleAvailable else {
+            info("Google Drive", "В этой сборке нет ключа Google.\n\nЗадайте переменные окружения QS_GOOGLE_CLIENT_ID и "
+                 + "QS_GOOGLE_CLIENT_SECRET (Desktop-клиент Google) и пересоберите (./make-app.sh) — или подключите WebDAV (Яндекс Диск).")
+            return
+        }
+        guard ensureSyncPassword() else { return }
+        toast("Google Drive", "Открываю браузер: войдите в Google и разрешите QSwitcher доступ к его папке на Диске.")
+        SyncService.shared.connectGoogle { [weak self] ok, text in self?.syncReport(ok, "Google Drive", text) }
+    }
+
+    @objc private func connectWebDAV() {
+        let sync = SyncService.shared
+        let alert = NSAlert()
+        alert.messageText = "WebDAV (Яндекс Диск)"
+        alert.informativeText = "Яндекс Диск: адрес https://webdav.yandex.ru, логин Яндекса, пароль — «пароль приложения» "
+            + "(id.yandex.ru → Безопасность → Пароли приложений → Файлы). Файлы лягут в папку QSwitcher."
+        alert.addButton(withTitle: "Подключить")
+        alert.addButton(withTitle: "Отмена")
+        let w: CGFloat = 300
+        let url = NSTextField(frame: NSRect(x: 0, y: 60, width: w, height: 24))
+        url.stringValue = sync.webdavURL.isEmpty ? WebDAVTransport.defaultURL : sync.webdavURL
+        url.placeholderString = "адрес"
+        let user = NSTextField(frame: NSRect(x: 0, y: 30, width: w, height: 24))
+        user.stringValue = sync.webdavUser
+        user.placeholderString = "логин"
+        let pw = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: w, height: 24))
+        pw.placeholderString = "пароль приложения"
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: w, height: 84))
+        view.addSubview(url); view.addSubview(user); view.addSubview(pw)
+        alert.accessoryView = view
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = sync.webdavUser.isEmpty ? user : pw
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let u = url.stringValue.trimmingCharacters(in: .whitespaces)
+        let n = user.stringValue.trimmingCharacters(in: .whitespaces)
+        let p = pw.stringValue
+        guard let parsed = URL(string: u), ["https", "http"].contains(parsed.scheme ?? "") else {
+            info("WebDAV", "Адрес должен начинаться с https://"); return
+        }
+        guard !n.isEmpty, !p.isEmpty else { info("WebDAV", "Нужны логин и пароль."); return }
+        guard ensureSyncPassword() else { return }
+        toast("WebDAV", "Проверяю подключение…")
+        sync.connectWebDAV(url: u, user: n, password: p) { [weak self] ok, text in self?.syncReport(ok, "WebDAV", text) }
+    }
+
+    @objc private func changeSyncPassword() {
+        guard let pw = promptPassword(title: "Пароль синхронизации",
+                                      message: "Одинаковый на всех устройствах: им шифруются файлы в облаке. Сменили здесь — смените и на остальных.",
+                                      confirm: true, emptyMessage: "Пустой пароль не подходит.") else { return }
+        SyncService.shared.setPassword(pw)
+        SyncService.shared.request(forcePush: true, reason: "новый пароль")
+        toast("Синхронизация", "Пароль сохранён. На других устройствах нужен такой же.")
+    }
+
+    @objc private func disconnectSync() {
+        let alert = NSAlert()
+        alert.messageText = "Отключить синхронизацию?"
+        alert.informativeText = "Забыть вход в хранилище. Навыки остаются здесь, файлы в облаке — там."
+        alert.addButton(withTitle: "Отмена")
+        alert.addButton(withTitle: "Отключить")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        SyncService.shared.disconnect()
     }
 
     // MARK: - Личный слой
@@ -356,11 +507,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard alert.runModal() == .alertSecondButtonReturn else { return }
         PersonalLM.shared.clear()
         PersonalLM.shared.save()
+        SyncService.shared.request(forcePush: true, reason: "очистка личного слоя")
         print("🧠 Личный слой очищен")
     }
 
     /// Пароль (скрытый ввод). confirm — второй раз для проверки. nil — отмена или не совпало.
-    private func promptPassword(title: String, message: String, confirm: Bool) -> String? {
+    private func promptPassword(title: String, message: String, confirm: Bool,
+                                emptyMessage: String = "Пустой пароль. Для файла без пароля выбери тип «Открытый JSON».") -> String? {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
@@ -380,7 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let pw = box.stringValue
         if pw.isEmpty {
-            info(title, "Пустой пароль. Для файла без пароля выбери тип «Открытый JSON».")
+            info(title, emptyMessage)
             return nil
         }
         if confirm && pw != box2.stringValue {
@@ -430,6 +583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let doc = try SkillsFile.unpack(data, password: pw)
             let report = Skills.importDoc(doc)
+            SyncService.shared.request(forcePush: true, reason: "импорт навыков")
             print("[skills] импорт ← \(url.path): \(report.replacingOccurrences(of: "\n", with: " "))")
             info("Импорт навыков", report)
         } catch SkillsFile.Failure.wrongPassword {
@@ -1337,6 +1491,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if Core5.shared.personal != nil {
             PersonalLM.shared.flush()
             PersonalLM.shared.save(sync: true)
+            // Своё — в облако, пока не вышли (не дольше нескольких секунд)
+            SyncService.shared.shutdown()
         }
     }
 

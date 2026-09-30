@@ -79,6 +79,10 @@ public sealed class PersonalLM
     public Func<string, string> Swap { get; set; } = s => s;
     /// Сколько изменений с последнего сохранения.
     public int Dirty { get; private set; }
+    /// Сколько раз за запуск менялась своя таблица (или слой очищали) — по нему синхронизация
+    /// решает, отправлять ли слой.
+    public long LocalVersion => Interlocked.Read(ref _localVersion);
+    private long _localVersion;
 
     public PersonalLM(string device, string name, string platform)
     {
@@ -165,6 +169,7 @@ public sealed class PersonalLM
     {
         Local.Updated = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         Dirty++;
+        Interlocked.Increment(ref _localVersion);
     }
 
     /// <summary>Добавить напрямую (импорт текста, тесты): слово и пара с предыдущим.</summary>
@@ -515,6 +520,7 @@ public sealed class PersonalLM
         var fresh = new PersonalTable { Device = Local.Device, Name = Local.Name, Platform = Local.Platform };
         _tables[Local.Device] = fresh;
         Local = fresh;
+        Interlocked.Increment(ref _localVersion);
     }
 
     /// <summary>Очистить весь слой (все устройства). При синхронизации очистка расходится
@@ -582,6 +588,24 @@ public sealed class PersonalLM
             arr.Add(TableToJson(t));
         return new JsonObject { ["v"] = 1, ["self"] = self, ["clearedAt"] = cleared, ["tables"] = arr }
             .ToJsonString(SkillsFile.Json);
+    }
+
+    /// <summary>Только своя таблица (для файла синхронизации: каждое устройство отправляет своё,
+    /// чужие таблицы другие устройства берут из файлов их хозяев). Без обрезки и без сброса Dirty —
+    /// запись на диск идёт своим чередом.</summary>
+    public JsonObject SnapshotLocal()
+    {
+        PersonalTable copy;
+        long cleared;
+        lock (_lock)
+        {
+            copy = Clone(Local);
+            cleared = ClearedAt;
+        }
+        return new JsonObject
+        {
+            ["v"] = 1, ["self"] = copy.Device, ["clearedAt"] = cleared, ["tables"] = new JsonArray(TableToJson(copy)),
+        };
     }
 
     private static PersonalTable Clone(PersonalTable t)

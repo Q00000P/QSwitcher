@@ -3,7 +3,7 @@ import CryptoKit
 import CommonCrypto
 import SystemConfiguration
 
-/// Файл навыков QSwitcher — экспорт/импорт и (дальше) синхронизация между устройствами.
+/// Файл навыков QSwitcher — экспорт/импорт; тот же шифр у файлов синхронизации (SyncModel.swift).
 /// Один формат с виндой (SkillsFile.cs):
 ///
 ///   без пароля — JSON как есть (UTF-8, читается глазами);
@@ -46,11 +46,32 @@ enum SkillsFile {
         guard let pw = password, !pw.isEmpty else {
             return try JSONSerialization.data(withJSONObject: doc, options: [.prettyPrinted, .sortedKeys])
         }
-        let json = try JSONSerialization.data(withJSONObject: doc, options: [.sortedKeys])
+        return try seal(try JSONSerialization.data(withJSONObject: doc, options: [.sortedKeys]), password: pw)
+    }
+
+    /// Распаковать. Зашифрованный без пароля или с неверным — .wrongPassword. format — ожидаемый
+    /// формат документа (навыки или файл синхронизации).
+    static func unpack(_ data: Data, password: String?, format expected: String = SkillsFile.format) throws -> [String: Any] {
+        var jsonData: Data
+        if isEncrypted(data) {
+            guard let pw = password, !pw.isEmpty else { throw Failure.wrongPassword }
+            jsonData = try open(data, password: pw)
+        } else {
+            jsonData = data
+            if jsonData.starts(with: [0xEF, 0xBB, 0xBF]) { jsonData = Data(jsonData.dropFirst(3)) }   // BOM
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              obj["format"] as? String == expected else { throw Failure.notSkills }
+        return obj
+    }
+
+    /// Зашифровать JSON (сжимается внутри). stableSalt — одна соль на весь запуск: ключ выводится
+    /// один раз (600 тыс. итераций), а не на каждую отправку файла синхронизации; nonce — всегда новый.
+    static func seal(_ json: Data, password: String, stableSalt: Bool = false) throws -> Data {
         guard let plain = json.compressed() else { throw Failure.notSkills }
-        let salt = randomBytes(16)
+        let salt = stableSalt ? SkillsFile.stableSaltValue : randomBytes(16)
         let nonceData = randomBytes(12)
-        let key = SymmetricKey(data: pbkdf2(pw, salt: salt, rounds: iterations))
+        let key = SymmetricKey(data: keyFor(password, salt: salt, rounds: iterations))
         let sealed = try AES.GCM.seal(plain, using: key, nonce: try AES.GCM.Nonce(data: nonceData))
         var out = magic
         out.append(salt)
@@ -61,35 +82,45 @@ enum SkillsFile {
         return out
     }
 
-    /// Распаковать. Зашифрованный без пароля или с неверным — .wrongPassword.
-    static func unpack(_ data: Data, password: String?) throws -> [String: Any] {
-        var jsonData: Data
-        if isEncrypted(data) {
-            guard let pw = password, !pw.isEmpty, data.count >= 4 + 16 + 4 + 12 + 16 else { throw Failure.wrongPassword }
-            let b = [UInt8](data)
-            let salt = Data(b[4..<20])
-            let iters = UInt32(b[20]) | (UInt32(b[21]) << 8) | (UInt32(b[22]) << 16) | (UInt32(b[23]) << 24)
-            guard iters >= 1000, iters <= 10_000_000 else { throw Failure.notSkills }
-            let nonceData = Data(b[24..<36])
-            let ct = Data(b[36..<(b.count - 16)])
-            let tag = Data(b[(b.count - 16)...])
-            let key = SymmetricKey(data: pbkdf2(pw, salt: salt, rounds: iters))
-            let plain: Data
-            do {
-                let box = try AES.GCM.SealedBox(nonce: try AES.GCM.Nonce(data: nonceData), ciphertext: ct, tag: tag)
-                plain = try AES.GCM.open(box, using: key)
-            } catch {
-                throw Failure.wrongPassword
-            }
-            guard let raw = plain.decompressed() else { throw Failure.notSkills }
-            jsonData = raw
-        } else {
-            jsonData = data
-            if jsonData.starts(with: [0xEF, 0xBB, 0xBF]) { jsonData = Data(jsonData.dropFirst(3)) }   // BOM
+    /// Расшифровать QSX1 → JSON. Неверный пароль — .wrongPassword.
+    static func open(_ data: Data, password: String) throws -> Data {
+        guard isEncrypted(data), data.count >= 4 + 16 + 4 + 12 + 16 else { throw Failure.wrongPassword }
+        let b = [UInt8](data)
+        let salt = Data(b[4..<20])
+        let iters = UInt32(b[20]) | (UInt32(b[21]) << 8) | (UInt32(b[22]) << 16) | (UInt32(b[23]) << 24)
+        guard iters >= 1000, iters <= 10_000_000 else { throw Failure.notSkills }
+        let nonceData = Data(b[24..<36])
+        let ct = Data(b[36..<(b.count - 16)])
+        let tag = Data(b[(b.count - 16)...])
+        let key = SymmetricKey(data: keyFor(password, salt: salt, rounds: iters))
+        let plain: Data
+        do {
+            let box = try AES.GCM.SealedBox(nonce: try AES.GCM.Nonce(data: nonceData), ciphertext: ct, tag: tag)
+            plain = try AES.GCM.open(box, using: key)
+        } catch {
+            throw Failure.wrongPassword
         }
-        guard let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-              obj["format"] as? String == format else { throw Failure.notSkills }
-        return obj
+        guard let raw = plain.decompressed() else { throw Failure.notSkills }
+        return raw
+    }
+
+    private static let stableSaltValue = randomBytes(16)
+    private static var keys: [String: Data] = [:]
+    private static let keysLock = NSLock()
+
+    /// PBKDF2 с кэшем: у файлов других устройств соль тоже постоянная — ключ считается раз на
+    /// устройство за запуск.
+    private static func keyFor(_ password: String, salt: Data, rounds: UInt32) -> Data {
+        let id = "\(rounds)|\(salt.base64EncodedString())|\(Data(SHA256.hash(data: Data(password.utf8))).base64EncodedString())"
+        keysLock.lock()
+        if let k = keys[id] { keysLock.unlock(); return k }
+        keysLock.unlock()
+        let k = pbkdf2(password, salt: salt, rounds: rounds)
+        keysLock.lock()
+        if keys.count > 64 { keys.removeAll() }
+        keys[id] = k
+        keysLock.unlock()
+        return k
     }
 
     static var computerName: String { (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? "Mac" }

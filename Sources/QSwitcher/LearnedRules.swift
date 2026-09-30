@@ -63,6 +63,24 @@ final class LearnedRules {
         save()
     }
 
+    /// Синхронизация: слово → "f" (переключать), "s" (не трогать), nil (правила нет). Одной
+    /// записью на диск. Возвращает, сколько правил изменилось.
+    @discardableResult
+    func applySync(_ changes: [(word: String, state: String?)]) -> Int {
+        var n = 0
+        for (word, state) in changes {
+            let w = word.lowercased()
+            guard !w.isEmpty else { continue }
+            let wasF = force.contains(w), wasS = stop.contains(w)
+            force.remove(w)
+            stop.remove(w)
+            if state == "f" { force.insert(w) } else if state == "s" { stop.insert(w) }
+            if wasF != force.contains(w) || wasS != stop.contains(w) { n += 1 }
+        }
+        if n > 0 { save() }
+        return n
+    }
+
     /// Забыть всё выученное.
     func reset() {
         stop.removeAll()
