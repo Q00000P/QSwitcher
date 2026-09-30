@@ -13,3 +13,6 @@ src/QSwitcher.App/Resources/switch.wav
 # Пользовательское
 *.user
 .vs/
+
+# Папка публикации (dotnet publish -o publish) — собранный exe в репозиторий не кладём
+publish/

@@ -8,6 +8,7 @@ public enum HotkeyAction
     SwapWord,        // свап последнего слова, повтор — обратно
     SwapAndLearn,    // свап + создать правило (единственный способ обучения)
     SwapSelection,   // свап выделенного мышью текста
+    SwapSelectionLetters, // свап выделенного — только буквы, знаки не трогаем (формулы)
     ChangeCase,      // циклическая смена регистра выделенного
     Translit,        // транслит выделенного
     TogglePause,     // приостановить/возобновить свитчер
@@ -87,6 +88,9 @@ public sealed class HotkeyMap
     public HotkeyBinding SwapSelection { get; set; } =
         new() { Key = 0xA2, IsTap = true };                       // тап левый Ctrl
 
+    public HotkeyBinding SwapSelectionLetters { get; set; } =
+        new() { Key = 0xA2, IsTap = true, Shift = true };         // Shift + тап левый Ctrl
+
     public HotkeyBinding ChangeCase { get; set; } =
         new() { Key = 0x55, Modifier = 0xA3 };                    // правый Ctrl + U
 
@@ -108,6 +112,7 @@ public sealed class HotkeyMap
         yield return (HotkeyAction.SwapWord, SwapWord, "Свап слова / тоггл");
         yield return (HotkeyAction.SwapAndLearn, SwapAndLearn, "Свап и запомнить");
         yield return (HotkeyAction.SwapSelection, SwapSelection, "Свап выделенного");
+        yield return (HotkeyAction.SwapSelectionLetters, SwapSelectionLetters, "Свап выделенного — только буквы");
         yield return (HotkeyAction.ChangeCase, ChangeCase, "Регистр выделенного");
         yield return (HotkeyAction.Translit, Translit, "Транслит выделенного");
         yield return (HotkeyAction.TogglePause, TogglePause, "Пауза свитчера");
@@ -122,6 +127,7 @@ public sealed class HotkeyMap
             case HotkeyAction.SwapWord: SwapWord = b; break;
             case HotkeyAction.SwapAndLearn: SwapAndLearn = b; break;
             case HotkeyAction.SwapSelection: SwapSelection = b; break;
+            case HotkeyAction.SwapSelectionLetters: SwapSelectionLetters = b; break;
             case HotkeyAction.ChangeCase: ChangeCase = b; break;
             case HotkeyAction.Translit: Translit = b; break;
             case HotkeyAction.TogglePause: TogglePause = b; break;

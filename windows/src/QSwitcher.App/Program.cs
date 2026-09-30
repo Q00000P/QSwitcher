@@ -16,8 +16,15 @@ internal static class Program
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "QSwitcher");
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        // Режимы командной строки (прогон фраз, самопроверка ядра) — до всего
+        // остального: запущенный свитчер они не завершают и хук не ставят.
+        if (Cli.Handles(args))
+        {
+            Environment.ExitCode = Cli.Run(args);
+            return;
+        }
         ApplicationConfiguration.Initialize();
         Directory.CreateDirectory(DataDir);
 
@@ -105,29 +112,20 @@ internal static class Program
             if (removed > 0)
                 Log($"🧹 Снято {removed} взаимоисключающих правил (слово и его свап оба «переключать»)");
         }
-        var net = LayoutNet.Load(pair, Res.Open, Log);
+        var net = LayoutNet.Load(pair, Res.Open, Log, userWeightsPath: Path.Combine(DataDir, "qsnet.bin"));
+        var corrections = new Corrections(DataDir, net, learned, pair, cfg.AppClassOf, Log);
 
         // Ядро 5: частоты слов (qsngram.bin) + символьная модель (qschar.bin). Нет
         // частот — работает прежний каскад (сеть, словари), как до ядра 5.
         var ngram = NgramLM.Load(Res.Open, Log);
         var charLm = CharLM.Load(Res.Open, Log);
-        var core = new Core5(ngram, charLm)
-        {
-            // Параметры из config.json — на каждое решение, меняются на лету
-            LiveParams = () => new Core5.Params
-            {
-                Theta = cfg.CoreTheta,
-                Pi = Math.Clamp(cfg.CorePi, 0.001, 0.5),
-                BK = cfg.CoreLayoutBias,
-                DeferShort = cfg.CoreDeferShort,
-            },
-        };
+        var core = MakeCore(cfg, ngram, charLm);
         var appStats = new AppLangStats(Path.Combine(DataDir, "app-lang.json"), app =>
         {
             var cls = cfg.AppClassOf(app);
             return AppLangStats.ClassPrior(LayoutNet.AppNames[(int)cls]);
         });
-        bool coreOn() => !string.Equals(cfg.Core, "legacy", StringComparison.OrdinalIgnoreCase);
+        bool coreOn() => cfg.CoreOn;
         Log(ngram.Loaded
             ? $"Ядро: {(coreOn() ? "v5 — одна формула (частоты слов, символьная модель, опечатки, сосед, приложение)" : "legacy — прежний каскад (config: Core)")}"
             : "Ядро: legacy — нет qsngram.bin, ядру 5 не на чем решать");
@@ -146,18 +144,7 @@ internal static class Program
             catch (Exception ex) { Log($"⚠️ Ядро 5 / самопроверка: {ex.Message}"); }
         });
 
-        var detector = new Detector(pair, dict,
-            learned,
-            new DetectorConfig
-            {
-                ForceWords = cfg.ForceWords,
-                StopWords = cfg.StopWords,
-                MinWordLength = cfg.MinWordLength,
-                // Настройки сети читаются на каждое решение — меняются в config.json на лету
-                Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen),
-                AppClassOf = cfg.AppClassOf,
-                CoreV5 = coreOn,
-            }, Log, net, core);
+        var detector = MakeDetector(cfg, pair, dict, learned, net, core, Log);
 
         // Режим изоляции: QSWITCHER_PASSIVE=1 — хук ставится, но НИЧЕГО не делает.
         // Нужен чтобы понять, ломает ли чужие хоткеи сам факт установки хука
@@ -186,6 +173,7 @@ internal static class Program
 
         using var monitor = new KeyboardMonitor(detector, pair, replacer, learned, Log)
         {
+            Corrections = corrections,
             EngineV4 = engineV4,
             Foreground = foreground,
             AppStats = appStats,
@@ -199,7 +187,7 @@ internal static class Program
             RetroPrepositionsOnly = cfg.RetroPrepositionsOnly,
             SwitchLayoutAfter = cfg.SwitchLayoutAfter,
         };
-        using var tray = new TrayUi(cfg, learned, secureLog, pair, Log);
+        using var tray = new TrayUi(cfg, learned, secureLog, pair, Log, net, corrections);
         tray.IsPaused = () => monitor.Paused;
         tray.TogglePause = monitor.TogglePause;
         tray.StartUpdateChecks(cfg, Log);
@@ -214,6 +202,35 @@ internal static class Program
         learned.Flush();
         appStats.SaveNow();
     }
+
+    /// <summary>Ядро 5 с параметрами из config.json — читаются на каждое решение,
+    /// меняются на лету. Общее для живого ввода и прогона фраз (--test).</summary>
+    internal static Core5 MakeCore(AppConfig cfg, NgramLM ngram, CharLM charLm) => new(ngram, charLm)
+    {
+        LiveParams = () => new Core5.Params
+        {
+            Theta = cfg.CoreTheta,
+            Pi = Math.Clamp(cfg.CorePi, 0.001, 0.5),
+            BK = cfg.CoreLayoutBias,
+            DeferShort = cfg.CoreDeferShort,
+        },
+    };
+
+    /// <summary>Детектор с настройками из config.json — один и тот же для живого
+    /// ввода и прогона фраз (--test), чтобы прогон проверял ровно то, что работает.</summary>
+    internal static Detector MakeDetector(AppConfig cfg, LayoutPair pair, WordDictionary dict,
+                                          LearnedRules learned, LayoutNet net, Core5 core, Action<string>? log) =>
+        new(pair, dict, learned,
+            new DetectorConfig
+            {
+                ForceWords = cfg.ForceWords,
+                StopWords = cfg.StopWords,
+                MinWordLength = cfg.MinWordLength,
+                // Настройки сети читаются на каждое решение — меняются в config.json на лету
+                Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen, cfg.NnThresholdShort),
+                AppClassOf = cfg.AppClassOf,
+                CoreV5 = () => cfg.CoreOn,
+            }, log, net, core);
 }
 
 /// <summary>
@@ -254,7 +271,7 @@ public static class AppVersion
 {
     public const string Version = "4.0";
     /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
-    public const string Build = "wave10";
+    public const string Build = "wave15";
 }
 
 /// <summary>
@@ -280,6 +297,9 @@ public sealed class AppConfig
     // слов + символьная модель + опечатки + сосед + ожидание приложения; "legacy" —
     // прежний каскад (сеть, словари, щит). Меняется на лету.
     public string Core { get; set; } = "v5";
+    /// Ядро 5 включено (всё, кроме "legacy").
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool CoreOn => !string.Equals(Core, "legacy", StringComparison.OrdinalIgnoreCase);
     /// Порог свапа ядра 5 (перевес другого прочтения, наты).
     public double CoreTheta { get; set; } = 2.0;
     /// Вероятность смены языка между соседними словами.
@@ -297,6 +317,8 @@ public sealed class AppConfig
     public bool NnEnabled { get; set; } = true;
     /// Уверенность (max(p, 1−p)), ниже которой сеть молчит и решают словари.
     public double NnThreshold { get; set; } = 0.85;
+    /// Порог для коротких слов (≤3 букв) — строже: ложный свап короткого дороже пропуска.
+    public double NnThresholdShort { get; set; } = 0.95;
     /// "primary" — сеть решает до словарей; "arbiter" — только когда словари промолчали.
     public string NnMode { get; set; } = "primary";
     /// Слова короче — сети не показываем (одиночные буквы и пары — правила/щит).
@@ -454,6 +476,7 @@ public sealed class AppConfig
         ExcludedProcesses.Clear(); ExcludedProcesses.AddRange(fresh.ExcludedProcesses);
         NnEnabled = fresh.NnEnabled;
         NnThreshold = fresh.NnThreshold;
+        NnThresholdShort = fresh.NnThresholdShort;
         NnMode = fresh.NnMode;
         NnMinLen = fresh.NnMinLen;
         AppClasses = fresh.AppClasses;
@@ -480,7 +503,8 @@ public sealed class TrayUi : IDisposable
     private readonly NotifyIcon _icon;
 
     public TrayUi(AppConfig cfg, LearnedRules learned, SecureLog secureLog,
-                  LayoutPair pairForRules, Action<string> log)
+                  LayoutPair pairForRules, Action<string> log,
+                  LayoutNet? net = null, Corrections? corrections = null)
     {
         var menu = new ContextMenuStrip();
 
@@ -693,6 +717,72 @@ public sealed class TrayUi : IDisposable
             }
         };
         menu.Items.Add(resetLearnedItem);
+
+        // === Сеть-детектор: дообучение и сброс ===
+        if (net is not null && corrections is not null)
+        {
+            bool finetuneRunning = false;
+            var finetuneItem = new ToolStripMenuItem("Дообучить сеть на моих исправлениях…");
+            finetuneItem.Click += (_, _) =>
+            {
+                if (finetuneRunning) return;
+                if (!net.Loaded)
+                {
+                    MessageBox.Show("Нет qsnet.bin — дообучать нечего.", "QSwitcher");
+                    return;
+                }
+                var examples = corrections.Examples();
+                if (examples.Count == 0)
+                {
+                    MessageBox.Show("Сеть учится на явных правках («Свап и запомнить»). Пока таких нет.", "QSwitcher");
+                    return;
+                }
+                string extra = net.IsUser ? "\nСейчас уже стоят дообученные веса — они будут доучены дальше." : "";
+                if (MessageBox.Show($"Личных примеров: {examples.Count} (выученные правила + исправления с контекстом).\n" +
+                                    "К ним подмешиваются общие примеры, чтобы сеть не забыла базу. Займёт секунды." + extra,
+                                    "Дообучить сеть?", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+                    return;
+                finetuneRunning = true;
+                finetuneItem.Enabled = false;
+                var replay = net.LoadReplay();
+                log($"[nn] дообучение: {examples.Count} личных + {replay.Count} общих…");
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        var r = net.Finetune(examples, replay);
+                        net.Reload();
+                        log($"[nn] дообучено: {r}");
+                        MessageBox.Show($"{r}\n\nВеса: {net.UserWeightsPath}\nОткат — «Сбросить сеть к базовой».", "Сеть дообучена");
+                    }
+                    catch (Exception e)
+                    {
+                        log($"[nn] дообучение не удалось: {e.Message}");
+                        MessageBox.Show(e.Message, "Дообучение не удалось", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    finally
+                    {
+                        finetuneRunning = false;
+                        try { menu.BeginInvoke(() => finetuneItem.Enabled = true); } catch { finetuneItem.Enabled = true; }
+                    }
+                });
+            };
+            menu.Items.Add(finetuneItem);
+
+            var resetNetItem = new ToolStripMenuItem("Сбросить сеть к базовой…");
+            resetNetItem.Click += (_, _) =>
+            {
+                string text = net.IsUser
+                    ? "Пользовательские веса будут удалены, вернутся встроенные. Исправления остаются — можно дообучить заново."
+                    : "Сейчас и так встроенные веса. Пользовательского файла нет.";
+                if (MessageBox.Show(text, "Сбросить сеть к базовой?", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                {
+                    net.ResetToBase();
+                    log($"[nn] сброс к базовым весам: {net.Source}");
+                }
+            };
+            menu.Items.Add(resetNetItem);
+        }
 
         var updateItem = new ToolStripMenuItem("Проверить обновления…");
         updateItem.Click += async (_, _) =>

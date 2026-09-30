@@ -121,6 +121,26 @@ public sealed class LayoutPair
         return new string(result);
     }
 
+    /// <summary>Свап только букв: буква → что на той же клавише в другой раскладке
+    /// (буква или знак: 'х' → '['), а знаки, цифры и пробелы остаются. Для формул
+    /// и кода, набранных не в той раскладке ('ф=ы-а' → 'a=s-f').</summary>
+    public string SwapLetters(string text)
+    {
+        var result = new char[text.Length];
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            char lower = char.ToLowerInvariant(c);
+            if (IsLatinLetter(c) && LatinToOther.TryGetValue(lower, out var toOther))
+                result[i] = char.IsUpper(c) ? char.ToUpperInvariant(toOther) : toOther;
+            else if (IsOtherLetter(c) && OtherToLatin.TryGetValue(lower, out var toLatin))
+                result[i] = char.IsUpper(c) ? char.ToUpperInvariant(toLatin) : toLatin;
+            else
+                result[i] = c;
+        }
+        return new string(result);
+    }
+
     /// <summary>Стандартная пара RU↔EN (ЙЦУКЕН ↔ QWERTY).</summary>
     public static LayoutPair RuEn()
     {

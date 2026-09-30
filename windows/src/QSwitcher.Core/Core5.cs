@@ -95,77 +95,7 @@ public readonly struct QSTable
     }
 }
 
-/// <summary>
-/// Частоты слов и пар (nn/ngram/build.py → qsngram.bin, QSNG2): −ln P(слово),
-/// −ln P(слово | предыдущее) в шагах 0.1 ната. Эталон — nn/ngram/score.py.
-/// </summary>
-public sealed class NgramLM
-{
-    public bool Loaded { get; private set; }
-    private double _scale = 0.1;
-    private readonly Dictionary<string, (QSTable Uni, QSTable Bi)> _t = new();
-
-    public static NgramLM Load(Func<string, Stream?> open, Action<string>? log = null)
-    {
-        var lm = new NgramLM();
-        try
-        {
-            using var s = open("qsngram.bin");
-            if (s is null)
-            {
-                log?.Invoke("🔡 N-граммы: qsngram.bin не найден — ядро 5 без частот слов");
-                return lm;
-            }
-            byte[] all = QSTable.ReadAll(s);
-            lm.Parse(all);
-            lm.Loaded = true;
-            log?.Invoke($"🔡 N-граммы: qsngram.bin ({all.Length / 1e6:F1} МБ)");
-        }
-        catch (Exception e)
-        {
-            log?.Invoke($"⚠️ N-граммы: qsngram.bin не читается: {e.Message}");
-        }
-        return lm;
-    }
-
-    private void Parse(byte[] all)
-    {
-        if (all.Length < 9 || Encoding.ASCII.GetString(all, 0, 5) != "QSNG2")
-            throw new InvalidDataException("не QSNG2");
-        int off = 5;
-        int hl = QSTable.U32(all, ref off);
-        using var doc = JsonDocument.Parse(new ReadOnlyMemory<byte>(all, off, hl));
-        off += hl;
-        var root = doc.RootElement;
-        int uniBits = root.GetProperty("uni_bits").GetInt32();
-        int biBits = root.GetProperty("bi_bits").GetInt32();
-        _scale = root.GetProperty("scale").GetDouble();
-        foreach (var lang in root.GetProperty("langs").EnumerateArray())
-        {
-            string l = lang.GetString() ?? "";
-            int ul = QSTable.U32(all, ref off), bl = QSTable.U32(all, ref off);
-            var u = new QSTable(all, off, ul, uniBits); off += ul;
-            var b = new QSTable(all, off, bl, biBits); off += bl;
-            _t[l] = (u, b);
-        }
-    }
-
-    /// <summary>−ln P(слово) или null — слова нет в корпусе.</summary>
-    public double? Uni(string lang, string w)
-    {
-        if (!_t.TryGetValue(lang, out var t)) return null;
-        int v = t.Uni.Get(w);
-        return v < 0 ? null : v * _scale;
-    }
-
-    /// <summary>−ln P(слово | предыдущее) или null — пары нет.</summary>
-    public double? Bi(string lang, string prev, string w)
-    {
-        if (!_t.TryGetValue(lang, out var t)) return null;
-        int v = t.Bi.Get(prev + "\u001F" + w);
-        return v < 0 ? null : v * _scale;
-    }
-}
+// Частоты слов и пар — NgramLM.cs (UniD/BiD: в double, как эталон).
 
 /// <summary>
 /// Символьная модель языка (qschar.bin, QSCL1): «как выглядит слово этого языка» —
@@ -596,7 +526,7 @@ public sealed class Core5
     // --- модель ---
 
     /// −ln P(слово) по частотам или null — слова нет в корпусе.
-    public double? Known(string lang, string w) => _lm.Uni(lang, w);
+    public double? Known(string lang, string w) => _lm.UniD(lang, w);
 
     /// Ближайшее известное слово в одной правке: −ln P(соседа) + ln(число правок).
     private double? Typo(string lang, string w)
@@ -646,7 +576,7 @@ public sealed class Core5
         pw += P.Tau * pt;
         if (!string.IsNullOrEmpty(prevWord))
         {
-            var b = _lm.Bi(lang, prevWord.ToLowerInvariant(), lw);
+            var b = _lm.BiD(lang, prevWord.ToLowerInvariant(), lw);
             if (b.HasValue)
             {
                 pw = P.Beta * Math.Exp(-b.Value) + (1 - P.Beta) * pw;
@@ -770,12 +700,12 @@ public sealed class Core5
                 // пара справа: «другое прочтение prev → текущее» против «prev как набрано → текущее»
                 if (w.Lang == pw.A)
                 {
-                    var bA = _lm.Bi(pw.A, pw.Alt.ToLowerInvariant(), w.Shown.ToLowerInvariant());
+                    var bA = _lm.BiD(pw.A, pw.Alt.ToLowerInvariant(), w.Shown.ToLowerInvariant());
                     if (bA.HasValue) add += Math.Min(3.0, Math.Max(0.0, 12.0 - bA.Value) / 3);
                 }
                 if (w.Lang == pw.T)
                 {
-                    var bT = _lm.Bi(pw.T, pw.Typed.ToLowerInvariant(), w.Shown.ToLowerInvariant());
+                    var bT = _lm.BiD(pw.T, pw.Typed.ToLowerInvariant(), w.Shown.ToLowerInvariant());
                     if (bT.HasValue) add -= Math.Min(3.0, Math.Max(0.0, 12.0 - bT.Value) / 3);
                 }
                 double newLo = pw.Lo + add;

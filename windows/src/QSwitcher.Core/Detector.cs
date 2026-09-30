@@ -228,26 +228,25 @@ public sealed class Detector
         if (!isLatin && !isOther)
             return (NormalizeMixed(word, lower), "mixed");
 
-        // (1а) Щит коротких слов: короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА,
-        // против контекста не свапаем. Почти любая пара букв — чьё-то короткое
-        // слово в другом языке ('ру' при ctx=ru свапалось в 'he', 'рф' → 'ha').
-        // Стоит ВЫШЕ сети намеренно: 'he' в корпусах частое, «ру» — нет, и
-        // сеть уверенно ошибётся ровно там, где мы уже обжигались.
-        // Направление 'yt'→'не' при ctx=ru не задето: цель свапа = контекст.
-        if (lower.Length <= 3 && context is not null
-            && context == (isLatin ? Lang.Latin : Lang.Other))
-        {
-            Log($"'{lower}' короткое, набрано в языке контекста ({context}) → keep");
-            return (null, "short-in-context");
-        }
-
-        // (1б) Сеть — основной режим: решает до словарей, если уверена.
-        // Не уверена — молчит, дальше словарные правила как раньше.
+        // (1а) Сеть — основной режим: решает до щита и словарей, если уверена.
+        // Для коротких слов (≤3) порог строже (ThresholdShort). Не уверена — молчит.
         var nn = _cfg.Nn?.Invoke();
         if (nn is { Mode: not "arbiter" })
         {
             var v = NetVerdict(word, lower, isLatin, history, app, nn.Value);
             if (v.HasValue) return (v.Value.Result, v.Value.Reason);
+        }
+
+        // (1б) Щит коротких слов: короткое слово, НАБРАННОЕ В ЯЗЫКЕ КОНТЕКСТА,
+        // против контекста не свапаем. Почти любая пара букв — чьё-то короткое
+        // слово в другом языке ('ру' при ctx=ru свапалось в 'he', 'рф' → 'ha').
+        // Стоит после сети: она, если уверена (строгий порог), знает про
+        // контекст больше, чем язык соседей; не уверена — щит страхует.
+        if (lower.Length <= 3 && context is not null
+            && context == (isLatin ? Lang.Latin : Lang.Other))
+        {
+            Log($"'{lower}' короткое, набрано в языке контекста ({context}) → keep");
+            return (null, "short-in-context");
         }
 
         // (2) Валидное слово текущего языка — не трогаем.
@@ -335,9 +334,10 @@ public sealed class Detector
         string ctxStr = string.Join(" ", history.Take(3));
         string appName = LayoutNet.AppNames[(int)appClass];
         string tag = $"P(ru)={p:F3}";
-        if (conf < nn.Threshold)
+        double threshold = lower.Length <= 3 ? nn.ThresholdShort : nn.Threshold;
+        if (conf < threshold)
         {
-            Log($"сеть {tag} не уверена (порог {nn.Threshold}, ctx='{ctxStr}', {appName}) → словари");
+            Log($"сеть {tag} не уверена (порог {threshold}, ctx='{ctxStr}', {appName}) → словари");
             return null;
         }
         if (intendedOther == !isLatin)
@@ -389,7 +389,7 @@ public sealed class Detector
 }
 
 /// <summary>Настройки сети на момент решения (читаются из конфига на лету).</summary>
-public readonly record struct NnSettings(bool Enabled, double Threshold, string Mode, int MinLen);
+public readonly record struct NnSettings(bool Enabled, double Threshold, string Mode, int MinLen, double ThresholdShort = 0.95);
 
 /// <summary>Настройки детектора, читаются из конфига приложения.</summary>
 public sealed class DetectorConfig

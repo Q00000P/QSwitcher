@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace QSwitcher.Core;
 
@@ -29,6 +30,13 @@ public sealed class LayoutNet
     public bool Loaded { get; private set; }
     public string Trained { get; private set; } = "";
     public string Source { get; private set; } = "";
+    /// <summary>Загружены пользовательские (дообученные) веса, а не встроенные.</summary>
+    public bool IsUser { get; private set; }
+    /// <summary>Заголовок файла как есть — переносится в пользовательские веса.</summary>
+    private JsonNode? _header;
+    private Func<string, Stream?>? _open;
+    /// <summary>Путь пользовательских весов (в папке данных) — задаётся при Load.</summary>
+    public string? UserWeightsPath { get; private set; }
 
     private int _buckets, _dim, _hidden, _inputDim;
     private float[] _emb = Array.Empty<float>();
@@ -51,36 +59,68 @@ public sealed class LayoutNet
 
     // ------------------------------------------------------------ загрузка
 
-    /// <summary>open — как у WordDictionary.Load: снаружи, потом встроенное.</summary>
-    public static LayoutNet Load(LayoutPair pair, Func<string, Stream?> open, Action<string>? log = null)
+    /// <summary>open — как у WordDictionary.Load: снаружи, потом встроенное.
+    /// userWeightsPath — куда пишет «Дообучить» (папка данных); если файл там есть,
+    /// он важнее встроенного.</summary>
+    public static LayoutNet Load(LayoutPair pair, Func<string, Stream?> open, Action<string>? log = null,
+                                 string? userWeightsPath = null)
     {
-        var net = new LayoutNet(pair, log);
+        var net = new LayoutNet(pair, log) { _open = open, UserWeightsPath = userWeightsPath };
+        net.Reload();
+        return net;
+    }
+
+    /// <summary>Перечитать веса (после дообучения или сброса).</summary>
+    public void Reload()
+    {
+        Loaded = false;
+        IsUser = false;
         try
         {
-            using var s = open("qsnet.bin");
-            if (s is null)
+            byte[]? bytes = null;
+            if (UserWeightsPath is not null && File.Exists(UserWeightsPath))
             {
-                log?.Invoke("🧠 Сеть: qsnet.bin не найден — работаем на словарях");
-                return net;
+                bytes = File.ReadAllBytes(UserWeightsPath);
+                IsUser = true;
+                Source = UserWeightsPath;
             }
-            using var ms = new MemoryStream();
-            s.CopyTo(ms);
-            net.Parse(ms.ToArray());
-            net.Loaded = true;
-            log?.Invoke($"🧠 Сеть: qsnet.bin (buckets={net._buckets}, dim={net._dim}, hidden={net._hidden}, обучена {net.Trained})");
-            using var st = open("qsnet-selftest.json");
-            if (!net.SelfTest(st))
+            else if (_open is not null)
             {
-                net.Loaded = false;
-                log?.Invoke("⚠️ Сеть ВЫКЛЮЧЕНА: порт не совпал с эталоном (см. выше)");
+                using var s = _open("qsnet.bin");
+                if (s is not null)
+                {
+                    using var ms = new MemoryStream();
+                    s.CopyTo(ms);
+                    bytes = ms.ToArray();
+                    Source = "qsnet.bin";
+                }
+            }
+            if (bytes is null)
+            {
+                _log?.Invoke("🧠 Сеть: qsnet.bin не найден — работаем на словарях");
+                return;
+            }
+            Parse(bytes);
+            Loaded = true;
+            string ft = _header?["finetuned"]?.GetValue<string>() is { } f
+                ? $", дообучена {f}, v{_header?["finetune_version"]?.GetValue<int>() ?? 0}" : "";
+            _log?.Invoke($"🧠 Сеть: {Source} (buckets={_buckets}, dim={_dim}, hidden={_hidden}, обучена {Trained}{ft})");
+            // Селфтест — только для встроенных весов: эталон считан именно по ним.
+            if (!IsUser && _open is not null)
+            {
+                using var st = _open("qsnet-selftest.json");
+                if (!SelfTest(st))
+                {
+                    Loaded = false;
+                    _log?.Invoke("⚠️ Сеть ВЫКЛЮЧЕНА: порт не совпал с эталоном (см. выше)");
+                }
             }
         }
         catch (Exception e)
         {
-            net.Loaded = false;
-            log?.Invoke($"⚠️ Сеть: qsnet.bin не читается: {e.Message}");
+            Loaded = false;
+            _log?.Invoke($"⚠️ Сеть: qsnet.bin не читается: {e.Message}");
         }
-        return net;
     }
 
     private void Parse(byte[] data)
@@ -88,6 +128,7 @@ public sealed class LayoutNet
         if (data.Length < 8 || data[0] != (byte)'Q' || data[1] != (byte)'S' || data[2] != (byte)'N' || data[3] != (byte)'1')
             throw new InvalidDataException("не QSN1");
         int hlen = BitConverter.ToInt32(data, 4);
+        _header = JsonNode.Parse(new ReadOnlyMemory<byte>(data, 8, hlen).Span);
         using var doc = JsonDocument.Parse(new ReadOnlyMemory<byte>(data, 8, hlen));
         var h = doc.RootElement;
         _buckets = h.GetProperty("buckets").GetInt32();
@@ -224,6 +265,266 @@ public sealed class LayoutNet
             if (h > 0) z += h * _w2[j];
         }
         return 1f / (1f + MathF.Exp(-z));
+    }
+
+    // ------------------------------------------------------------ дообучение
+
+    /// <summary>Личный или общий пример: клавиши, контекст, класс приложения, раскладка, метка.</summary>
+    public sealed record Example(string Keys, IReadOnlyList<CtxWord> Ctx, AppClass App, bool LayoutRu, bool LabelRu)
+    {
+        /// <summary>Из JSON {"keys","ctx":[[k,f]…],"app","layout","label"}; null — битая запись.</summary>
+        public static Example? FromJson(JsonElement c)
+        {
+            if (!c.TryGetProperty("keys", out var kp) || kp.GetString() is not { Length: > 0 } keys) return null;
+            if (!c.TryGetProperty("label", out var lp)) return null;
+            var ctx = new List<CtxWord>();
+            if (c.TryGetProperty("ctx", out var cp))
+                foreach (var pair in cp.EnumerateArray())
+                {
+                    if (ctx.Count >= CtxWords) break;
+                    string? k = pair.GetArrayLength() > 0 && pair[0].ValueKind == JsonValueKind.String ? pair[0].GetString() : null;
+                    string f = pair.GetArrayLength() > 1 ? pair[1].GetString() ?? "none" : "none";
+                    ctx.Add(new CtxWord(k, f == "ru" ? CtxFlag.Ru : f == "en" ? CtxFlag.En : CtxFlag.None));
+                }
+            string appName = c.TryGetProperty("app", out var ap) ? ap.GetString() ?? "other" : "other";
+            int ai = Array.IndexOf(AppNames, appName);
+            string layout = c.TryGetProperty("layout", out var lay) ? lay.GetString() ?? "en" : "en";
+            return new Example(keys, ctx, ai < 0 ? AppClass.Other : (AppClass)ai, layout == "ru", lp.GetString() == "ru");
+        }
+
+        public JsonObject ToJson()
+        {
+            var ctx = new JsonArray();
+            foreach (var c in Ctx)
+                ctx.Add(new JsonArray(c.Keys is null ? null : JsonValue.Create(c.Keys),
+                                      JsonValue.Create(new[] { "ru", "en", "none" }[(int)c.Flag])));
+            return new JsonObject
+            {
+                ["keys"] = Keys, ["ctx"] = ctx, ["app"] = AppNames[(int)App],
+                ["layout"] = LayoutRu ? "ru" : "en", ["label"] = LabelRu ? "ru" : "en",
+            };
+        }
+
+        /// <summary>Ключ для схлопывания дубликатов: клавиши + контекст.</summary>
+        public string DedupKey => Keys + "|" + string.Join(",", Ctx.Select(c => (c.Keys ?? "") + ":" + (int)c.Flag));
+    }
+
+    public sealed record FinetuneReport(int Personal, int PersonalBefore, int PersonalAfter,
+                                        int Generic, int GenericBefore, int GenericAfter, double Seconds)
+    {
+        public override string ToString() =>
+            $"личных примеров {Personal}: верно {PersonalBefore} → {PersonalAfter}; " +
+            $"общих {Generic}: {GenericBefore} → {GenericAfter}; {Seconds:F1} с";
+    }
+
+    // Гиперпараметры — ровно как в nn/finetune.py
+    private const int FtEpochs = 300;
+    private const float FtLR = 0.05f, FtLambda = 0.05f, FtSmooth = 0.02f, FtPersonalWeight = 20f;
+
+    /// <summary>Общие примеры для replay (qsnet-replay.json) — чтобы личные слова
+    /// добавились, а не вытеснили базу.</summary>
+    public List<Example> LoadReplay()
+    {
+        var outp = new List<Example>();
+        if (_open is null) return outp;
+        using var st = _open("qsnet-replay.json");
+        if (st is null) return outp;
+        using var doc = JsonDocument.Parse(st);
+        foreach (var c in doc.RootElement.EnumerateArray())
+            if (Example.FromJson(c) is { } e) outp.Add(e);
+        return outp;
+    }
+
+    /// <summary>Аугментация личного примера: обе раскладки и копия без контекста — как expand() в finetune.py.</summary>
+    private static IEnumerable<Example> Expand(Example e)
+    {
+        foreach (bool lay in new[] { e.LayoutRu, !e.LayoutRu })
+        {
+            yield return e with { LayoutRu = lay };
+            if (e.Ctx.Count > 0) yield return e with { LayoutRu = lay, Ctx = Array.Empty<CtxWord>() };
+        }
+    }
+
+    /// <summary>Дообучить текущие веса на личных примерах (+ replay) и записать
+    /// пользовательский qsnet.bin. Долго (секунды) — звать из фона. После — Reload().</summary>
+    public FinetuneReport Finetune(IReadOnlyList<Example> personal, IReadOnlyList<Example> replay)
+    {
+        if (!Loaded) throw new InvalidOperationException("сеть не загружена");
+        if (UserWeightsPath is null) throw new InvalidOperationException("не задан путь пользовательских весов");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var pers = personal.SelectMany(Expand).ToList();
+        var samples = pers.Concat(replay).ToList();
+        int nP = pers.Count, N = samples.Count;
+        if (N == 0) throw new InvalidOperationException("нет примеров");
+        int D = _dim, H = _hidden, I = _inputDim;
+
+        var slots = new List<(int off, int[] bk)>[N];
+        var dense = new float[N][];
+        var y = new float[N];
+        var w = new float[N];
+        for (int i = 0; i < N; i++)
+        {
+            var e = samples[i];
+            var sl = new List<(int, int[])> { (0, BucketsOf(e.Keys).ToArray()) };
+            int off = D;
+            for (int c = 0; c < CtxWords; c++)
+            {
+                if (c < e.Ctx.Count && e.Ctx[c].Keys is { Length: > 0 } k) sl.Add((off, BucketsOf(k).ToArray()));
+                off += D + NFlags;
+            }
+            slots[i] = sl;
+            var x = new float[I];
+            off = D;
+            for (int c = 0; c < CtxWords; c++)
+            {
+                var flag = c < e.Ctx.Count ? e.Ctx[c].Flag : CtxFlag.None;
+                x[off + D + (int)flag] = 1;
+                off += D + NFlags;
+            }
+            x[off + (int)e.App] = 1; off += NApps;
+            x[off + (e.LayoutRu ? 0 : 1)] = 1;
+            dense[i] = x;
+            y[i] = e.LabelRu ? 1 : 0;
+            w[i] = i < nP ? FtPersonalWeight : 1;
+        }
+        float wMean = w.Sum() / N;
+        for (int i = 0; i < N; i++) w[i] /= wMean;
+        var yt = y.Select(v => v * (1 - 2 * FtSmooth) + FtSmooth).ToArray();
+
+        var emb = (float[])_emb.Clone();
+        var w1 = (float[])_w1.Clone(); var b1 = (float[])_b1.Clone();
+        var w2 = (float[])_w2.Clone(); float b2 = _b2;
+        var w1_0 = _w1; var b1_0 = _b1; var w2_0 = _w2; float b2_0 = _b2;
+        var X = new float[N * I];
+        var hp = new float[N * H];
+        var p = new float[N];
+
+        void Assemble()
+        {
+            for (int i = 0; i < N; i++)
+            {
+                int bas = i * I;
+                Array.Copy(dense[i], 0, X, bas, I);
+                foreach (var (off, bk) in slots[i])
+                {
+                    foreach (int r in bk)
+                    {
+                        int rb = r * D;
+                        for (int j = 0; j < D; j++) X[bas + off + j] += emb[rb + j];
+                    }
+                    float inv = 1f / bk.Length;
+                    for (int j = 0; j < D; j++) X[bas + off + j] *= inv;
+                }
+            }
+        }
+        void Forward()
+        {
+            for (int i = 0; i < N; i++)
+            {
+                int xb = i * I;
+                float z = b2;
+                for (int j = 0; j < H; j++)
+                {
+                    float h = b1[j];
+                    for (int k = 0; k < I; k++) { float xk = X[xb + k]; if (xk != 0) h += xk * w1[k * H + j]; }
+                    hp[i * H + j] = h;
+                    if (h > 0) z += h * w2[j];
+                }
+                p[i] = 1f / (1f + MathF.Exp(-z));
+            }
+        }
+        (int, int) Correct()
+        {
+            int a = 0, b = 0;
+            for (int i = 0; i < N; i++)
+                if ((p[i] >= 0.5f) == (y[i] >= 0.5f)) { if (i < nP) a++; else b++; }
+            return (a, b);
+        }
+
+        Assemble(); Forward();
+        var before = Correct();
+        var gw1 = new float[I * H]; var gb1 = new float[H]; var gw2 = new float[H]; var dh = new float[H];
+        for (int ep = 0; ep < FtEpochs; ep++)
+        {
+            Assemble(); Forward();
+            for (int j = 0; j < I * H; j++) gw1[j] = FtLambda * (w1[j] - w1_0[j]);
+            for (int j = 0; j < H; j++) { gb1[j] = FtLambda * (b1[j] - b1_0[j]); gw2[j] = FtLambda * (w2[j] - w2_0[j]); }
+            float gb2 = FtLambda * (b2 - b2_0);
+            for (int i = 0; i < N; i++)
+            {
+                float dz = (p[i] - yt[i]) * w[i] / N;
+                gb2 += dz;
+                int xb = i * I;
+                for (int j = 0; j < H; j++)
+                {
+                    float h = hp[i * H + j];
+                    if (h > 0) { gw2[j] += h * dz; dh[j] = dz * w2[j]; } else dh[j] = 0;
+                }
+                for (int j = 0; j < H; j++)
+                {
+                    if (dh[j] == 0) continue;
+                    gb1[j] += dh[j];
+                    for (int k = 0; k < I; k++) { float xk = X[xb + k]; if (xk != 0) gw1[k * H + j] += xk * dh[j]; }
+                }
+                foreach (var (off, bk) in slots[i])
+                {
+                    float inv = 1f / bk.Length;
+                    for (int d = 0; d < D; d++)
+                    {
+                        float g = 0;
+                        int row = (off + d) * H;
+                        for (int j = 0; j < H; j++) if (dh[j] != 0) g += dh[j] * w1[row + j];
+                        g *= inv * FtLR;
+                        if (g != 0) foreach (int r in bk) emb[r * D + d] -= g;
+                    }
+                }
+            }
+            for (int j = 0; j < I * H; j++) w1[j] -= FtLR * gw1[j];
+            for (int j = 0; j < H; j++) { b1[j] -= FtLR * gb1[j]; w2[j] -= FtLR * gw2[j]; }
+            b2 -= FtLR * gb2;
+        }
+        var keep = (_emb, _w1, _b1, _w2, _b2);
+        _emb = emb; _w1 = w1; _b1 = b1; _w2 = w2; _b2 = b2;
+        Assemble(); Forward();
+        var after = Correct();
+        try { SaveUser(personal.Count); }
+        catch { (_emb, _w1, _b1, _w2, _b2) = keep; throw; }
+        return new FinetuneReport(nP, before.Item1, after.Item1, N - nP, before.Item2, after.Item2, sw.Elapsed.TotalSeconds);
+    }
+
+    private void SaveUser(int personalCount)
+    {
+        var h = _header?.DeepClone() as JsonObject ?? new JsonObject();
+        h["finetuned"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+        h["finetune_version"] = (h["finetune_version"]?.GetValue<int>() ?? 0) + 1;
+        h["personal_examples"] = personalCount;
+        h["base_trained"] ??= Trained;
+        var hbytes = System.Text.Encoding.UTF8.GetBytes(h.ToJsonString());
+        using var ms = new MemoryStream();
+        ms.Write(new[] { (byte)'Q', (byte)'S', (byte)'N', (byte)'1' });
+        ms.Write(BitConverter.GetBytes(hbytes.Length));
+        ms.Write(hbytes);
+        foreach (var t in h["tensors"]!.AsArray())
+        {
+            float[] arr = t![0]!.GetValue<string>() switch
+            {
+                "emb" => _emb, "w1" => _w1, "b1" => _b1, "w2" => _w2, "b2" => new[] { _b2 }, _ => Array.Empty<float>(),
+            };
+            var bytes = new byte[arr.Length * 4];
+            Buffer.BlockCopy(arr, 0, bytes, 0, bytes.Length);
+            ms.Write(bytes);
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(UserWeightsPath!)!);
+        File.WriteAllBytes(UserWeightsPath! + ".tmp", ms.ToArray());
+        File.Move(UserWeightsPath! + ".tmp", UserWeightsPath!, overwrite: true);
+        _header = h;
+    }
+
+    /// <summary>Сброс к встроенным весам: удалить пользовательский файл и перечитать.</summary>
+    public void ResetToBase()
+    {
+        if (UserWeightsPath is not null && File.Exists(UserWeightsPath)) File.Delete(UserWeightsPath);
+        Reload();
     }
 
     // ------------------------------------------------------------ самопроверка
