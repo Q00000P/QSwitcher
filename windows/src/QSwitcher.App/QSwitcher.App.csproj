@@ -56,6 +56,9 @@
     <EmbeddedResource Include="..\..\..\nn\qsnet-selftest.json" Link="Resources\qsnet-selftest.json"
                       LogicalName="QSwitcher.App.Resources.qsnet-selftest.json"
                       Condition="Exists('..\..\..\nn\qsnet-selftest.json')" />
+    <EmbeddedResource Include="..\..\..\nn\qsnet-replay.json" Link="Resources\qsnet-replay.json"
+                      LogicalName="QSwitcher.App.Resources.qsnet-replay.json"
+                      Condition="Exists('..\..\..\nn\qsnet-replay.json')" />
   </ItemGroup>
   <!-- Словари качаются и готовятся автоматически перед сборкой (разово).
        Если ru.txt/en.txt уже на месте — мгновенный no-op. -->

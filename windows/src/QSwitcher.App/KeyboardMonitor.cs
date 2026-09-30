@@ -583,6 +583,12 @@ public sealed class KeyboardMonitor : IDisposable
         // Всё остальное (знаки препинания вне таблицы, F-клавиши) — граница
         string punct = KeyMap.Translate(vk, false, shift, caps);
         if (punct.Length > 0) return OnWordBoundary(new Keystroke(vk, punct));
+        // '-' и '=' в таблице клавиш не значатся, Translate отдаёт для них пустую
+        // строку, и набор просто сбрасывается — границы нет, в историю ничего не
+        // попадает. Для структурного правила такой разделитель всё равно важен:
+        // в 'A=s-f' именно он говорит, что это формула, а не проза.
+        if (StructureVks.Contains(vk)) _lastSeparatorStructural = true;
+        else if (!KeyMap.IsWordKey(vk)) _lastSeparatorStructural = false;
         _word.Clear(); _droppedPrefix = "";
         Journal.Add(KeyJournal.Kind.Reset, vk);
         return false;
@@ -625,7 +631,11 @@ public sealed class KeyboardMonitor : IDisposable
     /// обнуляет. Без этого ретроконверсия пересобирала слова из прошлых
     /// сеансов поверх текущего текста: одно набранное 'й' превращалось
     /// в 'q q q', съедая соседние символы.
-    private readonly List<(string Text, string Trigger, Lang Lang, DateTime At, IReadOnlyList<Keystroke>? Keys)> _history = new();
+    /// <summary>Pinned — root-решение человека для ЭТОГО вхождения (ручной свап,
+    /// тоггл) или структурный keep (формула/список): ретроцепочка и любая
+    /// автоматика такое вхождение не трогают. На следующие вводы того же слова
+    /// не распространяется — это не правило.</summary>
+    private readonly List<(string Text, string Trigger, Lang Lang, DateTime At, IReadOnlyList<Keystroke>? Keys, bool Pinned)> _history = new();
 
     /// Насколько долго слово считается «рядом с курсором».
     private static readonly TimeSpan HistoryTtl = TimeSpan.FromSeconds(8);
@@ -672,7 +682,15 @@ public sealed class KeyboardMonitor : IDisposable
         // так что контекст не перетекает из прошлого сообщения.
         var recent = new List<string>(3);
         for (int i = _history.Count - 1; i >= 0 && recent.Count < 3; i--) recent.Add(_history[i].Text);
-        var verdict = _detector.Decide(text, current, context, recent, Foreground?.ProcessName);
+        bool structural = IsStructural(text, _lastCompletedPrefix, trigger.Chars);
+        // Флаг живёт до следующей завершённой границы: 'A=s-f' структурно целиком,
+        // а после пробела и обычного слова проза снова обычная.
+        _lastSeparatorStructural = structural
+            && (trigger.Chars.Length == 0 || StructureChars.Contains(trigger.Chars[0]) || char.IsDigit(trigger.Chars[0]));
+        var verdict = structural
+            ? new Verdict(false, null, "structure")
+            : _detector.Decide(text, current, context, recent, Foreground?.ProcessName);
+        if (structural) _log($"  [det] '{text}' в формуле/списке (префикс '{_lastCompletedPrefix}', граница '{trigger.Chars}') → keep");
         _log($"[word] собрано '{text}' ({wordCopy.Count} клавиш)");
         _log($"[boundary] '{text}' ({current}, ctx={context?.ToString() ?? "nil"}) → {(verdict.ShouldSwap ? "SWITCH" : "keep")} [{verdict.Reason}]");
         SecureLog?.Append(verdict.ShouldSwap && verdict.Replacement is not null
@@ -742,7 +760,7 @@ public sealed class KeyboardMonitor : IDisposable
         {
             _lastWordLang = current;
             _lastSwitch = null;
-            PushHistory(text, trigger.Chars, wordCopy);
+            PushHistory(text, trigger.Chars, wordCopy, pinned: structural);
             _consecutive = 0;
             _lastTarget = null;
             if (lineBreak) InvalidateHistory("перевод строки");
@@ -799,6 +817,10 @@ public sealed class KeyboardMonitor : IDisposable
                 SelectionAction(SelectionOp.Swap);
                 break;
 
+            case HotkeyAction.SwapSelectionLetters:
+                SelectionAction(SelectionOp.SwapLetters);
+                break;
+
             case HotkeyAction.ChangeCase:
                 SelectionAction(SelectionOp.Case);
                 break;
@@ -818,7 +840,7 @@ public sealed class KeyboardMonitor : IDisposable
         }
     }
 
-    public enum SelectionOp { Swap, Case, Translit }
+    public enum SelectionOp { Swap, SwapLetters, Case, Translit }
 
     /// Операции над выделенным текстом — через буфер обмена.
     /// На Windows нет аналога Accessibility API для чтения выделения,
@@ -872,6 +894,7 @@ public sealed class KeyboardMonitor : IDisposable
             return op switch
             {
                 SelectionOp.Swap => SelectionSwapText(text),
+                SelectionOp.SwapLetters => _pair.SwapLetters(text),
                 SelectionOp.Case => Transliterator.CycleCase(text),
                 SelectionOp.Translit => Transliterator.ToLatin(text),
                 _ => text,
@@ -929,6 +952,10 @@ public sealed class KeyboardMonitor : IDisposable
                 LearnForceConsistent(bufText, _pair.Swap(bufText)); // учим слово (с буквами), не префикс
             _lastSwitch = new LastSwitch(full, swappedFull, "");
             _lastWordLang = LangOf(swappedFull);
+            // Любой ручной свап — пример для сети с контекстом (не правило)
+            Corrections?.Record(bufText, intendedOther: LangOf(bufSwapped) == Lang.Other,
+                                RecentHistory(full, swappedFull), Foreground?.ProcessName);
+            PushHistory(swappedFull, "", null, pinned: true);
             _replacer.Submit(new ReplaceJob(
                 EraseCount: full.Length,
                 Text: swappedFull,
@@ -952,6 +979,10 @@ public sealed class KeyboardMonitor : IDisposable
             if (learn) ApplyLearn(to);
 
             _lastWordLang = LangOf(to);
+            PinLastHistory(to, last.TriggerChar);
+            // Любой тоггл — пример для сети: что теперь на экране, то и имелось в виду
+            Corrections?.Record(last.Original, intendedOther: LangOf(to) == Lang.Other,
+                                RecentHistory(last.Original, last.Converted), Foreground?.ProcessName);
             _replacer.Submit(new ReplaceJob(
                 EraseCount: from.Length + last.TriggerChar.Length + tail.Length,
                 Text: to,
@@ -968,7 +999,7 @@ public sealed class KeyboardMonitor : IDisposable
             return;
         }
 
-        var (text, triggerChar, _, at, histKeys) = _history[^1];
+        var (text, triggerChar, _, at, histKeys, _) = _history[^1];
         if (DateTime.UtcNow - at > HistoryTtl)
         {
             _log("[manual] последнее слово слишком старое — не трогаю");
@@ -994,6 +1025,10 @@ public sealed class KeyboardMonitor : IDisposable
 
         _lastSwitch = new LastSwitch(fullText, swapped, triggerChar);
         _lastWordLang = LangOf(swapped);
+        PinLastHistory(swapped, triggerChar);
+        // Любой ручной свап — пример для сети с контекстом (не правило)
+        Corrections?.Record(text, intendedOther: LangOf(swapped) == Lang.Other,
+                            RecentHistory(fullText, swapped), Foreground?.ProcessName);
         _replacer.Submit(new ReplaceJob(
             EraseCount: fullText.Length + triggerChar.Length + tail.Length,
             Text: swapped,
@@ -1003,10 +1038,42 @@ public sealed class KeyboardMonitor : IDisposable
     }
 
     /// Добавить слово в историю (для ретроконверсии и ручного свапа).
-    private void PushHistory(string text, string trigger, IReadOnlyList<Keystroke>? keys = null)
+    private void PushHistory(string text, string trigger, IReadOnlyList<Keystroke>? keys = null, bool pinned = false)
     {
-        _history.Add((text, trigger, LangOf(text), DateTime.UtcNow, keys));
+        _history.Add((text, trigger, LangOf(text), DateTime.UtcNow, keys, pinned));
         if (_history.Count > 12) _history.RemoveAt(0);
+    }
+
+    /// <summary>Последнее вхождение теперь такое на экране по воле человека — пришпилить.</summary>
+    private void PinLastHistory(string onScreen, string trigger)
+    {
+        if (_history.Count == 0) { PushHistory(onScreen, trigger, null, pinned: true); return; }
+        var h = _history[^1];
+        _history[^1] = (onScreen, trigger, LangOf(onScreen), h.At, null, true);
+    }
+
+    /// <summary>Токен ≤2 букв внутри формулы/кода/нумерации (A=B-C, a), x2, C:) —
+    /// не проза, в обе стороны не трогаем. Смотрим на префикс, символ-границу
+    /// и на то, чем закончилось предыдущее слово.</summary>
+    private static readonly HashSet<char> StructureChars = new("=+-*/\\()[]{}<>|&^%$#@~:;_");
+    /// <summary>Клавиши-разделители, которых нет в таблице KeyMap ('-', '=' и
+    /// цифровая клавиатура): они сбрасывают набор, границей не становятся, но для
+    /// структурного правила значат ровно то же.</summary>
+    private static readonly HashSet<uint> StructureVks = new()
+    {
+        0xBD, 0xBB, 0x6D, 0x6B, 0x6A, 0x6F, // - = numpad - + * /
+    };
+    private bool _lastSeparatorStructural;
+
+    private bool IsStructural(string text, string prefix, string trigger)
+    {
+        if (text.Count(char.IsLetter) > 2) return false;
+        static bool Struct(string s) => s.Length > 0 && (StructureChars.Contains(s[0]) || char.IsDigit(s[0]));
+        if (prefix.Length > 0) return true;                                 // 'x2', '3a'
+        if (Struct(trigger)) return true;                                   // 'A=', 'a)', 'C:'
+        if (_lastSeparatorStructural) return true;                          // '=B', '-C' через сброс
+        if (_history.Count > 0 && Struct(_history[^1].Trigger)) return true; // '=B', '-C' через границу
+        return false;
     }
 
     /// Экран изменился не нами — всё, что помним про позицию, недействительно.
@@ -1051,6 +1118,7 @@ public sealed class KeyboardMonitor : IDisposable
             var h = _history[i];
             // Слишком давно — курсор мог уехать куда угодно
             if (now - h.At > HistoryTtl) break;
+            if (h.Pinned) break;   // root-решение человека / структура — не трогаем
             if (h.Text.Length != 1 || !char.IsLetter(h.Text[0])) break;
             if (h.Lang == target) break;
             // Через перевод строки/таб не тянем: текст за ним уже не рядом
@@ -1081,7 +1149,10 @@ public sealed class KeyboardMonitor : IDisposable
         // Показан конвертированный — значит свапать надо; показан исходный —
         // значит не надо. Правило пишем на ИСХОДНОЕ слово.
         if (onScreen == l.Converted) LearnForceConsistent(l.Original, l.Converted);
-        else _learned.LearnStop(l.Original);
+        else
+        {
+            _learned.LearnStop(l.Original);
+        }
     }
 
     /// <summary>
@@ -1092,6 +1163,19 @@ public sealed class KeyboardMonitor : IDisposable
     /// Раз человек сказал «й должно становиться q», то обратное правило
     /// заведомо неверно и снимается.
     /// </summary>
+    /// <summary>Личные исправления для сети (с контекстом); задаётся из Program.</summary>
+    public Corrections? Corrections { get; init; }
+
+    /// <summary>Три предыдущих слова (ближайшее первым) без самого исправляемого.</summary>
+    private List<string> RecentHistory(params string[] excluding)
+    {
+        var hist = new List<string>();
+        int end = _history.Count - 1;
+        if (end >= 0 && excluding.Any(x => string.Equals(x, _history[end].Text, StringComparison.OrdinalIgnoreCase))) end--;
+        for (int i = end; i >= 0 && hist.Count < 3; i--) hist.Add(_history[i].Text);
+        return hist;
+    }
+
     private void LearnForceConsistent(string word, string swapped)
     {
         _learned.LearnForce(word);

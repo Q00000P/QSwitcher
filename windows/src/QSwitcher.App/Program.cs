@@ -105,7 +105,8 @@ internal static class Program
             if (removed > 0)
                 Log($"🧹 Снято {removed} взаимоисключающих правил (слово и его свап оба «переключать»)");
         }
-        var net = LayoutNet.Load(pair, Res.Open, Log);
+        var net = LayoutNet.Load(pair, Res.Open, Log, userWeightsPath: Path.Combine(DataDir, "qsnet.bin"));
+        var corrections = new Corrections(DataDir, net, learned, pair, cfg.AppClassOf, Log);
         var detector = new Detector(pair, dict,
             learned,
             new DetectorConfig
@@ -114,7 +115,7 @@ internal static class Program
                 StopWords = cfg.StopWords,
                 MinWordLength = cfg.MinWordLength,
                 // Настройки сети читаются на каждое решение — меняются в config.json на лету
-                Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen),
+                Nn = () => new NnSettings(cfg.NnEnabled, cfg.NnThreshold, cfg.NnMode.ToLowerInvariant(), cfg.NnMinLen, cfg.NnThresholdShort),
                 AppClassOf = cfg.AppClassOf,
             }, Log, net);
 
@@ -145,6 +146,7 @@ internal static class Program
 
         using var monitor = new KeyboardMonitor(detector, pair, replacer, learned, Log)
         {
+            Corrections = corrections,
             EngineV4 = engineV4,
             Foreground = foreground,
             Passive = passive,
@@ -157,7 +159,7 @@ internal static class Program
             RetroPrepositionsOnly = cfg.RetroPrepositionsOnly,
             SwitchLayoutAfter = cfg.SwitchLayoutAfter,
         };
-        using var tray = new TrayUi(cfg, learned, secureLog, pair, Log);
+        using var tray = new TrayUi(cfg, learned, secureLog, pair, Log, net, corrections);
         tray.IsPaused = () => monitor.Paused;
         tray.TogglePause = monitor.TogglePause;
         tray.StartUpdateChecks(cfg, Log);
@@ -211,7 +213,7 @@ public static class AppVersion
 {
     public const string Version = "4.0";
     /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
-    public const string Build = "wave9";
+    public const string Build = "wave14";
 }
 
 /// <summary>
@@ -241,6 +243,8 @@ public sealed class AppConfig
     public bool NnEnabled { get; set; } = true;
     /// Уверенность (max(p, 1−p)), ниже которой сеть молчит и решают словари.
     public double NnThreshold { get; set; } = 0.85;
+    /// Порог для коротких слов (≤3 букв) — строже: ложный свап короткого дороже пропуска.
+    public double NnThresholdShort { get; set; } = 0.95;
     /// "primary" — сеть решает до словарей; "arbiter" — только когда словари промолчали.
     public string NnMode { get; set; } = "primary";
     /// Слова короче — сети не показываем (одиночные буквы и пары — правила/щит).
@@ -398,6 +402,7 @@ public sealed class AppConfig
         ExcludedProcesses.Clear(); ExcludedProcesses.AddRange(fresh.ExcludedProcesses);
         NnEnabled = fresh.NnEnabled;
         NnThreshold = fresh.NnThreshold;
+        NnThresholdShort = fresh.NnThresholdShort;
         NnMode = fresh.NnMode;
         NnMinLen = fresh.NnMinLen;
         AppClasses = fresh.AppClasses;
@@ -419,7 +424,8 @@ public sealed class TrayUi : IDisposable
     private readonly NotifyIcon _icon;
 
     public TrayUi(AppConfig cfg, LearnedRules learned, SecureLog secureLog,
-                  LayoutPair pairForRules, Action<string> log)
+                  LayoutPair pairForRules, Action<string> log,
+                  LayoutNet? net = null, Corrections? corrections = null)
     {
         var menu = new ContextMenuStrip();
 
@@ -632,6 +638,72 @@ public sealed class TrayUi : IDisposable
             }
         };
         menu.Items.Add(resetLearnedItem);
+
+        // === Сеть-детектор: дообучение и сброс ===
+        if (net is not null && corrections is not null)
+        {
+            bool finetuneRunning = false;
+            var finetuneItem = new ToolStripMenuItem("Дообучить сеть на моих исправлениях…");
+            finetuneItem.Click += (_, _) =>
+            {
+                if (finetuneRunning) return;
+                if (!net.Loaded)
+                {
+                    MessageBox.Show("Нет qsnet.bin — дообучать нечего.", "QSwitcher");
+                    return;
+                }
+                var examples = corrections.Examples();
+                if (examples.Count == 0)
+                {
+                    MessageBox.Show("Сеть учится на явных правках («Свап и запомнить»). Пока таких нет.", "QSwitcher");
+                    return;
+                }
+                string extra = net.IsUser ? "\nСейчас уже стоят дообученные веса — они будут доучены дальше." : "";
+                if (MessageBox.Show($"Личных примеров: {examples.Count} (выученные правила + исправления с контекстом).\n" +
+                                    "К ним подмешиваются общие примеры, чтобы сеть не забыла базу. Займёт секунды." + extra,
+                                    "Дообучить сеть?", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+                    return;
+                finetuneRunning = true;
+                finetuneItem.Enabled = false;
+                var replay = net.LoadReplay();
+                log($"[nn] дообучение: {examples.Count} личных + {replay.Count} общих…");
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        var r = net.Finetune(examples, replay);
+                        net.Reload();
+                        log($"[nn] дообучено: {r}");
+                        MessageBox.Show($"{r}\n\nВеса: {net.UserWeightsPath}\nОткат — «Сбросить сеть к базовой».", "Сеть дообучена");
+                    }
+                    catch (Exception e)
+                    {
+                        log($"[nn] дообучение не удалось: {e.Message}");
+                        MessageBox.Show(e.Message, "Дообучение не удалось", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    finally
+                    {
+                        finetuneRunning = false;
+                        try { menu.BeginInvoke(() => finetuneItem.Enabled = true); } catch { finetuneItem.Enabled = true; }
+                    }
+                });
+            };
+            menu.Items.Add(finetuneItem);
+
+            var resetNetItem = new ToolStripMenuItem("Сбросить сеть к базовой…");
+            resetNetItem.Click += (_, _) =>
+            {
+                string text = net.IsUser
+                    ? "Пользовательские веса будут удалены, вернутся встроенные. Исправления остаются — можно дообучить заново."
+                    : "Сейчас и так встроенные веса. Пользовательского файла нет.";
+                if (MessageBox.Show(text, "Сбросить сеть к базовой?", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                {
+                    net.ResetToBase();
+                    log($"[nn] сброс к базовым весам: {net.Source}");
+                }
+            };
+            menu.Items.Add(resetNetItem);
+        }
 
         var updateItem = new ToolStripMenuItem("Проверить обновления…");
         updateItem.Click += async (_, _) =>
