@@ -39,3 +39,4 @@ nn/lm/data/
 __pycache__/
 # dev-watch.sh: сигнал, вывод и сохранённые прогоны
 .qs-*
+version-mac.json

@@ -16,3 +16,4 @@ src/QSwitcher.App/Resources/switch.wav
 
 # Папка публикации (dotnet publish -o publish) — собранный exe в репозиторий не кладём
 publish/
+version-win.json
