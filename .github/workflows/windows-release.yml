@@ -1,15 +1,16 @@
 # Релиз для Windows: собирается на GitHub и прикрепляется к релизу win-<версия>.
 #
-# Запуск: опубликовать релиз с тегом win-X.Y (версия = Version в Program.cs),
-# либо вручную (Actions → Windows release → Run workflow, тег вида win-X.Y).
+# Запуск: запушить тег win-X.Y (версия = Version в Program.cs) — релиз создаётся сам,
+# описание берётся из release-notes/X.Y.md. Пересобрать: Actions → Windows release →
+# Run workflow (тег вида win-X.Y) или Re-run у прошлого запуска.
 # Ключ Google Drive — только из секретов репозитория QS_GOOGLE_CLIENT_ID /
 # QS_GOOGLE_CLIENT_SECRET (в коде его нет). Без них синхронизация через WebDAV
 # работает, Google Drive в сборке недоступен.
 name: Windows release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['win-*']
   workflow_dispatch:
     inputs:
       tag:
@@ -21,10 +22,9 @@ permissions:
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'win-')
     runs-on: windows-latest
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,6 +91,8 @@ jobs:
         run: |
           gh release view $env:TAG *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TAG --title "QSwitcher для Windows $env:VERSION" --notes "Сборка $env:VERSION для Windows."
+            $notes = "release-notes/$env:VERSION.md"
+            if (Test-Path $notes) { gh release create $env:TAG --title "QSwitcher для Windows $env:VERSION" --notes-file $notes }
+            else { gh release create $env:TAG --title "QSwitcher для Windows $env:VERSION" --notes "Сборка $env:VERSION для Windows." }
           }
           gh release upload $env:TAG $env:ZIP version-win.json --clobber
