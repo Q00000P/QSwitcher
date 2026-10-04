@@ -1,21 +1,24 @@
-# Релиз для Windows: собирается на GitHub и прикрепляется к релизу win-<версия>.
+# Релиз для Windows собирается на GitHub сам.
 #
-# Запуск: запушить тег win-X.Y (версия = Version в Program.cs) — релиз создаётся сам,
-# описание берётся из release-notes/X.Y.md. Пересобрать: Actions → Windows release →
-# Run workflow (тег вида win-X.Y) или Re-run у прошлого запуска.
+# Поднял Version в windows/src/QSwitcher.App/Program.cs и запушил в main → если релиза
+# win-<версия> ещё нет, он создаётся: сборка, самопроверка, QSwitcher-win-<версия>.zip и
+# version-win.json (манифест для сервера обновлений) в релизе, описание из
+# release-notes/<версия>.md. Пересобрать уже выпущенную версию (например, после того как
+# заданы секреты): Actions → Windows release → Run workflow — файлы релиза заменятся.
+#
 # Ключ Google Drive — только из секретов репозитория QS_GOOGLE_CLIENT_ID /
 # QS_GOOGLE_CLIENT_SECRET (в коде его нет). Без них синхронизация через WebDAV
-# работает, Google Drive в сборке недоступен.
+# работает, а Google Drive — только если те же переменные заданы на компьютере.
 name: Windows release
 
 on:
   push:
-    tags: ['win-*']
+    branches: [main]
+    paths:
+      - windows/src/QSwitcher.App/Program.cs
+      - release-notes/**
+      - .github/workflows/windows-release.yml
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Тег релиза (win-X.Y)"
-        required: true
 
 permissions:
   contents: write
@@ -24,24 +27,33 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
-
-      - name: Версия совпадает с тегом
+      - name: Версия и наличие релиза
         shell: pwsh
         run: |
           $v = (Select-String -Path windows\src\QSwitcher.App\Program.cs -Pattern 'Version = "(.*)"').Matches[0].Groups[1].Value
-          if ("win-$v" -ne $env:TAG) { throw "Тег $env:TAG, а в Program.cs версия $v" }
+          $tag = "win-$v"
           "VERSION=$v" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          "TAG=$tag" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          gh release view $tag *> $null
+          $exists = $LASTEXITCODE -eq 0
+          "EXISTS=$([int]$exists)" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          if ($exists -and '${{ github.event_name }}' -eq 'push') {
+            "SKIP=1" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+            "Релиз $tag уже есть — пропускаю (пересборка: Run workflow)."
+          } else { "Версия $v → $tag" }
+          exit 0
+
+      - uses: actions/setup-dotnet@v4
+        if: env.SKIP != '1'
+        with:
+          dotnet-version: 8.0.x
 
       - name: Словари (как в windows/README.md)
+        if: env.SKIP != '1'
         shell: pwsh
         working-directory: windows/src/QSwitcher.App/Resources
         run: |
@@ -54,13 +66,17 @@ jobs:
           "en.txt: $((Get-Content en.txt).Count), ru.txt: $((Get-Content ru.txt).Count)"
 
       - name: Сборка
+        if: env.SKIP != '1'
         shell: pwsh
         env:
           QS_GOOGLE_CLIENT_ID: ${{ secrets.QS_GOOGLE_CLIENT_ID }}
           QS_GOOGLE_CLIENT_SECRET: ${{ secrets.QS_GOOGLE_CLIENT_SECRET }}
-        run: dotnet publish windows\src\QSwitcher.App -c Release -o publish
+        run: |
+          if (-not $env:QS_GOOGLE_CLIENT_ID) { "::warning::Секреты QS_GOOGLE_CLIENT_ID / QS_GOOGLE_CLIENT_SECRET не заданы — Google Drive в сборку не встроен" }
+          dotnet publish windows\src\QSwitcher.App -c Release -o publish
 
       - name: Самопроверка (ядро 5 + синхронизация)
+        if: env.SKIP != '1'
         shell: pwsh
         run: |
           $p = Start-Process -FilePath publish\QSwitcher.exe -ArgumentList '--selftest-core' -Wait -PassThru -NoNewWindow
@@ -69,6 +85,7 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "самопроверка: код $($p.ExitCode)" }
 
       - name: Архив и манифест
+        if: env.SKIP != '1'
         shell: pwsh
         run: |
           $zip = "QSwitcher-win-$env:VERSION.zip"
@@ -84,15 +101,15 @@ jobs:
           "ZIP=$zip" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
           "SHA256: $sha"
 
-      - name: Прикрепить к релизу
+      - name: Релиз
+        if: env.SKIP != '1'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -ne 0) {
+          if ($env:EXISTS -ne '1') {
             $notes = "release-notes/$env:VERSION.md"
-            if (Test-Path $notes) { gh release create $env:TAG --title "QSwitcher для Windows $env:VERSION" --notes-file $notes }
-            else { gh release create $env:TAG --title "QSwitcher для Windows $env:VERSION" --notes "Сборка $env:VERSION для Windows." }
+            if (-not (Test-Path $notes)) { "Сборка $env:VERSION для Windows." | Set-Content $notes -Encoding UTF8 }
+            gh release create $env:TAG --target $env:GITHUB_SHA --title "QSwitcher для Windows $env:VERSION" --notes-file $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release create: $LASTEXITCODE" }
           }
           gh release upload $env:TAG $env:ZIP version-win.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload: $LASTEXITCODE" }
