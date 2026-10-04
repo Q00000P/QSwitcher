@@ -293,7 +293,7 @@ public sealed class BufferedLogger : IDisposable
 /// <summary>Версия приложения.</summary>
 public static class AppVersion
 {
-    public const string Version = "4.0";
+    public const string Version = "11.0";
     /// Метка волны разработки — чтобы по логу было видно, какой билд запущен.
     public const string Build = "wave17";
 }
